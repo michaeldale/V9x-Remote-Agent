@@ -1,0 +1,32 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: open-watcom/setup-watcom@v1
+        with:
+          version: "2.0"
+
+      - name: Build guest agent and package
+        shell: powershell
+        run: .\scripts\build-guest.ps1 -BuildId ci-${{ github.run_number }}
+
+      - name: Host protocol and CLI tests
+        shell: powershell
+        run: .\scripts\build-host-tests.ps1
+
+      - name: Build and validate install ISO
+        shell: powershell
+        run: .\scripts\make-install-media.ps1 -Validate
+
+      - name: MCP server tests
+        shell: powershell
+        run: python -m unittest discover -s mcp -p "test_*.py" -v

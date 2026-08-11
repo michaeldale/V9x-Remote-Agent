@@ -1,0 +1,10 @@
+build/
+.claude/
+__pycache__/
+.pytest_cache/
+*.pyc
+*.pyo
+*.obj
+*.map
+*.err
+*.lnk

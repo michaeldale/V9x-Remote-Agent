@@ -1,0 +1,49 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+jobs:
+  release:
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: open-watcom/setup-watcom@v1
+        with:
+          version: "2.0"
+
+      - name: Build release artifacts
+        shell: powershell
+        run: .\scripts\make-release.ps1
+
+      - name: Extract changelog section for release notes
+        shell: powershell
+        run: |
+          $lines = Get-Content CHANGELOG.md
+          $start = -1
+          for ($i = 0; $i -lt $lines.Count; $i++) {
+            if ($lines[$i] -match '^## ') { $start = $i; break }
+          }
+          if ($start -lt 0) { throw 'No release section found in CHANGELOG.md.' }
+          $end = $lines.Count
+          for ($i = $start + 1; $i -lt $lines.Count; $i++) {
+            if ($lines[$i] -match '^## ') { $end = $i; break }
+          }
+          $lines[$start..($end - 1)] | Set-Content build\release\NOTES.md -Encoding UTF8
+
+      - name: Create GitHub release
+        shell: powershell
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $zip = Get-ChildItem build\release\v9xremote-*.zip | Select-Object -First 1
+          gh release create "${{ github.ref_name }}" `
+            $zip.FullName `
+            build\release\V9XREMOTE.ISO `
+            build\release\SHA256SUMS `
+            --title "V9x Remote Agent ${{ github.ref_name }}" `
+            --notes-file build\release\NOTES.md
