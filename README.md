@@ -5,8 +5,8 @@ development and debugging. A 141 KB runtime-free agent runs inside Windows
 95/98/Me (typically an 86Box VM). A PowerShell CLI and an MCP server on the
 host let a developer, or an AI coding agent working on their behalf, build
 software on a modern machine, push it into the guest, run it, capture output
-and screenshots, and reboot the guest with cryptographic-grade proof that the
-reboot actually happened.
+and screenshots, and run a verified reboot workflow with reconnect, persisted
+resume-token, and desktop-readiness checks.
 
 ![Windows 98 desktop captured through the agent](docs/images/win98-desktop.png)
 
@@ -29,14 +29,16 @@ clean reboot without a human touching the emulator.
   byte limits, timeouts, cancellation, and deterministic exit codes
 - CRC32-verified transactional file upload/download (`.PART` staging plus
   rollback backups) and recursive host-to-guest tree push
-- Proven reboots: a persisted resume token plus a boot counter mean "the guest
-  rebooted" is verified, never assumed
+- Verified reboot workflow: require disconnect/reconnect, the exact persisted
+  resume token, a changed agent-start counter, and desktop readiness. The
+  counter alone is not machine-reboot proof.
 - Desktop-ready polling and 24-bit BMP screenshot capture
 - Mouse and keyboard injection (move, click, drag, wheel, hotkeys, typed text)
   so an agent can drive dialogs and installers the UI only exposes visually
 - A small, versioned, fragmentation-safe TCP protocol (see
-  [docs/protocol.md](docs/protocol.md)); the guest agent is a single 141 KB
-  EXE with audited imports and no runtime dependencies
+  [docs/protocol.md](docs/protocol.md)); the guest uses a small network agent
+  plus a disposable screenshot helper, with audited imports and no runtime
+  dependencies
 - Optional IPv4 binding, port, and client allowlist for real retro hardware
   on an isolated network ([docs/physical-machine.md](docs/physical-machine.md))
 

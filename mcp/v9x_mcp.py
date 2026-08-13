@@ -717,7 +717,7 @@ def guest_path_schema(description):
 TOOLS = [
     {
         "name": "v9x_ping",
-        "description": "Check that the Windows 9x guest agent is alive; returns uptime and boot counter.",
+        "description": "Check that the Windows 9x guest agent is alive; returns uptime and the agent-start counter (not reboot proof by itself).",
         "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
     },
     {
@@ -900,7 +900,7 @@ TOOLS = [
     },
     {
         "name": "v9x_screenshot",
-        "description": "Capture the guest's screen and return it as a PNG image you can see. Optionally also saves it locally.",
+        "description": "Capture a confirmed-stable guest desktop as PNG. Never call during a fullscreen transition or suspected display wedge; use info, trace execution, and file retrieval first.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -911,7 +911,7 @@ TOOLS = [
     },
     {
         "name": "v9x_reboot_with_proof",
-        "description": "Reboot the guest and wait for proof: a fresh connection with a higher boot counter and the echoed resume token. Call v9x_wait_desktop afterwards before GUI work.",
+        "description": "Reboot and verify disconnect/reconnect with a changed agent-start counter and echoed resume token. The counter alone is not reboot proof. Call v9x_wait_desktop afterwards to complete confirmation before GUI work.",
         "inputSchema": {
             "type": "object",
             "properties": {

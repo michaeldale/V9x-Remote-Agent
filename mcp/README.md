@@ -52,7 +52,7 @@ unauthenticated (see [../SECURITY.md](../SECURITY.md)).
 | `v9x_key` | Press a key or hotkey combo, e.g. `CTRL+ESC`, `ALT+F4` |
 | `v9x_scroll` | Scroll the mouse wheel |
 | `v9x_input` | Raw ordered action batch for drags and precise sequences |
-| `v9x_reboot_with_proof` | Reboot and verify via boot counter + echoed resume token |
+| `v9x_reboot_with_proof` | Reboot and verify reconnect + changed agent-start counter + echoed resume token |
 | `v9x_shutdown` | Clean shutdown |
 | `v9x_wait_desktop` | Block until the Windows desktop is ready |
 
@@ -63,6 +63,10 @@ The screenshot tool converts the agent's 24-bit BMP to PNG in-process (also
 standard library only) and returns it as an MCP image content block, so the
 model can actually look at the Windows 98 screen. Pass `save_path` to keep a
 copy on disk.
+
+Never request a screenshot during a fullscreen mode transition or suspected
+display wedge. Use info, direct trace execution, and file retrieval first;
+capture only after the desktop/display is confirmed stable.
 
 ## Typical agent loop
 

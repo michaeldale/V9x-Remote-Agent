@@ -98,10 +98,11 @@ A fully annotated version with sample outputs is in
 
 ## Failure handling rules
 
-- **A reboot is proven, never assumed.** `reboot` succeeds only when the
-  agent reconnects with a higher boot counter and echoes back the exact
-  `-JobId` token from `PENDING.DAT`. If exit code is 42, the guest may be
-  hung: capture a screenshot before touching anything else.
+- **A reboot is proven, never assumed.** `BootCounter` increments whenever the
+  agent starts, so a larger value alone is not reboot proof. Require the old
+  connection to end, a new connection with the exact `-JobId` token from
+  `PENDING.DAT`, and `wait-desktop` success. If recovery is uncertain, use
+  `info`, execute a trace dumper directly, and download trace files first.
 - Call `wait-desktop` after every reboot and before any GUI `exec` or
   `screenshot`; services start before the shell does.
 - GUI programs: direct `exec` of a GUI-subsystem EXE leaves window state to
@@ -114,7 +115,11 @@ A fully annotated version with sample outputs is in
   focused window, so bring it forward (click its title bar) before typing, and
   avoid `ALT+F4` on the bare desktop (it raises the Shut Down dialog).
 - A GUI program that only exits from its paint path needs a visible desktop;
-  if it times out, screenshot first, then check `wait-desktop`.
+  if it times out, check `info` and `wait-desktop` before considering capture.
+- Never request a screenshot during a fullscreen transition or a suspected
+  display wedge. A screenshot invokes the Win98 display driver through GDI.
+  Capture only on a confirmed stable desktop/window. If the agent disappears,
+  recover externally and check trace files before launching more graphics code.
 - Long operations: `exec` streams output live and enforces `-TimeoutSeconds`
   on the guest side; a timed-out child is terminated (exit code 32). Pick
   timeouts explicitly rather than relying on the 60 s default.

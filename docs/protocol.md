@@ -135,16 +135,17 @@ ASCII resume token of at most 63 bytes. Before acknowledging, the guest flushes
 the token to `C:\V9XREMOTE\PENDING.DAT`. The corresponding accepted response
 (`0x8040` or `0x8041`) contains the current boot counter and echoed token.
 
-For reboot, the host disconnects and accepts success only after a fresh HELLO
-reports a different boot counter and the exact persisted token. Agent
-availability alone is not reboot proof. Power control is refused while an
+The boot counter advances whenever the agent starts and is not reboot proof by
+itself. For reboot, the host requires disconnect/reconnect to a fresh HELLO
+with a different counter and the exact persisted token, followed by desktop
+readiness. Agent availability alone is not proof. Power control is refused while an
 execution request is active, and any active file transaction is cleaned before
 the Windows power request.
 
 ## Screenshot
 
-`SCREENSHOT_REQUEST` (`0x0050`) carries a destination path in the guest. The
-agent captures the current display into a bottom-up, 24-bit BI_RGB BMP, flushes
+`SCREENSHOT_REQUEST` (`0x0050`) carries a destination path in the guest. A
+disposable helper captures the display into a bottom-up, 24-bit BI_RGB BMP, flushes
 it to disk, and returns `SCREENSHOT_RESPONSE` (`0x8050`) with width, height,
 source bits-per-pixel, file size, CRC32, and guest path. The host then downloads
 that BMP through the normal file-read protocol and verifies both metadata sets.

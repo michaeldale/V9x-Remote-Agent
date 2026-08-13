@@ -85,8 +85,10 @@ Boot and capture examples:
     -Destination .\mode.bmp
 ```
 
-`reboot` succeeds only when a new HELLO has both a changed boot counter and the
-requested persisted job token. `wait-desktop` polls INFO until the Explorer
+`BootCounter` increments on every agent start and is not reboot proof alone.
+`reboot` succeeds only after disconnect/reconnect when a new HELLO has both a
+changed counter and the requested persisted job token. `wait-desktop` must
+then confirm Explorer readiness before post-reboot work; it polls INFO until the Explorer
 desktop (`Progman` or `Shell_TrayWnd`) appears. `screenshot` writes on the guest
 and then transactionally downloads and verifies the BMP.
 

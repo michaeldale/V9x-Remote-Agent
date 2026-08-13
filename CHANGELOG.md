@@ -2,6 +2,32 @@
 
 All notable changes to the V9x Remote Agent. Dates are in YYYY-MM-DD.
 
+## 0.5.2 (2026-08-13)
+
+### Fixed
+- Screenshot capture and all GDI screen probing now run in the disposable
+  `V9XSHOT.EXE` helper. A display-driver GPF or blocked GDI call can no longer
+  directly crash the network agent; the agent terminates a helper that has not
+  completed within 7.5 seconds and returns a normal screenshot error.
+- Capture is rejected unless Explorer's desktop is ready, and the helper
+  refuses a mode whose dimensions change during a short stability sample.
+- `V9XAGNT.EXE` no longer imports GDI32. HELLO and INFO use USER screen metrics
+  and report bits-per-pixel as unknown (`0`); successful screenshot responses
+  still report the source colour depth measured by the helper.
+- The Win98 install and staged-update paths deploy the helper with the matching
+  agent build.
+- `INSTALL.BAT` validates the complete package before modifying the guest,
+  checks every required copy, and removes both staged binaries if either copy
+  fails. `UPDATE.BAT` installs the helper before activating the matching agent.
+
+### Changed
+- Recovery guidance now forbids screenshots during fullscreen mode changes or
+  suspected display wedges. Use INFO, direct trace-dump execution, and file
+  download first, and capture only after desktop readiness is re-established.
+- `BootCounter` is documented as an agent-start counter, not independent reboot
+  proof; reconnect, the persisted resume token, and desktop readiness are
+  required before post-reboot GUI work.
+
 ## 0.5.1 (2026-08-12)
 
 Fixes a live execution wedge: `shell -Command "start SETUP.EXE"` spawned a

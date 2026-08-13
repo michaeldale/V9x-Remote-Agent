@@ -1460,7 +1460,10 @@ Changes to Velocity9x should remain in the Velocity9x repository; the standalone
 
 **Risk:** A broken display driver can make screenshot capture hang or crash.
 
-**Mitigation:** screenshot is optional and late in the flow; invoke only after a fresh liveness check; preserve serial and host timeouts.
+**Mitigation:** screenshot is optional and late in the flow; invoke only on a
+confirmed stable desktop. All GDI capture runs in a disposable helper with a
+hard timeout, while the network agent has no GDI32 import. During transitions
+or suspected wedges, prefer INFO, direct trace-dump execution, and file download.
 
 ### 18.4 Child process blocks output pipes
 

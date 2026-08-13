@@ -141,10 +141,7 @@ foreach ($requiredImport in @('Accept', 'Bind', 'CreateFileA', 'CreateMutexA',
                                'FindNextFileA', 'GetExitCodeProcess',
                                'GetFileAttributesA', 'GetFileSize',
                                'GetPrivateProfileIntA', 'GetPrivateProfileStringA',
-                               'GetVersion',
-                               'BitBlt', 'CreateCompatibleBitmap',
-                               'CreateCompatibleDC', 'ExitWindowsEx', 'FindWindowA',
-                               'GetDIBits',
+                               'GetVersion', 'ExitWindowsEx', 'FindWindowA',
                                'GetSystemMetrics', 'Inet_addr', 'Listen', 'MoveFileA',
                                'PeekNamedPipe', 'Recv', 'Send', 'Socket',
                                'TerminateProcess', 'WSAStartup',
@@ -157,8 +154,48 @@ foreach ($requiredImport in @('Accept', 'Bind', 'CreateFileA', 'CreateMutexA',
         throw "Guest output is missing expected import $requiredImport."
     }
 }
+if ($dllNames -contains 'GDI32.DLL') {
+    throw 'The long-lived guest agent must not import GDI32.DLL; capture belongs in V9XSHOT.EXE.'
+}
+
+$helperSource = Join-Path $repoRoot 'src\guest\screenshot_helper.c'
+$helperObject = Join-Path $outputDir 'src_guest_screenshot_helper.obj'
+$helperExecutable = Join-Path $outputDir 'V9XSHOT.EXE'
+$helperMapFile = Join-Path $outputDir 'V9XSHOT.MAP'
+$helperLinkFile = Join-Path $outputDir 'V9XSHOT.LNK'
+& $compiler '-bt=nt' '-zq' '-wx' '-zl' '-s' '-os' "-fo=$helperObject" $helperSource
+if ($LASTEXITCODE -ne 0) {
+    throw 'Open Watcom failed to compile src\guest\screenshot_helper.c.'
+}
+$helperLinkLines = @(
+    'format windows nt',
+    'runtime windows=4.0',
+    'option quiet',
+    'option nodefaultlibs',
+    "option start='_V9xScreenshotEntry@0'",
+    'option stack=65536',
+    "option map='$helperMapFile'",
+    "name '$helperExecutable'",
+    "file '$helperObject'",
+    "library '$(Join-Path $watcomRoot 'lib386\nt\kernel32.lib')'",
+    "library '$(Join-Path $watcomRoot 'lib386\nt\user32.lib')'",
+    "library '$(Join-Path $watcomRoot 'lib386\nt\gdi32.lib')'"
+)
+Set-Content -LiteralPath $helperLinkFile -Encoding Ascii -Value $helperLinkLines
+& $linker "@$helperLinkFile"
+if ($LASTEXITCODE -ne 0) { throw 'Open Watcom failed to link V9XSHOT.EXE.' }
+$helperDumpText = (@(& $dumper -e $helperExecutable 2>&1)) -join "`n"
+if ($LASTEXITCODE -ne 0) { throw 'wdump could not inspect V9XSHOT.EXE.' }
+foreach ($requiredImport in @('BitBlt', 'CreateCompatibleBitmap',
+                               'CreateCompatibleDC', 'GetDIBits',
+                               'SetErrorMode')) {
+    if ($helperDumpText -notmatch "(?im)\s$([regex]::Escape($requiredImport))\s*$") {
+        throw "Screenshot helper is missing expected import $requiredImport."
+    }
+}
 
 Copy-Item -LiteralPath $executable -Destination (Join-Path $packageDir 'V9XAGNT.EXE') -Force
+Copy-Item -LiteralPath $helperExecutable -Destination (Join-Path $packageDir 'V9XSHOT.EXE') -Force
 foreach ($name in @('INSTALL.BAT', 'UNINSTALL.BAT', 'UPDATE.BAT', 'INSTALL.REG',
                      'REMOVE.REG', 'UPDATE.REG', 'AGENT.INI', 'README.TXT')) {
     $sourceLines = @(Get-Content -LiteralPath (Join-Path $repoRoot "packaging\win98se\$name"))
@@ -178,6 +215,7 @@ Set-Content -LiteralPath (Join-Path $packageDir 'SHA256.TXT') -Encoding Ascii -V
 
 [pscustomobject]@{
     Executable = $executable
+    ScreenshotHelper = $helperExecutable
     Package = $packageDir
     BuildId = $BuildId
     Bytes = $bytes.Length

@@ -22,7 +22,13 @@ UPDATE.BAT to run during the next boot. UPDATE.BAT replaces the inactive old
 binary, restores normal RunServices startup, and launches the new agent.
 
 The package includes install, update, and removal registry files. INSTALL.BAT
-copies them into C:\V9XREMOTE. The agent writes AGENT.LOG and BOOT.DAT there.
+copies them and the disposable V9XSHOT.EXE capture helper into C:\V9XREMOTE.
+The agent writes AGENT.LOG and BOOT.DAT there. BOOT.DAT counts agent starts;
+it is not proof of a machine reboot by itself.
+
+Never request a screenshot during a fullscreen mode transition or suspected
+display wedge. Use INFO, run a trace dumper directly, and retrieve trace files
+first. Capture only after Explorer's desktop is ready and the display is stable.
 
 The protocol is unauthenticated. Keep the guest behind 86Box SLiRP and protect
 the forwarded port with the host firewall. Never expose port 9869 to a LAN or

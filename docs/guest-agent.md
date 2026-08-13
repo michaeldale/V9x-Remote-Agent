@@ -55,7 +55,7 @@ values so the host can prove the intended boot completed. Power requests are
 rejected while a child execution is active.
 
 Desktop readiness requires a visible desktop plus an Explorer `Progman` or
-`Shell_TrayWnd` window. Screenshot capture uses GDI to write a bounded 24-bit
+`Shell_TrayWnd` window. The disposable `V9XSHOT.EXE` helper uses GDI to write a bounded 24-bit
 BMP under `C:\V9XREMOTE\TEMP` by default. It reports file size and CRC32 before
 the host retrieves the image through the transactional download path.
 

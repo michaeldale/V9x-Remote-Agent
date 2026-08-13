@@ -4,15 +4,12 @@
 #include "v9xremote/status.h"
 
 #define V9X_SCREEN_MAX_BYTES 16777216ul
+#define V9X_SCREEN_HELPER_TIMEOUT 7500ul
 
+static const char v9x_screen_helper[] = "C:\\V9XREMOTE\\V9XSHOT.EXE";
+static const char v9x_screen_capture[] = "C:\\V9XREMOTE\\TEMP\\CAPTURE.$$$";
+static const char v9x_screen_metadata[] = "C:\\V9XREMOTE\\TEMP\\CAPTURE.DAT";
 static unsigned char v9x_screen_response[320];
-
-static void v9x_screen_zero(void *target, unsigned long length)
-{
-    unsigned char *bytes = (unsigned char *)target;
-    unsigned long index;
-    for (index = 0ul; index < length; ++index) bytes[index] = 0u;
-}
 
 static int v9x_screen_path(const unsigned char *payload, unsigned long length,
                            char *path)
@@ -30,6 +27,20 @@ static int v9x_screen_path(const unsigned char *payload, unsigned long length,
     }
     path[path_length] = '\0';
     return 1;
+}
+
+static int v9x_ascii_path_equal(const char *left, const char *right)
+{
+    unsigned char a;
+    unsigned char b;
+    for (;;) {
+        a = (unsigned char)*left++;
+        b = (unsigned char)*right++;
+        if (a >= 'a' && a <= 'z') a = (unsigned char)(a - ('a' - 'A'));
+        if (b >= 'a' && b <= 'z') b = (unsigned char)(b - ('a' - 'A'));
+        if (a != b) return 0;
+        if (a == 0u) return 1;
+    }
 }
 
 static int v9x_screen_error(V9xAgentState *state, DWORD request_id,
@@ -61,6 +72,22 @@ static int v9x_write_all(HANDLE file, const unsigned char *data, DWORD length,
     return 1;
 }
 
+static int v9x_read_all(HANDLE file, unsigned char *data, DWORD length,
+                        DWORD *native_error)
+{
+    DWORD offset = 0ul;
+    DWORD received;
+    while (offset < length) {
+        if (!ReadFile(file, data + offset, length - offset, &received, 0) ||
+            received == 0ul) {
+            *native_error = GetLastError();
+            return 0;
+        }
+        offset += received;
+    }
+    return 1;
+}
+
 int v9x_desktop_ready(void)
 {
     HWND desktop = GetDesktopWindow();
@@ -72,15 +99,63 @@ int v9x_desktop_ready(void)
 
 void v9x_screen_info(DWORD *width, DWORD *height, DWORD *bits_per_pixel)
 {
-    HDC screen = GetDC(0);
+    /* Keep HELLO and INFO out of GDI.  A damaged display driver must not be
+       able to fault the long-lived agent merely because a client connects. */
     *width = (DWORD)GetSystemMetrics(SM_CXSCREEN);
     *height = (DWORD)GetSystemMetrics(SM_CYSCREEN);
     *bits_per_pixel = 0ul;
-    if (screen != 0) {
-        *bits_per_pixel = (DWORD)(GetDeviceCaps(screen, BITSPIXEL) *
-                                  GetDeviceCaps(screen, PLANES));
-        (void)ReleaseDC(0, screen);
+}
+
+static int v9x_run_screen_helper(DWORD *native_error)
+{
+    STARTUPINFOA startup;
+    PROCESS_INFORMATION process;
+    char command_line[64];
+    DWORD wait_result;
+    DWORD exit_code = 0ul;
+    unsigned long index;
+
+    for (index = 0ul; index < sizeof(startup); ++index)
+        ((unsigned char *)&startup)[index] = 0u;
+    for (index = 0ul; index < sizeof(process); ++index)
+        ((unsigned char *)&process)[index] = 0u;
+    startup.cb = sizeof(startup);
+    for (index = 0ul; v9x_screen_helper[index] != '\0'; ++index)
+        command_line[index] = v9x_screen_helper[index];
+    command_line[index] = '\0';
+
+    (void)DeleteFileA(v9x_screen_capture);
+    (void)DeleteFileA(v9x_screen_metadata);
+    if (!CreateProcessA(v9x_screen_helper, command_line, 0, 0, FALSE,
+                        CREATE_NEW_PROCESS_GROUP, 0, "C:\\V9XREMOTE\\TEMP",
+                        &startup, &process)) {
+        *native_error = GetLastError();
+        return 0;
     }
+    CloseHandle(process.hThread);
+    wait_result = WaitForSingleObject(process.hProcess,
+                                      V9X_SCREEN_HELPER_TIMEOUT);
+    if (wait_result == WAIT_TIMEOUT) {
+        v9x_log_line("screenshot-helper-timeout");
+        (void)TerminateProcess(process.hProcess, ERROR_TIMEOUT);
+        (void)WaitForSingleObject(process.hProcess, 1000ul);
+        *native_error = ERROR_TIMEOUT;
+        CloseHandle(process.hProcess);
+        return 0;
+    }
+    if (wait_result != WAIT_OBJECT_0 ||
+        !GetExitCodeProcess(process.hProcess, &exit_code)) {
+        *native_error = GetLastError();
+        CloseHandle(process.hProcess);
+        return 0;
+    }
+    CloseHandle(process.hProcess);
+    if (exit_code != 0ul) {
+        v9x_log_line("screenshot-helper-failed");
+        *native_error = exit_code;
+        return 0;
+    }
+    return 1;
 }
 
 int v9x_capture_screenshot(V9xAgentState *state, unsigned long request_id,
@@ -88,22 +163,15 @@ int v9x_capture_screenshot(V9xAgentState *state, unsigned long request_id,
                            unsigned long length)
 {
     char path[260];
-    HDC screen = 0;
-    HDC memory = 0;
-    HBITMAP bitmap = 0;
-    HGDIOBJ old_object = 0;
-    BITMAPINFO info;
-    unsigned char bitmap_header[14];
-    unsigned char dib_header[40];
-    unsigned char *pixels = 0;
+    unsigned char metadata[20];
+    unsigned char *image = 0;
     HGLOBAL allocation = 0;
     HANDLE file = INVALID_HANDLE_VALUE;
     DWORD width;
     DWORD height;
     DWORD source_bpp;
-    DWORD row_bytes;
-    DWORD image_bytes;
     DWORD file_bytes;
+    DWORD actual_bytes;
     DWORD native_error = 0ul;
     DWORD crc;
     unsigned long response_offset = 20ul;
@@ -114,81 +182,74 @@ int v9x_capture_screenshot(V9xAgentState *state, unsigned long request_id,
                                 ERROR_INVALID_PARAMETER,
                                 "invalid screenshot path");
     }
+    if (v9x_ascii_path_equal(path, v9x_screen_capture) ||
+        v9x_ascii_path_equal(path, v9x_screen_metadata)) {
+        return v9x_screen_error(state, request_id, V9X_STATUS_INVALID_PAYLOAD,
+                                ERROR_INVALID_PARAMETER,
+                                "screenshot path is reserved");
+    }
     if (InterlockedCompareExchange(&state->exec_active, 0l, 0l) != 0l) {
         return v9x_screen_error(state, request_id, V9X_STATUS_BUSY, 0ul,
                                 "execution active");
     }
-    v9x_screen_info(&width, &height, &source_bpp);
+    if (!v9x_desktop_ready()) {
+        return v9x_screen_error(state, request_id, V9X_STATUS_BUSY, 0ul,
+                                "desktop not ready for screenshot");
+    }
+    v9x_log_line("screenshot-helper-start");
+    if (!v9x_run_screen_helper(&native_error)) goto cleanup;
+
+    file = CreateFileA(v9x_screen_metadata, GENERIC_READ, FILE_SHARE_READ, 0,
+                       OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, 0);
+    if (file == INVALID_HANDLE_VALUE) { native_error = GetLastError(); goto cleanup; }
+    if (GetFileSize(file, 0) != sizeof(metadata) ||
+        !v9x_read_all(file, metadata, sizeof(metadata), &native_error)) goto cleanup;
+    CloseHandle(file);
+    file = INVALID_HANDLE_VALUE;
+    if (v9x_read_u32(metadata) != 0x31533956ul) {
+        native_error = ERROR_INVALID_DATA; goto cleanup;
+    }
+    width = v9x_read_u32(metadata + 4);
+    height = v9x_read_u32(metadata + 8);
+    source_bpp = v9x_read_u32(metadata + 12);
+    file_bytes = v9x_read_u32(metadata + 16);
     if (width == 0ul || height == 0ul || width > 4096ul || height > 4096ul ||
-        width > (0xfffffffful - 3ul) / 3ul) {
-        return v9x_screen_error(state, request_id, V9X_STATUS_LIMIT_EXCEEDED,
-                                ERROR_INSUFFICIENT_BUFFER,
-                                "screen dimensions exceed limits");
+        file_bytes < 54ul || file_bytes > V9X_SCREEN_MAX_BYTES + 54ul) {
+        native_error = ERROR_INVALID_DATA; goto cleanup;
     }
-    row_bytes = (width * 3ul + 3ul) & ~3ul;
-    if (height > V9X_SCREEN_MAX_BYTES / row_bytes) {
-        return v9x_screen_error(state, request_id, V9X_STATUS_LIMIT_EXCEEDED,
-                                ERROR_INSUFFICIENT_BUFFER,
-                                "screenshot exceeds memory limit");
+
+    file = CreateFileA(v9x_screen_capture, GENERIC_READ, FILE_SHARE_READ, 0,
+                       OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, 0);
+    if (file == INVALID_HANDLE_VALUE) { native_error = GetLastError(); goto cleanup; }
+    actual_bytes = GetFileSize(file, 0);
+    if (actual_bytes != file_bytes || actual_bytes == 0xfffffffful) {
+        native_error = ERROR_INVALID_DATA; goto cleanup;
     }
-    image_bytes = row_bytes * height;
-    file_bytes = 54ul + image_bytes;
-    screen = GetDC(0);
-    if (screen == 0) { native_error = GetLastError(); goto cleanup; }
-    memory = CreateCompatibleDC(screen);
-    if (memory == 0) { native_error = GetLastError(); goto cleanup; }
-    bitmap = CreateCompatibleBitmap(screen, (int)width, (int)height);
-    if (bitmap == 0) { native_error = GetLastError(); goto cleanup; }
-    old_object = SelectObject(memory, bitmap);
-    if (old_object == 0 || old_object == HGDI_ERROR) {
-        native_error = GetLastError(); goto cleanup;
+    allocation = GlobalAlloc(GMEM_FIXED, file_bytes);
+    if (allocation == 0) { native_error = ERROR_NOT_ENOUGH_MEMORY; goto cleanup; }
+    image = (unsigned char *)allocation;
+    if (!v9x_read_all(file, image, file_bytes, &native_error)) goto cleanup;
+    CloseHandle(file);
+    file = INVALID_HANDLE_VALUE;
+    if (image[0] != 'B' || image[1] != 'M' ||
+        v9x_read_u32(image + 2) != file_bytes ||
+        v9x_read_u32(image + 18) != width ||
+        v9x_read_u32(image + 22) != height) {
+        native_error = ERROR_INVALID_DATA; goto cleanup;
     }
-    if (!BitBlt(memory, 0, 0, (int)width, (int)height,
-                screen, 0, 0, SRCCOPY)) {
-        native_error = GetLastError(); goto cleanup;
-    }
-    (void)SelectObject(memory, old_object);
-    old_object = 0;
-    v9x_screen_zero(&info, sizeof(info));
-    info.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-    info.bmiHeader.biWidth = (LONG)width;
-    info.bmiHeader.biHeight = (LONG)height;
-    info.bmiHeader.biPlanes = 1u;
-    info.bmiHeader.biBitCount = 24u;
-    info.bmiHeader.biCompression = BI_RGB;
-    info.bmiHeader.biSizeImage = image_bytes;
-    allocation = GlobalAlloc(GMEM_FIXED, image_bytes);
-    if (allocation == 0) { native_error = GetLastError(); goto cleanup; }
-    pixels = (unsigned char *)allocation;
-    if (GetDIBits(screen, bitmap, 0u, (UINT)height, pixels, &info,
-                  DIB_RGB_COLORS) != (int)height) {
-        native_error = GetLastError(); goto cleanup;
-    }
-    v9x_screen_zero(bitmap_header, sizeof(bitmap_header));
-    bitmap_header[0] = 'B'; bitmap_header[1] = 'M';
-    v9x_write_u32(bitmap_header + 2, file_bytes);
-    v9x_write_u32(bitmap_header + 10, 54ul);
-    v9x_screen_zero(dib_header, sizeof(dib_header));
-    v9x_write_u32(dib_header, 40ul);
-    v9x_write_u32(dib_header + 4, width);
-    v9x_write_u32(dib_header + 8, height);
-    v9x_write_u16(dib_header + 12, 1u);
-    v9x_write_u16(dib_header + 14, 24u);
-    v9x_write_u32(dib_header + 20, image_bytes);
+
     file = CreateFileA(path, GENERIC_WRITE, 0, 0, CREATE_ALWAYS,
                        FILE_ATTRIBUTE_NORMAL, 0);
     if (file == INVALID_HANDLE_VALUE) { native_error = GetLastError(); goto cleanup; }
-    if (!v9x_write_all(file, bitmap_header, sizeof(bitmap_header), &native_error) ||
-        !v9x_write_all(file, dib_header, sizeof(dib_header), &native_error) ||
-        !v9x_write_all(file, pixels, image_bytes, &native_error) ||
+    if (!v9x_write_all(file, image, file_bytes, &native_error) ||
         !FlushFileBuffers(file)) {
         if (native_error == 0ul) native_error = GetLastError();
         goto cleanup;
     }
+    CloseHandle(file);
+    file = INVALID_HANDLE_VALUE;
     crc = v9x_crc32_begin();
-    crc = v9x_crc32_update(crc, bitmap_header, sizeof(bitmap_header));
-    crc = v9x_crc32_update(crc, dib_header, sizeof(dib_header));
-    crc = v9x_crc32_update(crc, pixels, image_bytes);
+    crc = v9x_crc32_update(crc, image, file_bytes);
     crc = v9x_crc32_end(crc);
     v9x_write_u32(v9x_screen_response, width);
     v9x_write_u32(v9x_screen_response + 4, height);
@@ -203,13 +264,11 @@ cleanup:
     if (file != INVALID_HANDLE_VALUE) CloseHandle(file);
     if (!success) (void)DeleteFileA(path);
     if (allocation != 0) (void)GlobalFree(allocation);
-    if (old_object != 0 && memory != 0) (void)SelectObject(memory, old_object);
-    if (bitmap != 0) (void)DeleteObject(bitmap);
-    if (memory != 0) (void)DeleteDC(memory);
-    if (screen != 0) (void)ReleaseDC(0, screen);
+    (void)DeleteFileA(v9x_screen_capture);
+    (void)DeleteFileA(v9x_screen_metadata);
     if (!success) {
         return v9x_screen_error(state, request_id, V9X_STATUS_IO_FAILED,
-                                native_error, "screenshot capture failed");
+                                native_error, "screenshot helper failed");
     }
     v9x_log_line("screenshot-complete");
     return v9x_send_frame(state, V9X_MSG_SCREENSHOT_RESPONSE, request_id,

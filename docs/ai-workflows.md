@@ -106,8 +106,10 @@ shell finishes loading.
 - **Visual regressions**: screenshot before and after, compare on the host.
   The desktop is 800x600 or whatever the guest mode is; `info` reports the
   current mode.
-- **Hang diagnosis**: on exec timeout, take a screenshot (is there an error
-  dialog?), then `get C:\V9XREMOTE\AGENT.LOG` for the agent's view.
+- **Hang diagnosis**: on exec timeout, use `info`, run any trace dumper
+  directly, and retrieve logs with `get`. Only take a screenshot after the
+  desktop/display is known stable; never capture during a fullscreen mode
+  transition or suspected display wedge.
 - **Crash recovery**: if the guest wedges hard, a VM restart is fine; the
   agent starts with Windows, `BOOT.DAT` keeps the boot counter monotonic, and
   interrupted transfers leave only `.PART`/`.V9X.BAK` files, never a corrupt
