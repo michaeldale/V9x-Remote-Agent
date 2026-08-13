@@ -20,8 +20,8 @@ Nothing requires clicking inside the emulator.
 |---|---|---|
 | `ping` | | Liveness; returns uptime and boot counter |
 | `info` | | Agent version, build ID, computer name, screen mode, pending job |
-| `exec` | `-Application`, `-Arguments`, `-WorkingDirectory`, `-TimeoutSeconds`, `-ExpectedExitCode`, `-ShowWindow` | Run a Win32 EXE directly, capture stdout/stderr |
-| `shell` | `-Command`, `-TimeoutSeconds` | Run through `COMMAND.COM /C` (built-ins, batch files) |
+| `exec` | `-Application`, `-Arguments`, `-WorkingDirectory`, `-TimeoutSeconds`, `-ExpectedExitCode`, `-ShowWindow`, `-Detach` | Run a Win32 EXE directly, capture stdout/stderr |
+| `shell` | `-Command`, `-TimeoutSeconds`, `-Detach` | Run through `COMMAND.COM /C` (built-ins, batch files) |
 | `stat` | `-Path` | Existence, size, attributes |
 | `list` | `-Path` | Directory listing (bounded to 16 KiB) |
 | `mkdir` | `-Path` | Idempotent directory creation |
@@ -118,6 +118,13 @@ A fully annotated version with sample outputs is in
 - Long operations: `exec` streams output live and enforces `-TimeoutSeconds`
   on the guest side; a timed-out child is terminated (exit code 32). Pick
   timeouts explicitly rather than relying on the 60 s default.
+- Launching a program that outlives the request (an installer you will drive
+  with `input`, or anything you would reach for `START` to do): pass
+  `-Detach`. Never run `shell -Command "start FOO.EXE"`: on Windows 9x the
+  detached child keeps the `COMMAND.COM` wrapper alive, so the request holds
+  the execution slot until its timeout. A detached exec returns immediately
+  with `Detached: true` and captures no output; an `Orphaned: true` result
+  means a non-detached shell command left descendants running.
 - If the agent refuses connections right after a reboot, it is normal: retry
   `ping` for up to ~2 minutes while Windows boots.
 

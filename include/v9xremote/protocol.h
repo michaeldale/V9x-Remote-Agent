@@ -59,18 +59,21 @@
 #define V9X_CAP_SCREENSHOT_BMP 0x00000100ul
 #define V9X_CAP_DRIVER_UPDATE  0x00000200ul
 #define V9X_CAP_INPUT_INJECT   0x00000400ul
+#define V9X_CAP_EXEC_DETACH    0x00000800ul
 #define V9X_CAPABILITIES (V9X_CAP_INFO | V9X_CAP_PING | \
                           V9X_CAP_EXEC_DIRECT | V9X_CAP_EXEC_SHELL | \
                           V9X_CAP_EXEC_CANCEL | V9X_CAP_FILE_READ | \
                           V9X_CAP_FILE_WRITE | V9X_CAP_POWER_CONTROL | \
                           V9X_CAP_SCREENSHOT_BMP | V9X_CAP_DRIVER_UPDATE | \
-                          V9X_CAP_INPUT_INJECT)
+                          V9X_CAP_INPUT_INJECT | V9X_CAP_EXEC_DETACH)
 
 #define V9X_MAX_FILE_SIZE 67108864ul
 #define V9X_FILE_CHUNK_SIZE 32768ul
 
 #define V9X_EXEC_MODE_DIRECT 0u
 #define V9X_EXEC_MODE_SHELL  1u
+#define V9X_EXEC_OPTION_DETACH 0x0001u
+#define V9X_EXEC_OPTION_MASK   0x0001u
 #define V9X_EXEC_RESULT_OK            0ul
 #define V9X_EXEC_RESULT_CREATE_FAILED 1ul
 #define V9X_EXEC_RESULT_TIMEOUT       2ul
@@ -82,6 +85,8 @@
 #define V9X_EXEC_FLAG_CANCELLED        0x00000008ul
 #define V9X_EXEC_FLAG_PIPE_CAPTURE     0x00000010ul
 #define V9X_EXEC_FLAG_GUI_WINDOW       0x00000020ul
+#define V9X_EXEC_FLAG_DETACHED         0x00000040ul
+#define V9X_EXEC_FLAG_ORPHANED         0x00000080ul
 
 /* Input-injection action opcodes (V9X_MSG_INPUT_REQUEST payload).
    Payload: u16 action count, then that many actions, each a u8 opcode

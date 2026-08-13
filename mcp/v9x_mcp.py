@@ -77,6 +77,7 @@ CAP_FILE_WRITE = 0x0040
 CAP_POWER = 0x0080
 CAP_SCREENSHOT = 0x0100
 CAP_INPUT = 0x0400
+CAP_EXEC_DETACH = 0x0800
 
 INPUT_OP_MOUSE_MOVE = 1
 INPUT_OP_MOUSE_BUTTON = 2
@@ -114,6 +115,10 @@ EXEC_FLAG_TIMED_OUT = 0x04
 EXEC_FLAG_CANCELLED = 0x08
 EXEC_FLAG_PIPE_CAPTURE = 0x10
 EXEC_FLAG_GUI_WINDOW = 0x20
+EXEC_FLAG_DETACHED = 0x40
+EXEC_FLAG_ORPHANED = 0x80
+
+EXEC_OPTION_DETACH = 0x0001
 
 EXEC_RESULT_NAMES = {
     0: "ok",
@@ -407,10 +412,14 @@ class V9xClient:
         timeout_ms=60000,
         show_window=False,
         output_limit=262144,
+        detach=False,
     ):
         self.require(CAP_EXEC if mode == 0 else CAP_SHELL, "execution")
+        if detach:
+            self.require(CAP_EXEC_DETACH, "detached execution")
         payload = struct.pack(
-            "<BBHIII", mode, 1 if show_window else 0, 0, timeout_ms, output_limit,
+            "<BBHIII", mode, 1 if show_window else 0,
+            EXEC_OPTION_DETACH if detach else 0, timeout_ms, output_limit,
             output_limit,
         )
         payload += encode_string(application)
@@ -454,6 +463,8 @@ class V9xClient:
                 "timed_out": bool(flags & EXEC_FLAG_TIMED_OUT),
                 "cancelled": bool(flags & EXEC_FLAG_CANCELLED),
                 "gui_window": bool(flags & EXEC_FLAG_GUI_WINDOW),
+                "detached": bool(flags & EXEC_FLAG_DETACHED),
+                "orphaned": bool(flags & EXEC_FLAG_ORPHANED),
             }
         finally:
             self.sock.settimeout(self.timeout)
@@ -725,6 +736,7 @@ TOOLS = [
                 "working_dir": {"type": "string", "description": "Guest working directory (optional)"},
                 "timeout_ms": {"type": "integer", "description": "Guest-side timeout in ms (default 60000, max 3600000)"},
                 "show_window": {"type": "boolean", "description": "Show the child's window (console children; GUI-subsystem EXEs manage their own window)"},
+                "detach": {"type": "boolean", "description": "Launch and return immediately without waiting or capturing output. Use for installers and programs that outlive the request."},
             },
             "required": ["application"],
             "additionalProperties": False,
@@ -738,6 +750,7 @@ TOOLS = [
             "properties": {
                 "command": {"type": "string", "description": "The shell command line"},
                 "timeout_ms": {"type": "integer", "description": "Guest-side timeout in ms (default 60000)"},
+                "detach": {"type": "boolean", "description": "Launch and return immediately without waiting or capturing output. Use instead of START for commands that spawn long-lived programs."},
             },
             "required": ["command"],
             "additionalProperties": False,
@@ -976,6 +989,7 @@ class ToolHandler:
                     working_dir=args.get("working_dir", ""),
                     timeout_ms=int(args.get("timeout_ms", 60000)),
                     show_window=bool(args.get("show_window", False)),
+                    detach=bool(args.get("detach", False)),
                 )
             )
 
@@ -986,6 +1000,7 @@ class ToolHandler:
                     1,
                     arguments=args["command"],
                     timeout_ms=int(args.get("timeout_ms", 60000)),
+                    detach=bool(args.get("detach", False)),
                 )
             )
 

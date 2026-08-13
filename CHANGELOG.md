@@ -2,6 +2,34 @@
 
 All notable changes to the V9x Remote Agent. Dates are in YYYY-MM-DD.
 
+## 0.5.1 (2026-08-12)
+
+Fixes a live execution wedge: `shell -Command "start SETUP.EXE"` spawned a
+detached child that kept the Windows 9x `COMMAND.COM` wrapper (and the
+inherited pipe write handles) alive, so the finished request held the guest's
+single execution slot for its full timeout and other connections were refused
+for 60 to 120 seconds.
+
+### Added
+- Detached execution: `v9xctl.ps1 exec`/`shell -Detach` (MCP: `detach: true`
+  on `v9x_exec`/`v9x_shell`) launches the child with all standard handles on
+  `NUL` and completes immediately without capturing output or waiting. Use it
+  instead of `START` for installers and other programs that outlive the
+  request. Request option bit `0x0001`, completion flag `0x40`, capability
+  bit `V9X_CAP_EXEC_DETACH` (0x800).
+
+### Fixed
+- Capture pipes are now created non-inheritable and the child receives
+  inheritable duplicates of only the write ends (via `DuplicateHandle`), so
+  agent-side read handles can no longer leak into a child's descendants.
+- Shell mode no longer burns the whole timeout when the command finished but
+  its DOS-VM wrapper lingers because of `START`-spawned or Win16
+  descendants: once every pipe write handle has closed and the process
+  handle is still unsignaled after a 2 s grace, the agent discards the
+  wrapper and completes the request successfully with new completion flag
+  `0x80` (`Orphaned`). Windows 9x has no job objects, so waiting on the
+  descendant tree is impossible by design.
+
 ## 0.5.0 (2026-08-11)
 
 First public release, focused on packaging the project for other people and

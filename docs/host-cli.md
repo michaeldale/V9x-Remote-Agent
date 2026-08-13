@@ -46,6 +46,15 @@ executables: a direct-mode GUI-subsystem executable always controls its own
 window (hidden GUI windows never paint on Windows 9x), and the result reports
 `GuiWindow = True` when that rule applied.
 
+`-Detach` launches the child and returns immediately without capturing output
+or waiting for exit; the result reports `Detached = True` and a nominal exit
+code 0. Use it instead of `shell -Command "start FOO.EXE"` for installers and
+other programs that outlive the request: a START-spawned child keeps the
+Windows 9x `COMMAND.COM` wrapper alive, which would otherwise hold the guest's
+single execution slot until the timeout. When a non-detached shell command
+finishes its output but leaves such descendants behind, the agent completes
+the request after a short grace and reports `Orphaned = True`.
+
 File examples:
 
 ```powershell

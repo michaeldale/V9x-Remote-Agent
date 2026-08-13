@@ -31,6 +31,7 @@ param(
     [int]$StderrLimit = 262144,
     [uint32[]]$ExpectedExitCode = @(0),
     [switch]$ShowWindow,
+    [switch]$Detach,
     [string]$Sequence,
     [switch]$Json
 )
@@ -699,6 +700,10 @@ try {
         $exitCategory = 23
         throw "Agent build '$($hello.BuildId)' does not advertise $Action support."
     }
+    if ($Detach -and ($hello.Capabilities -band [uint32]0x00000800) -eq 0) {
+        $exitCategory = 23
+        throw "Agent build '$($hello.BuildId)' does not advertise detached execution."
+    }
     $mode = if ($Action -eq 'exec') { 'Direct' } else { 'Shell' }
     $execApplication = if ($Action -eq 'exec') { $Application } else { '' }
     $execCommand = if ($Action -eq 'exec') { $Arguments } else { $ShellCommand }
@@ -706,7 +711,7 @@ try {
         -CommandLine $execCommand -WorkingDirectory $WorkingDirectory `
         -TimeoutMilliseconds ([uint32]($TimeoutSeconds * 1000)) `
         -StdoutLimit ([uint32]$StdoutLimit) -StderrLimit ([uint32]$StderrLimit) `
-        -ShowWindow:$ShowWindow
+        -ShowWindow:$ShowWindow -Detach:$Detach
     $requestBytes = New-V9xFrameBytes -Type 0x0010 -RequestId $requestId -Payload $execPayload
     $stream.ReadTimeout = ($TimeoutSeconds + 15) * 1000
     $stream.Write($requestBytes, 0, $requestBytes.Length)
@@ -769,6 +774,8 @@ try {
         Cancelled = $complete.Cancelled
         CaptureMode = if ($complete.PipeCapture) { 'pipes' } else { 'none' }
         GuiWindow = $complete.GuiWindow
+        Detached = $complete.Detached
+        Orphaned = $complete.Orphaned
     }
     if ($Json) { $result | ConvertTo-Json -Depth 4 -Compress } else { $result | Format-List }
     exit $outcomeExit

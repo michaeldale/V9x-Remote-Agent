@@ -195,13 +195,15 @@ function New-V9xExecPayload {
         [uint32]$TimeoutMilliseconds = 60000,
         [ValidateRange(0, 1048576)][uint32]$StdoutLimit = 262144,
         [ValidateRange(0, 1048576)][uint32]$StderrLimit = 262144,
-        [switch]$ShowWindow
+        [switch]$ShowWindow,
+        [switch]$Detach
     )
     $bytes = [Collections.Generic.List[byte]]::new()
     [byte]$modeByte = if ($Mode -eq 'Shell') { 1 } else { 0 }
     $bytes.Add($modeByte)
     $bytes.Add([byte][bool]$ShowWindow)
-    $bytes.AddRange([BitConverter]::GetBytes([uint16]0))
+    [uint16]$optionBits = if ($Detach) { 1 } else { 0 }
+    $bytes.AddRange([BitConverter]::GetBytes($optionBits))
     $bytes.AddRange([BitConverter]::GetBytes($TimeoutMilliseconds))
     $bytes.AddRange([BitConverter]::GetBytes($StdoutLimit))
     $bytes.AddRange([BitConverter]::GetBytes($StderrLimit))
@@ -229,6 +231,8 @@ function ConvertFrom-V9xExecComplete {
         Cancelled = [bool]($flags -band 0x00000008)
         PipeCapture = [bool]($flags -band 0x00000010)
         GuiWindow = [bool]($flags -band 0x00000020)
+        Detached = [bool]($flags -band 0x00000040)
+        Orphaned = [bool]($flags -band 0x00000080)
     }
 }
 

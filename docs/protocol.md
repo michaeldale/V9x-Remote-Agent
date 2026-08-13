@@ -48,7 +48,7 @@ the connection. Operational requests before HELLO receive an error and close.
 |---:|---|
 | 1 | mode: 0 direct, 1 `COMMAND.COM /C` |
 | 1 | show-window flag; ignored for direct-mode GUI-subsystem targets |
-| 2 | reserved, zero |
+| 2 | option flags: bit `0x0001` detach; other bits must be zero |
 | 4 | timeout milliseconds, maximum 3,600,000 |
 | 4 | stdout limit, maximum 1,048,576 |
 | 4 | stderr limit, maximum 1,048,576 |
@@ -65,7 +65,24 @@ truncated to its requested limit.
 
 Result categories are success, creation failure, timeout, cancellation, and
 internal failure. Flags separately record stdout/stderr truncation, timeout,
-cancellation, anonymous-pipe capture, and GUI-window launch (`0x20`).
+cancellation, anonymous-pipe capture, GUI-window launch (`0x20`), detached
+launch (`0x40`), and orphaned-descendant completion (`0x80`).
+
+The detach option (request option bit `0x0001`, advertised by capability
+`0x800`) launches the child with all standard handles redirected to `NUL` and
+completes immediately: no output is captured, no wait occurs, and the reported
+exit code is a nominal 0. Use it for installers and `START`-style launches
+whose target outlives the request; the pipe-capture flag is not set and flag
+`0x40` is set instead.
+
+Capture pipes are created non-inheritable and the child receives inheritable
+duplicates of only the write ends, so agent-side handles cannot leak into the
+child's descendants. In shell mode, if every write handle on both pipes closes
+while the child's process handle remains unsignaled, the agent waits a 2,000 ms
+grace and then completes the request successfully with flag `0x80`, discarding
+the lingering `COMMAND.COM` wrapper: on Windows 9x there are no job objects,
+and a detached or Win16 descendant can otherwise hold the wrapper (and the
+execution slot) open until the timeout.
 
 The show-window flag hides (0) or shows (1) the child's window and applies to
 shell mode and console-subsystem targets. When direct mode targets an

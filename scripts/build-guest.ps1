@@ -136,7 +136,8 @@ if ($dumpText -match '(?i)GetCommandLineW|GetModuleFileNameW|__CHK|MSVCR|UCRT') 
 }
 foreach ($requiredImport in @('Accept', 'Bind', 'CreateFileA', 'CreateMutexA',
                                'CreatePipe', 'CreateProcessA', 'CreateThread',
-                               'DeleteFileA', 'FindClose', 'FindFirstFileA',
+                               'DeleteFileA', 'DuplicateHandle',
+                               'FindClose', 'FindFirstFileA',
                                'FindNextFileA', 'GetExitCodeProcess',
                                'GetFileAttributesA', 'GetFileSize',
                                'GetPrivateProfileIntA', 'GetPrivateProfileStringA',

@@ -8,6 +8,7 @@
 #define V9X_EXEC_MAX_TIMEOUT 3600000ul
 #define V9X_EXEC_MAX_OUTPUT 1048576ul
 #define V9X_EXEC_CHUNK 1024ul
+#define V9X_EXEC_EOF_GRACE 2000ul
 
 typedef struct V9xExecutionJob {
     V9xAgentState *state;
@@ -17,6 +18,7 @@ typedef struct V9xExecutionJob {
     DWORD stderr_limit;
     BYTE mode;
     BYTE show_window;
+    unsigned short options;
     char application[260];
     char command[2048];
     char directory[260];
@@ -123,20 +125,51 @@ static int v9x_application_is_gui(const char *path)
     return is_gui;
 }
 
+/* Win9x has no PROC_THREAD_ATTRIBUTE handle lists, so inheritance is
+   controlled the classic way: create the pipe with both ends non-inheritable,
+   then hand the child an inheritable duplicate of only the write end. The
+   agent-side read end can then never leak into the child or its
+   descendants, and every write handle disappears when the child's process
+   tree stops holding its duplicates. */
+static int v9x_create_capture_pipe(HANDLE *read_end, HANDLE *child_write)
+{
+    HANDLE write_local = 0;
+    *read_end = 0;
+    *child_write = 0;
+    if (!CreatePipe(read_end, &write_local, 0, 4096ul)) return 0;
+    if (!DuplicateHandle(GetCurrentProcess(), write_local,
+                         GetCurrentProcess(), child_write, 0ul, TRUE,
+                         DUPLICATE_SAME_ACCESS)) {
+        CloseHandle(write_local);
+        CloseHandle(*read_end);
+        *read_end = 0;
+        *child_write = 0;
+        return 0;
+    }
+    CloseHandle(write_local);
+    return 1;
+}
+
 static int v9x_send_pipe_data(V9xExecutionJob *job, HANDLE pipe_handle,
                               unsigned short message_type, DWORD limit,
                               DWORD *total, DWORD *sent_total, DWORD *flags,
-                              DWORD truncate_flag)
+                              DWORD truncate_flag, int *broken)
 {
     unsigned char buffer[V9X_EXEC_CHUNK];
     DWORD available = 0ul;
     DWORD read_count = 0ul;
     DWORD send_count;
-    if (!PeekNamedPipe(pipe_handle, 0, 0ul, 0, &available, 0) || available == 0ul) {
+    if (*broken) return 1;
+    if (!PeekNamedPipe(pipe_handle, 0, 0ul, 0, &available, 0)) {
+        if (GetLastError() == ERROR_BROKEN_PIPE) *broken = 1;
         return 1;
     }
+    if (available == 0ul) return 1;
     if (available > sizeof(buffer)) available = sizeof(buffer);
-    if (!ReadFile(pipe_handle, buffer, available, &read_count, 0)) return 1;
+    if (!ReadFile(pipe_handle, buffer, available, &read_count, 0)) {
+        if (GetLastError() == ERROR_BROKEN_PIPE) *broken = 1;
+        return 1;
+    }
     if (0xfffffffful - *total < read_count) *total = 0xfffffffful;
     else *total += read_count;
     send_count = read_count;
@@ -165,7 +198,7 @@ static DWORD WINAPI v9x_execution_worker(LPVOID parameter)
     DWORD result = V9X_EXEC_RESULT_INTERNAL;
     DWORD native_error = 0ul;
     DWORD exit_code = 0xfffffffful;
-    DWORD flags = V9X_EXEC_FLAG_PIPE_CAPTURE;
+    DWORD flags;
     DWORD stdout_total = 0ul;
     DWORD stderr_total = 0ul;
     DWORD stdout_sent = 0ul;
@@ -173,9 +206,17 @@ static DWORD WINAPI v9x_execution_worker(LPVOID parameter)
     DWORD started = GetTickCount();
     DWORD wait_result;
     DWORD drain_count;
+    DWORD eof_tick = 0ul;
+    int stdout_broken = 0;
+    int stderr_broken = 0;
+    int eof_seen = 0;
+    int detach;
     unsigned char complete[28];
     char command_line[2320];
     BOOL created = FALSE;
+
+    detach = (job->options & V9X_EXEC_OPTION_DETACH) != 0u;
+    flags = detach ? V9X_EXEC_FLAG_DETACHED : V9X_EXEC_FLAG_PIPE_CAPTURE;
 
     v9x_zero_bytes(&security, sizeof(security));
     v9x_zero_bytes(&startup, sizeof(startup));
@@ -198,13 +239,16 @@ static DWORD WINAPI v9x_execution_worker(LPVOID parameter)
         goto complete_job;
     }
     v9x_log_line("exec-start");
-    if (!CreatePipe(&stdout_read, &stdout_write, &security, 4096ul) ||
-        !CreatePipe(&stderr_read, &stderr_write, &security, 4096ul)) {
+    if (!detach &&
+        (!v9x_create_capture_pipe(&stdout_read, &stdout_write) ||
+         !v9x_create_capture_pipe(&stderr_read, &stderr_write))) {
         native_error = GetLastError();
         result = V9X_EXEC_RESULT_CREATE_FAILED;
         goto complete_job;
     }
-    stdin_handle = CreateFileA("NUL", GENERIC_READ,
+    stdin_handle = CreateFileA("NUL",
+                               detach ? GENERIC_READ | GENERIC_WRITE :
+                                        GENERIC_READ,
                                FILE_SHARE_READ | FILE_SHARE_WRITE, &security,
                                OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, 0);
     if (stdin_handle == INVALID_HANDLE_VALUE) {
@@ -213,8 +257,8 @@ static DWORD WINAPI v9x_execution_worker(LPVOID parameter)
         goto complete_job;
     }
     startup.hStdInput = stdin_handle;
-    startup.hStdOutput = stdout_write;
-    startup.hStdError = stderr_write;
+    startup.hStdOutput = detach ? stdin_handle : stdout_write;
+    startup.hStdError = detach ? stdin_handle : stderr_write;
     created = CreateProcessA(job->mode == V9X_EXEC_MODE_DIRECT ?
                                  job->application : 0,
                              command_line, 0, 0, TRUE, 0ul, 0,
@@ -222,8 +266,8 @@ static DWORD WINAPI v9x_execution_worker(LPVOID parameter)
                              &startup, &process);
     native_error = created ? 0ul : GetLastError();
     CloseHandle(stdin_handle); stdin_handle = INVALID_HANDLE_VALUE;
-    CloseHandle(stdout_write); stdout_write = 0;
-    CloseHandle(stderr_write); stderr_write = 0;
+    if (stdout_write != 0) { CloseHandle(stdout_write); stdout_write = 0; }
+    if (stderr_write != 0) { CloseHandle(stderr_write); stderr_write = 0; }
     if (!created) {
         result = V9X_EXEC_RESULT_CREATE_FAILED;
         goto complete_job;
@@ -231,13 +275,22 @@ static DWORD WINAPI v9x_execution_worker(LPVOID parameter)
     CloseHandle(process.hThread); process.hThread = 0;
 
     result = V9X_EXEC_RESULT_OK;
+    if (detach) {
+        /* Fire-and-forget launch: no capture and no wait, so a child that
+           lives past this request (installer, START-style spawn) can never
+           hold the execution slot. Exit code 0 is nominal. */
+        exit_code = 0ul;
+        goto complete_job;
+    }
     for (;;) {
         if (!v9x_send_pipe_data(job, stdout_read, V9X_MSG_EXEC_STDOUT,
                                 job->stdout_limit, &stdout_total, &stdout_sent,
-                                &flags, V9X_EXEC_FLAG_STDOUT_TRUNCATED) ||
+                                &flags, V9X_EXEC_FLAG_STDOUT_TRUNCATED,
+                                &stdout_broken) ||
             !v9x_send_pipe_data(job, stderr_read, V9X_MSG_EXEC_STDERR,
                                 job->stderr_limit, &stderr_total, &stderr_sent,
-                                &flags, V9X_EXEC_FLAG_STDERR_TRUNCATED)) {
+                                &flags, V9X_EXEC_FLAG_STDERR_TRUNCATED,
+                                &stderr_broken)) {
             InterlockedExchange(&job->state->exec_cancel, 1l);
         }
         if (InterlockedCompareExchange(&job->state->exec_cancel, 0l, 0l) != 0l) {
@@ -251,6 +304,22 @@ static DWORD WINAPI v9x_execution_worker(LPVOID parameter)
             result = V9X_EXEC_RESULT_TIMEOUT;
             (void)TerminateProcess(process.hProcess, 0xfffffffdul);
             break;
+        }
+        if (job->mode == V9X_EXEC_MODE_SHELL && stdout_broken && stderr_broken) {
+            /* Every write handle on both pipes is gone, so COMMAND.COM has
+               finished, yet the process handle is still unsignaled: on Win9x
+               the DOS-VM wrapper lingers while START-spawned or Win16
+               descendants keep it alive, and without job objects nothing can
+               wait on the tree. After a short grace, discard the wrapper and
+               report the command complete instead of burning the timeout. */
+            if (!eof_seen) {
+                eof_seen = 1;
+                eof_tick = GetTickCount();
+            } else if (GetTickCount() - eof_tick >= V9X_EXEC_EOF_GRACE) {
+                flags |= V9X_EXEC_FLAG_ORPHANED;
+                (void)TerminateProcess(process.hProcess, 0ul);
+                break;
+            }
         }
         wait_result = WaitForSingleObject(process.hProcess, 20ul);
         if (wait_result == WAIT_OBJECT_0) break;
@@ -267,10 +336,12 @@ static DWORD WINAPI v9x_execution_worker(LPVOID parameter)
         DWORD before_stderr = stderr_total;
         (void)v9x_send_pipe_data(job, stdout_read, V9X_MSG_EXEC_STDOUT,
                                  job->stdout_limit, &stdout_total, &stdout_sent,
-                                 &flags, V9X_EXEC_FLAG_STDOUT_TRUNCATED);
+                                 &flags, V9X_EXEC_FLAG_STDOUT_TRUNCATED,
+                                 &stdout_broken);
         (void)v9x_send_pipe_data(job, stderr_read, V9X_MSG_EXEC_STDERR,
                                  job->stderr_limit, &stderr_total, &stderr_sent,
-                                 &flags, V9X_EXEC_FLAG_STDERR_TRUNCATED);
+                                 &flags, V9X_EXEC_FLAG_STDERR_TRUNCATED,
+                                 &stderr_broken);
         if (before_stdout == stdout_total && before_stderr == stderr_total) break;
     }
     if (!GetExitCodeProcess(process.hProcess, &exit_code) && native_error == 0ul) {
@@ -320,10 +391,11 @@ unsigned long v9x_execution_prepare(V9xAgentState *state,
     v9x_job.request_id = request_id;
     v9x_job.mode = payload[0];
     v9x_job.show_window = payload[1];
+    v9x_job.options = v9x_read_u16(payload + 2);
     v9x_job.timeout_ms = v9x_read_u32(payload + 4);
     v9x_job.stdout_limit = v9x_read_u32(payload + 8);
     v9x_job.stderr_limit = v9x_read_u32(payload + 12);
-    if (v9x_read_u16(payload + 2) != 0u ||
+    if ((v9x_job.options & ~V9X_EXEC_OPTION_MASK) != 0u ||
         v9x_job.mode > V9X_EXEC_MODE_SHELL || v9x_job.show_window > 1u ||
         v9x_job.timeout_ms > V9X_EXEC_MAX_TIMEOUT ||
         v9x_job.stdout_limit > V9X_EXEC_MAX_OUTPUT ||
