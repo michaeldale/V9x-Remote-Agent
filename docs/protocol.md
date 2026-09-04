@@ -40,6 +40,21 @@ without receiving a HELLO response.
 Unknown operations return `ERROR_RESPONSE` (`0x8fff`). Malformed framing closes
 the connection. Operational requests before HELLO receive an error and close.
 
+## Concurrency
+
+The agent accepts up to four concurrent client connections, each served on its
+own thread with its own send lock; additional connections are rejected (accepted
+then immediately closed). **Request IDs are unique only per connection**, so host
+tooling must not assume a globally unique ID space and must match responses (and
+cancellations) within the connection that issued the request.
+
+Execution runs in a pool of up to four concurrent jobs (see below), so
+`V9X_STATUS_BUSY` on `EXEC_REQUEST` means every slot is in use rather than a
+single global lock. Reboot, shutdown, screenshot, and hot-update are machine-wide
+operations: they are refused with `BUSY` while any execution slot is active on
+any connection, and screenshots are serialized machine-wide because they share a
+single helper and temp files.
+
 ## Execution
 
 `EXEC_REQUEST` (`0x0010`) contains:
@@ -93,9 +108,16 @@ the child's initial window state is left to the application, matching
 application file cannot be opened or parsed before launch, the agent falls
 back to applying the show-window flag as requested.
 
-`CANCEL_REQUEST` (`0x0011`) carries the active execution request ID as a u32.
-`CANCEL_RESPONSE` (`0x8012`) echoes that ID and a u32 accepted flag. `PING` and
-`CANCEL` remain responsive while the execution worker is active.
+Up to four `EXEC_REQUEST`s run concurrently, one per pool slot; each streams its
+own `EXEC_STDOUT`/`EXEC_STDERR`/`EXEC_COMPLETE` keyed by request ID, so a host
+must demultiplex by request ID. `V9X_STATUS_BUSY` is returned only when all four
+slots are occupied.
+
+`CANCEL_REQUEST` (`0x0011`) carries the target execution request ID as a u32.
+Cancellation is scoped to the connection that owns the job (a request ID is only
+matched against jobs started on the same connection). `CANCEL_RESPONSE`
+(`0x8012`) echoes that ID and a u32 accepted flag. `PING` and `CANCEL` remain
+responsive while execution workers are active.
 
 ## Files
 
@@ -128,6 +150,20 @@ may intentionally leave part/backup evidence for recovery.
 `FILE_READ_COMPLETE` (`0x8026`) with total size and CRC32. The host must verify
 both before publishing its local temporary file.
 
+## HTTP download
+
+`DOWNLOAD_REQUEST` (`0x0027`, capability `V9X_CAP_HTTP_DOWNLOAD` `0x1000`) carries
+a length-prefixed URL string then a length-prefixed guest destination path. The
+guest fetches the URL itself over a hand-rolled HTTP/1.0 client (its only
+outbound network path). **Only `http://` is supported**; an `https://` URL is
+rejected with `V9X_STATUS_UNSUPPORTED_OPERATION`. The body streams to a `.PART`
+file and is committed through the same backup/rename path as an upload, capped at
+67,108,864 bytes. During transfer the guest may send `DOWNLOAD_PROGRESS`
+(`0x9027`) frames carrying a u32 byte count. On success `DOWNLOAD_COMPLETE`
+(`0x8027`) contains the u32 HTTP status (200), total size, and CRC32. A non-200
+status or transport failure returns `ERROR_RESPONSE` with the HTTP status in the
+native-error field and leaves any existing destination untouched.
+
 ## Boot lifecycle and power
 
 `REBOOT_REQUEST` (`0x0040`) and `SHUTDOWN_REQUEST` (`0x0041`) carry a non-empty
@@ -139,8 +175,22 @@ The boot counter advances whenever the agent starts and is not reboot proof by
 itself. For reboot, the host requires disconnect/reconnect to a fresh HELLO
 with a different counter and the exact persisted token, followed by desktop
 readiness. Agent availability alone is not proof. Power control is refused while an
-execution request is active, and any active file transaction is cleaned before
-the Windows power request.
+execution slot is active on any connection, and the calling connection's active
+file transaction is cleaned before the Windows power request.
+
+`UPDATE_REQUEST` (`0x0042`, capability `V9X_CAP_DRIVER_UPDATE` `0x0200`) applies a
+new agent without a reboot. The host first uploads the new `V9XAGNT.EXE` and
+`V9XSHOT.EXE` as `C:\V9XREMOTE\V9XNEW.EXE` and `V9XSNEW.EXE` (normal upload path,
+CRC-verified on arrival), then sends a 16-byte payload: staged agent size and
+CRC32, then staged helper size and CRC32. The guest re-verifies each staged file
+(size, CRC32, and MZ header), writes `HOTSWAP.BAT`, launches it detached, replies
+`UPDATE_ACCEPTED` (`0x8042`, current boot counter and staged agent size), and
+exits. The batch waits for the executable lock to clear, swaps the binaries, and
+relaunches the agent, which comes back with an incremented boot counter. The host
+confirms the upgrade by reconnecting and observing the new boot counter (and
+`INFO` agent version). The RunServices entry is never repointed, so an
+interrupted swap still recovers on the next reboot. Refused with `BUSY` while any
+execution slot is active or an upload is in flight on the connection.
 
 ## Screenshot
 

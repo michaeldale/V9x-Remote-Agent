@@ -1,0 +1,8 @@
+# Files that land on DOS / Windows 9x machines must be CRLF on disk.
+# COMMAND.COM misparses LF-only batch files ("Bad command or file name"
+# on every line), and REGEDIT/agent config readers expect CRLF too.
+packaging/** text eol=crlf
+*.BAT text eol=crlf
+*.REG text eol=crlf
+*.INI text eol=crlf
+*.CFG text eol=crlf

@@ -28,11 +28,21 @@ Nothing requires clicking inside the emulator.
 | `put` | `-Source`, `-Destination` | Upload one file, CRC32-verified, transactional |
 | `get` | `-Source`, `-Destination` | Download one file, CRC32-verified |
 | `push-tree` | `-Source`, `-Destination` | Recursive directory upload |
+| `download` | `-Url`, `-Destination` | Guest fetches an `http://` URL to a guest path (http only, CRC32-verified) |
+| `update` | `-Source`, `-WaitSeconds` | Hot-upgrade the agent from an install-package folder, no reboot |
 | `reboot` | `-JobId`, `-WaitSeconds` | Reboot with proof (see below) |
 | `shutdown` | `-JobId` | Controlled shutdown |
 | `wait-desktop` | `-WaitSeconds` | Block until Explorer's desktop is ready |
-| `screenshot` | `-Destination`, `-Path` | 24-bit BMP of the guest screen |
+| `screenshot` | `-OutFile` (alias of `-Destination`), `-Path` | Guest screen capture; saved as PNG/JPEG/GIF/TIFF/BMP by the output file extension |
 | `input` | `-Sequence` | Inject mouse/keyboard: move, click, drag, wheel, key/hotkey, type, delay |
+
+## Host scripts beyond v9xctl
+
+| Script | Purpose |
+|---|---|
+| `scripts\set-autologon.ps1` | Report/enable/disable Windows 9x autologon; `-Dismiss` clears a logon dialog that is up right now |
+| `scripts\capture-emulator-window.ps1` | Grab the emulator's own window from the host, for states `screenshot` cannot reach (logon dialog, BIOS, shutdown hang) |
+| `scripts\run-driver-cycle.ps1` | Upload, preflight and optionally apply a driver package |
 
 ## Exit-code contract
 
@@ -74,7 +84,7 @@ Build on the host, deploy, run, observe, prove. Copy-paste skeleton:
 .\scripts\v9xctl.ps1 get -Source C:\V9XREMOTE\JOBS\myjob\RESULT.INI -Destination .\result.ini
 
 # 4. Look at the screen when output alone is not enough
-.\scripts\v9xctl.ps1 screenshot -Destination .\after.bmp -Json
+.\scripts\v9xctl.ps1 screenshot -OutFile .\after.png -Json
 
 # 5. When the change needs a reboot (drivers, RunServices, system files)
 .\scripts\v9xctl.ps1 reboot -JobId myjob-reboot-1 -WaitSeconds 180 -Json
@@ -132,6 +142,14 @@ A fully annotated version with sample outputs is in
   means a non-detached shell command left descendants running.
 - If the agent refuses connections right after a reboot, it is normal: retry
   `ping` for up to ~2 minutes while Windows boots.
+- **`wait-desktop` timing out (44) while `ping` still succeeds means nobody has
+  logged on, not that the agent died.** `RunServices` starts the agent before
+  the logon dialog, so on a guest that prompts at boot everything except
+  `screenshot` (43) and `wait-desktop` (44) works while that dialog sits there;
+  `info` answers with `DesktopReady: false`. Clear it with
+  `.\scripts\set-autologon.ps1 -Dismiss`, or turn the prompt off for good with
+  `-Enable`. Never conclude a guest is hung from `wait-desktop` alone: call
+  `info` first.
 
 ## Hard rules
 

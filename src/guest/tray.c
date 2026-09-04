@@ -3,6 +3,7 @@
 #include <shellapi.h>
 
 #define V9X_TRAY_ICON_ID 1u
+#define V9X_TRAY_PUMP_SLICE 100ul
 
 static unsigned long v9x_tray_append(char *target, unsigned long offset,
                                      const char *text)
@@ -44,6 +45,26 @@ static void v9x_tray_tooltip(const V9xAgentState *state,
     (void)v9x_tray_append(tooltip, offset, address);
 }
 
+/* Every tray failure used to be silent: v9x_tray_start returned 0 for three
+   different reasons and the caller logged one undifferentiated
+   "tray-icon-failed", while a failing Shell_NotifyIcon was retried forever
+   with its result discarded. The icon was broken from the first release and
+   the log could not say why, so each failure now names itself and carries
+   GetLastError. Call this immediately after the failing call: any intervening
+   API resets the thread's last-error value. */
+static void v9x_tray_log_error(const char *event)
+{
+    DWORD error = GetLastError();
+    char detail[80];
+    unsigned long at = 0ul;
+    detail[at++] = 'g';
+    detail[at++] = 'l';
+    detail[at++] = 'e';
+    detail[at++] = '=';
+    (void)v9x_tray_append_decimal(detail, at, (unsigned long)error);
+    v9x_log_event(event, detail);
+}
+
 static int v9x_tray_notify(V9xAgentState *state, DWORD message,
                            const char *address)
 {
@@ -82,20 +103,68 @@ static void v9x_tray_address(V9xAgentState *state, char *address)
     }
 }
 
+/* Sleep in slices, draining the message queue between them. The icon's owner
+   window must belong to a thread that dispatches messages, otherwise the
+   shell is talking to a window that never answers. */
+static void v9x_tray_wait(unsigned long milliseconds)
+{
+    MSG message;
+    unsigned long waited = 0ul;
+    do {
+        while (PeekMessageA(&message, 0, 0u, 0u, PM_REMOVE)) {
+            (void)DispatchMessageA(&message);
+        }
+        Sleep(V9X_TRAY_PUMP_SLICE);
+        waited += V9X_TRAY_PUMP_SLICE;
+    } while (waited < milliseconds);
+}
+
+static int v9x_tray_create_window(V9xAgentState *state)
+{
+    state->tray_window = CreateWindowExA(0ul, "STATIC", "V9x Remote Agent",
+                                         WS_OVERLAPPED, 0, 0, 0, 0,
+                                         0, 0, 0, 0);
+    if (state->tray_window == 0) {
+        v9x_tray_log_error("tray-window-failed");
+        return 0;
+    }
+    state->tray_icon = LoadIconA(0, IDI_APPLICATION);
+    if (state->tray_icon == 0) {
+        v9x_tray_log_error("tray-loadicon-failed");
+        DestroyWindow(state->tray_window);
+        state->tray_window = 0;
+        return 0;
+    }
+    return 1;
+}
+
 static DWORD WINAPI v9x_tray_worker(LPVOID parameter)
 {
     V9xAgentState *state = (V9xAgentState *)parameter;
     char address[16];
+    int reported = 0;
+
+    /* The owner window is created here, not by v9x_tray_start: this is the
+       only thread in the agent that pumps messages, and a window belongs to
+       the thread that created it. The main thread spends its life blocked in
+       accept(). */
+    if (!v9x_tray_create_window(state)) return 0ul;
 
     for (;;) {
-        while (FindWindowA("Shell_TrayWnd", 0) == 0) Sleep(1000ul);
+        while (FindWindowA("Shell_TrayWnd", 0) == 0) v9x_tray_wait(1000ul);
         v9x_tray_address(state, address);
         if (!v9x_tray_notify(state, NIM_ADD, address)) {
-            Sleep(1000ul);
+            if (!reported) {
+                v9x_tray_log_error("tray-notify-failed");
+                reported = 1;
+            }
+            v9x_tray_wait(1000ul);
             continue;
         }
+        v9x_log_event("tray-icon-added", address);
+        reported = 0;
         do {
-            Sleep(5000ul);
+            v9x_tray_wait(5000ul);
             v9x_tray_address(state, address);
         } while (FindWindowA("Shell_TrayWnd", 0) != 0 &&
                  v9x_tray_notify(state, NIM_MODIFY, address));
@@ -105,20 +174,16 @@ static DWORD WINAPI v9x_tray_worker(LPVOID parameter)
 int v9x_tray_start(V9xAgentState *state)
 {
     HANDLE thread;
-    state->tray_window = CreateWindowExA(0ul, "STATIC", "V9x Remote Agent",
-                                         WS_OVERLAPPED, 0, 0, 0, 0,
-                                         0, 0, 0, 0);
-    if (state->tray_window == 0) return 0;
-    state->tray_icon = LoadIconA(0, IDI_APPLICATION);
-    if (state->tray_icon == 0) {
-        DestroyWindow(state->tray_window);
-        state->tray_window = 0;
-        return 0;
-    }
-    thread = CreateThread(0, 16384ul, v9x_tray_worker, state, 0ul, 0);
+    /* lpThreadId must be a real pointer. Windows 9x rejects NULL here with
+       ERROR_INVALID_PARAMETER, which is why the tray icon never once appeared
+       on 98 SE: measured as "tray-thread-failed gle=87" on WIN98-S3NATIVE,
+       4 Sep 2026. Windows NT accepts NULL, so this was invisible on a modern
+       host. The agent's other two CreateThread calls always passed a
+       pointer. */
+    DWORD thread_id;
+    thread = CreateThread(0, 16384ul, v9x_tray_worker, state, 0ul, &thread_id);
     if (thread == 0) {
-        DestroyWindow(state->tray_window);
-        state->tray_window = 0;
+        v9x_tray_log_error("tray-thread-failed");
         return 0;
     }
     CloseHandle(thread);

@@ -3,7 +3,7 @@ param(
     [Parameter(Position = 0, Mandatory = $true)]
     [ValidateSet('ping', 'info', 'exec', 'shell', 'stat', 'list', 'mkdir',
                  'put', 'get', 'push-tree', 'reboot', 'shutdown', 'wait-desktop',
-                 'screenshot', 'input')]
+                 'screenshot', 'input', 'download', 'update')]
     [string]$Action,
     [Alias('Host')]
     [string]$EndpointHost = '127.0.0.1',
@@ -17,9 +17,11 @@ param(
     [string]$ShellCommand,
     [string]$WorkingDirectory = '',
     [string]$Source,
+    [Alias('OutFile')]
     [string]$Destination,
     [Alias('Path')]
     [string]$RemotePath,
+    [string]$Url,
     [string]$JobId,
     [ValidateRange(5, 600)]
     [int]$WaitSeconds = 120,
@@ -353,7 +355,16 @@ if ($Action -in @('put', 'get', 'push-tree') -and
     exit 10
 }
 if ($Action -eq 'screenshot' -and [string]::IsNullOrWhiteSpace($Destination)) {
-    [Console]::Error.WriteLine('Usage error: screenshot requires -Destination.')
+    [Console]::Error.WriteLine('Usage error: screenshot requires -Destination (alias -OutFile).')
+    exit 10
+}
+if ($Action -eq 'download' -and
+    ([string]::IsNullOrWhiteSpace($Url) -or [string]::IsNullOrWhiteSpace($Destination))) {
+    [Console]::Error.WriteLine('Usage error: download requires -Url and -Destination (guest path).')
+    exit 10
+}
+if ($Action -eq 'update' -and [string]::IsNullOrWhiteSpace($Source)) {
+    [Console]::Error.WriteLine('Usage error: update requires -Source (install package folder).')
     exit 10
 }
 if ($Action -eq 'put' -and -not (Test-Path -LiteralPath $Source -PathType Leaf)) {
@@ -561,18 +572,53 @@ try {
         $frame = Read-V9xOperationFrame -Stream $stream -RequestId $requestId `
             -ExpectedTypes 0x8050 -GuestErrorExitCode 43
         $capture = ConvertFrom-V9xScreenshotPayload -Payload $frame.Payload
+        $formatMap = @{
+            '.png' = 'Png'; '.jpg' = 'Jpeg'; '.jpeg' = 'Jpeg'; '.gif' = 'Gif'
+            '.tif' = 'Tiff'; '.tiff' = 'Tiff'
+        }
+        $outExtension = [IO.Path]::GetExtension($Destination).ToLowerInvariant()
+        $convertTo = if ($formatMap.ContainsKey($outExtension)) { $formatMap[$outExtension] } else { $null }
+        $localTarget = if ($convertTo) {
+            Join-Path ([IO.Path]::GetTempPath()) ("v9x-screenshot-{0}.bmp" -f ([Guid]::NewGuid().ToString('N')))
+        } else { $Destination }
         ++$requestId
-        $transfer = Invoke-V9xGetInternal -Stream $stream -RequestId ([ref]$requestId) `
-            -GuestPath $capture.GuestPath -LocalPath $Destination
-        if ($transfer.Size -ne $capture.FileBytes -or $transfer.Crc32 -ne $capture.Crc32) {
-            $exception = [InvalidDataException]::new(
-                'Downloaded screenshot metadata does not match the capture response.')
-            $exception.Data['V9xExitCode'] = 40
-            throw $exception
+        try {
+            $transfer = Invoke-V9xGetInternal -Stream $stream -RequestId ([ref]$requestId) `
+                -GuestPath $capture.GuestPath -LocalPath $localTarget
+            if ($transfer.Size -ne $capture.FileBytes -or $transfer.Crc32 -ne $capture.Crc32) {
+                $exception = [InvalidDataException]::new(
+                    'Downloaded screenshot metadata does not match the capture response.')
+                $exception.Data['V9xExitCode'] = 40
+                throw $exception
+            }
+            if ($convertTo) {
+                try {
+                    Add-Type -AssemblyName System.Drawing
+                    $sourceImage = [Drawing.Image]::FromFile($localTarget)
+                    try {
+                        $bitmap = [Drawing.Bitmap]::new($sourceImage)
+                        try {
+                            $imageFormat = [Drawing.Imaging.ImageFormat]::$convertTo
+                            $bitmap.Save($Destination, $imageFormat)
+                        } finally { $bitmap.Dispose() }
+                    } finally { $sourceImage.Dispose() }
+                } catch {
+                    $exception = [InvalidDataException]::new(
+                        "Failed to convert screenshot BMP to $convertTo`: $($_.Exception.Message)")
+                    $exception.Data['V9xExitCode'] = 40
+                    throw $exception
+                }
+            }
+        } finally {
+            if ($convertTo -and (Test-Path -LiteralPath $localTarget)) {
+                Remove-Item -LiteralPath $localTarget -Force -ErrorAction SilentlyContinue
+            }
         }
         $result = [pscustomobject]@{
             Success = $true; RequestId = [uint32]($requestId - 1); AgentBuild = $hello.BuildId
-            GuestPath = $capture.GuestPath; Destination = $transfer.Destination
+            GuestPath = $capture.GuestPath
+            Destination = if ($convertTo) { (Resolve-Path -LiteralPath $Destination).Path } else { $transfer.Destination }
+            Format = if ($convertTo) { $convertTo.ToLowerInvariant() } else { 'bmp' }
             Width = $capture.Width; Height = $capture.Height
             SourceBitsPerPixel = $capture.SourceBitsPerPixel; Bytes = $capture.FileBytes
             Crc32 = ('{0:X8}' -f $capture.Crc32)
@@ -601,6 +647,102 @@ try {
             Success = $true; RequestId = $requestId; AgentBuild = $hello.BuildId
             ActionsPerformed = $inputResult.ActionsPerformed
             CursorX = $inputResult.CursorX; CursorY = $inputResult.CursorY
+            Endpoint = "${EndpointHost}:$Port"
+        }
+        if ($Json) { $result | ConvertTo-Json -Depth 4 -Compress } else { $result | Format-List }
+        exit 0
+    }
+
+    if ($Action -eq 'download') {
+        if (($hello.Capabilities -band [uint32]0x00001000) -eq 0) {
+            $exitCategory = 23
+            throw "Agent build '$($hello.BuildId)' does not advertise HTTP download support."
+        }
+        $payload = New-V9xDownloadPayload -Url $Url -Destination $Destination
+        $bytes = New-V9xFrameBytes -Type 0x0027 -RequestId $requestId -Payload $payload
+        $stream.ReadTimeout = 600000
+        $stream.Write($bytes, 0, $bytes.Length)
+        $completeFrame = $null
+        [uint32]$lastProgress = 0
+        while ($null -eq $completeFrame) {
+            $frame = Read-V9xOperationFrame -Stream $stream -RequestId $requestId `
+                -ExpectedTypes 0x9027,0x8027 -GuestErrorExitCode 40
+            if ($frame.Type -eq 0x9027) {
+                if ($frame.Payload.Length -ge 4) {
+                    $lastProgress = [BitConverter]::ToUInt32($frame.Payload, 0)
+                }
+            } else {
+                $completeFrame = $frame
+            }
+        }
+        $download = ConvertFrom-V9xDownloadComplete -Payload $completeFrame.Payload
+        $result = [pscustomobject]@{
+            Success = $true; RequestId = $requestId; AgentBuild = $hello.BuildId
+            Url = $Url; Destination = $Destination; HttpStatus = $download.HttpStatus
+            Bytes = $download.Size; Crc32 = ('{0:X8}' -f $download.Crc32)
+            Endpoint = "${EndpointHost}:$Port"
+        }
+        if ($Json) { $result | ConvertTo-Json -Depth 4 -Compress } else { $result | Format-List }
+        exit 0
+    }
+
+    if ($Action -eq 'update') {
+        if (($hello.Capabilities -band [uint32]0x00000200) -eq 0) {
+            $exitCategory = 23
+            throw "Agent build '$($hello.BuildId)' does not advertise hot-update support."
+        }
+        $packageRoot = (Get-Item -LiteralPath $Source).FullName
+        $agentSource = Join-Path $packageRoot 'V9XAGNT.EXE'
+        $helperSource = Join-Path $packageRoot 'V9XSHOT.EXE'
+        if (-not (Test-Path -LiteralPath $agentSource -PathType Leaf) -or
+            -not (Test-Path -LiteralPath $helperSource -PathType Leaf)) {
+            $exitCategory = 11
+            throw "Install package must contain V9XAGNT.EXE and V9XSHOT.EXE: $packageRoot"
+        }
+        $agentPut = Invoke-V9xPutInternal -Stream $stream -RequestId ([ref]$requestId) `
+            -LocalPath $agentSource -GuestPath 'C:\V9XREMOTE\V9XNEW.EXE'
+        $helperPut = Invoke-V9xPutInternal -Stream $stream -RequestId ([ref]$requestId) `
+            -LocalPath $helperSource -GuestPath 'C:\V9XREMOTE\V9XSNEW.EXE'
+        $payload = New-V9xUpdatePayload -AgentSize $agentPut.Size -AgentCrc32 $agentPut.Crc32 `
+            -HelperSize $helperPut.Size -HelperCrc32 $helperPut.Crc32
+        $bytes = New-V9xFrameBytes -Type 0x0042 -RequestId $requestId -Payload $payload
+        $stream.Write($bytes, 0, $bytes.Length)
+        $frame = Read-V9xOperationFrame -Stream $stream -RequestId $requestId `
+            -ExpectedTypes 0x8042 -GuestErrorExitCode 41
+        $accepted = ConvertFrom-V9xUpdateAccepted -Payload $frame.Payload
+        $oldBootCounter = $hello.BootCounter
+        $oldBuild = $hello.BuildId
+        $client.Dispose()
+        $client = $null
+        $deadline = [DateTime]::UtcNow.AddSeconds($WaitSeconds)
+        $resumed = $null
+        $lastReconnectError = $null
+        while ([DateTime]::UtcNow -lt $deadline -and $null -eq $resumed) {
+            Start-Sleep -Milliseconds 500
+            try {
+                $candidate = Connect-V9xSession -HostName $EndpointHost -TcpPort $Port `
+                    -TimeoutSeconds ([Math]::Min($ConnectTimeoutSeconds, 3))
+                if ($candidate.Hello.BootCounter -ne $oldBootCounter) {
+                    $resumed = $candidate
+                } else {
+                    $candidate.Client.Dispose()
+                }
+            } catch {
+                $lastReconnectError = $_.Exception.Message
+            }
+        }
+        if ($null -eq $resumed) {
+            $exception = [InvalidOperationException]::new(
+                "Agent did not relaunch with a new boot counter within $WaitSeconds seconds. Last error: $lastReconnectError")
+            $exception.Data['V9xExitCode'] = 42
+            throw $exception
+        }
+        $client = $resumed.Client
+        $result = [pscustomobject]@{
+            Success = $true; RequestId = $requestId
+            PreviousBuild = $oldBuild; PreviousBootCounter = $oldBootCounter
+            AgentBuild = $resumed.Hello.BuildId; BootCounter = $resumed.Hello.BootCounter
+            AgentBytes = $accepted.AgentSize; Reconnected = $true
             Endpoint = "${EndpointHost}:$Port"
         }
         if ($Json) { $result | ConvertTo-Json -Depth 4 -Compress } else { $result | Format-List }

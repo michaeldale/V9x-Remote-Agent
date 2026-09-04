@@ -42,6 +42,15 @@ clean reboot without a human touching the emulator.
 - Optional IPv4 binding, port, and client allowlist for real retro hardware
   on an isolated network ([docs/physical-machine.md](docs/physical-machine.md))
 
+## DOS build
+
+A cut-down agent for real-mode DOS boxes (DOS/4GW protected mode, Watt-32 for
+TCP/IP) speaks the same wire protocol, so the same `v9xctl.ps1` and MCP tooling
+drive it. It keeps command execution and CRC-verified file transfer plus the
+HELLO/PING/INFO handshake; the Win32-only extras (screenshot, input, power,
+hot-update, HTTP download) and live exec streaming/cancel/timeout are dropped.
+Build with `scripts\build-guest-dos.ps1`; see [docs/dos-agent.md](docs/dos-agent.md).
+
 ## Quickstart
 
 | You have | Start here |
@@ -111,6 +120,21 @@ Exit code 0 means success. Transport and protocol failures use 20 to 23;
 process creation, unexpected exit, timeout, and cancellation use 30 to 33.
 The full verb and exit-code reference is [docs/host-cli.md](docs/host-cli.md).
 
+Two host-side helpers sit alongside `v9xctl`:
+
+```powershell
+.\scripts\set-autologon.ps1                     # is this guest going to stop at a logon prompt?
+.\scripts\set-autologon.ps1 -Dismiss            # clear a logon dialog that is up right now
+.\scripts\capture-emulator-window.ps1 MyVm -OutFile .\screen.png
+```
+
+A guest that prompts at boot is the one trap worth knowing about up front. The
+agent itself runs and answers before anyone logs on, but `screenshot` and
+`wait-desktop` need Explorer, so an unattended run stalls at its first
+`wait-desktop` while `ping` keeps succeeding. `set-autologon.ps1` reports and
+fixes that; `capture-emulator-window.ps1` lets you see a screen the in-guest
+capture path cannot reach.
+
 ## Build
 
 Only needed if you want to modify the guest agent; releases ship a prebuilt
@@ -153,6 +177,14 @@ expose the listener to a LAN or the Internet. Details in
 - [docs/physical-machine.md](docs/physical-machine.md): real retro hardware
 - [docs/design.md](docs/design.md): the original staged design document
 - [CHANGELOG.md](CHANGELOG.md)
+
+Working notes, newest first:
+
+- [docs/decisions/2026-09-04-prelogon-reachability-and-autologon.md](docs/decisions/2026-09-04-prelogon-reachability-and-autologon.md):
+  what the agent can and cannot do before anyone logs on, and the Windows 9x
+  autologon rules behind `scripts\set-autologon.ps1`
+- [docs/decisions/2026-09-04-tray-icon-createthread-lpthreadid.md](docs/decisions/2026-09-04-tray-icon-createthread-lpthreadid.md):
+  why the notification-area icon never appeared before 0.6.2
 
 ## Windows licensing
 

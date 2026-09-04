@@ -3,10 +3,6 @@
 #include "v9xremote/status.h"
 #include "v9xremote/version.h"
 
-static unsigned char v9x_payload[V9X_MAX_PAYLOAD];
-static unsigned char v9x_header_bytes[V9X_HEADER_SIZE];
-static unsigned char v9x_response[2048];
-
 static unsigned long v9x_append_decimal(char *target, unsigned long offset,
                                         unsigned long value)
 {
@@ -21,6 +17,35 @@ static unsigned long v9x_append_decimal(char *target, unsigned long offset,
         target[offset + index] = reversed[count - index - 1ul];
     }
     return offset + count;
+}
+
+static unsigned long v9x_append_hex16(char *target, unsigned long offset,
+                                      unsigned short value)
+{
+    static const char digits[] = "0123456789abcdef";
+    target[offset++] = digits[(value >> 12) & 0xfu];
+    target[offset++] = digits[(value >> 8) & 0xfu];
+    target[offset++] = digits[(value >> 4) & 0xfu];
+    target[offset++] = digits[value & 0xfu];
+    return offset;
+}
+
+/* Build a one-line audit detail for the dispatch trail: "t=<hex> rid=<n>
+   len=<n>". Bounded well under the log detail cap. */
+static void v9x_format_cmd(char *target, const V9xFrameHeader *header)
+{
+    unsigned long offset = 0ul;
+    target[offset++] = 't'; target[offset++] = '=';
+    offset = v9x_append_hex16(target, offset, header->type);
+    target[offset++] = ' ';
+    target[offset++] = 'r'; target[offset++] = 'i'; target[offset++] = 'd';
+    target[offset++] = '=';
+    offset = v9x_append_decimal(target, offset, header->request_id);
+    target[offset++] = ' ';
+    target[offset++] = 'l'; target[offset++] = 'e'; target[offset++] = 'n';
+    target[offset++] = '=';
+    offset = v9x_append_decimal(target, offset, header->payload_length);
+    target[offset] = '\0';
 }
 
 static int v9x_is_ascii_text(const unsigned char *text, unsigned long length)
@@ -60,7 +85,7 @@ static int v9x_send_exact(SOCKET socket_handle, const unsigned char *source,
     return 1;
 }
 
-int v9x_send_frame(V9xAgentState *state, unsigned short type,
+int v9x_send_frame(V9xConnection *conn, unsigned short type,
                    unsigned long request_id,
                    const unsigned char *payload, unsigned long length)
 {
@@ -74,74 +99,78 @@ int v9x_send_frame(V9xAgentState *state, unsigned short type,
     header.payload_length = length;
     header.reserved = 0ul;
     v9x_encode_header(header_bytes, &header);
-    EnterCriticalSection(&state->send_lock);
-    if (state->client_socket == INVALID_SOCKET ||
-        !v9x_send_exact(state->client_socket, header_bytes, V9X_HEADER_SIZE)) {
+    EnterCriticalSection(&conn->send_lock);
+    if (conn->socket == INVALID_SOCKET ||
+        !v9x_send_exact(conn->socket, header_bytes, V9X_HEADER_SIZE)) {
         result = 0;
     } else if (length != 0ul &&
-               !v9x_send_exact(state->client_socket, payload, length)) {
+               !v9x_send_exact(conn->socket, payload, length)) {
         result = 0;
     }
-    LeaveCriticalSection(&state->send_lock);
+    LeaveCriticalSection(&conn->send_lock);
     return result;
 }
 
-static int v9x_send_error(V9xAgentState *state, unsigned long request_id,
+static int v9x_send_error(V9xConnection *conn, unsigned long request_id,
                           unsigned long status, const char *detail)
 {
     unsigned long offset = 8ul;
-    v9x_write_u32(v9x_response, status);
-    v9x_write_u32(v9x_response + 4, GetLastError());
-    if (!v9x_append_string(v9x_response, sizeof(v9x_response), &offset, detail)) {
+    v9x_write_u32(conn->response, status);
+    v9x_write_u32(conn->response + 4, GetLastError());
+    if (!v9x_append_string(conn->response, sizeof(conn->response), &offset,
+                           detail)) {
         return 0;
     }
-    return v9x_send_frame(state, V9X_MSG_ERROR_RESPONSE, request_id,
-                          v9x_response, offset);
+    return v9x_send_frame(conn, V9X_MSG_ERROR_RESPONSE, request_id,
+                          conn->response, offset);
 }
 
-static int v9x_send_hello(V9xAgentState *state, unsigned long request_id)
+static int v9x_send_hello(V9xConnection *conn, unsigned long request_id)
 {
+    V9xAgentState *machine = conn->machine;
     unsigned long offset = 16ul;
     DWORD width;
     DWORD height;
     DWORD bits_per_pixel;
-    v9x_write_u16(v9x_response, V9X_PROTOCOL_VERSION);
-    v9x_write_u16(v9x_response + 2, 0u);
-    v9x_write_u32(v9x_response + 4, V9X_CAPABILITIES);
-    v9x_write_u32(v9x_response + 8, V9X_MAX_PAYLOAD);
-    v9x_write_u32(v9x_response + 12, state->boot_counter);
-    v9x_write_u16(v9x_response + 16, state->listen_port);
-    v9x_write_u16(v9x_response + 18, state->winsock_version);
+    v9x_write_u16(conn->response, V9X_PROTOCOL_VERSION);
+    v9x_write_u16(conn->response + 2, 0u);
+    v9x_write_u32(conn->response + 4, V9X_CAPABILITIES);
+    v9x_write_u32(conn->response + 8, V9X_MAX_PAYLOAD);
+    v9x_write_u32(conn->response + 12, machine->boot_counter);
+    v9x_write_u16(conn->response + 16, machine->listen_port);
+    v9x_write_u16(conn->response + 18, machine->winsock_version);
     offset = 20ul;
-    if (!v9x_append_string(v9x_response, sizeof(v9x_response), &offset,
+    if (!v9x_append_string(conn->response, sizeof(conn->response), &offset,
                            V9X_BUILD_ID) ||
-        !v9x_append_string(v9x_response, sizeof(v9x_response), &offset,
-                           state->pending_job)) return 0;
+        !v9x_append_string(conn->response, sizeof(conn->response), &offset,
+                           machine->pending_job)) return 0;
     v9x_screen_info(&width, &height, &bits_per_pixel);
-    v9x_response[offset++] = v9x_desktop_ready() ? 1u : 0u;
-    v9x_response[offset++] = 0u;
-    v9x_write_u16(v9x_response + offset, 0u); offset += 2ul;
-    v9x_write_u32(v9x_response + offset, width); offset += 4ul;
-    v9x_write_u32(v9x_response + offset, height); offset += 4ul;
-    v9x_write_u32(v9x_response + offset, bits_per_pixel); offset += 4ul;
-    if (!v9x_append_string(v9x_response, sizeof(v9x_response), &offset,
-                           state->listen_address) ||
-        !v9x_append_string(v9x_response, sizeof(v9x_response), &offset,
-                           state->allowed_client)) return 0;
-    return v9x_send_frame(state, V9X_MSG_HELLO_RESPONSE, request_id,
-                          v9x_response, offset);
+    conn->response[offset++] = v9x_desktop_ready() ? 1u : 0u;
+    conn->response[offset++] = 0u;
+    v9x_write_u16(conn->response + offset, 0u); offset += 2ul;
+    v9x_write_u32(conn->response + offset, width); offset += 4ul;
+    v9x_write_u32(conn->response + offset, height); offset += 4ul;
+    v9x_write_u32(conn->response + offset, bits_per_pixel); offset += 4ul;
+    if (!v9x_append_string(conn->response, sizeof(conn->response), &offset,
+                           machine->listen_address) ||
+        !v9x_append_string(conn->response, sizeof(conn->response), &offset,
+                           machine->allowed_client)) return 0;
+    return v9x_send_frame(conn, V9X_MSG_HELLO_RESPONSE, request_id,
+                          conn->response, offset);
 }
 
-static int v9x_send_ping(V9xAgentState *state, unsigned long request_id)
+static int v9x_send_ping(V9xConnection *conn, unsigned long request_id)
 {
-    v9x_write_u32(v9x_response, GetTickCount() - state->start_tick);
-    v9x_write_u32(v9x_response + 4, state->boot_counter);
-    return v9x_send_frame(state, V9X_MSG_PING_RESPONSE, request_id,
-                          v9x_response, 8ul);
+    V9xAgentState *machine = conn->machine;
+    v9x_write_u32(conn->response, GetTickCount() - machine->start_tick);
+    v9x_write_u32(conn->response + 4, machine->boot_counter);
+    return v9x_send_frame(conn, V9X_MSG_PING_RESPONSE, request_id,
+                          conn->response, 8ul);
 }
 
-static int v9x_send_info(V9xAgentState *state, unsigned long request_id)
+static int v9x_send_info(V9xConnection *conn, unsigned long request_id)
 {
+    V9xAgentState *machine = conn->machine;
     char computer[64];
     char windows_version[64];
     char system_directory[MAX_PATH];
@@ -173,44 +202,44 @@ static int v9x_send_info(V9xAgentState *state, unsigned long request_id)
                                 (version >> 8) & 0xfful);
     windows_version[offset] = '\0';
 
-    v9x_write_u32(v9x_response, state->boot_counter);
-    v9x_write_u32(v9x_response + 4, GetTickCount() - state->start_tick);
-    v9x_write_u32(v9x_response + 8, V9X_CAPABILITIES);
-    v9x_write_u16(v9x_response + 12, state->listen_port);
-    v9x_write_u16(v9x_response + 14, state->winsock_version);
-    v9x_write_u32(v9x_response + 16, version);
+    v9x_write_u32(conn->response, machine->boot_counter);
+    v9x_write_u32(conn->response + 4, GetTickCount() - machine->start_tick);
+    v9x_write_u32(conn->response + 8, V9X_CAPABILITIES);
+    v9x_write_u16(conn->response + 12, machine->listen_port);
+    v9x_write_u16(conn->response + 14, machine->winsock_version);
+    v9x_write_u32(conn->response + 16, version);
     offset = 20ul;
-    if (!v9x_append_string(v9x_response, sizeof(v9x_response), &offset, V9X_AGENT_VERSION) ||
-        !v9x_append_string(v9x_response, sizeof(v9x_response), &offset, V9X_BUILD_ID) ||
-        !v9x_append_string(v9x_response, sizeof(v9x_response), &offset, computer) ||
-        !v9x_append_string(v9x_response, sizeof(v9x_response), &offset, windows_version) ||
-        !v9x_append_string(v9x_response, sizeof(v9x_response), &offset, system_directory) ||
-        !v9x_append_string(v9x_response, sizeof(v9x_response), &offset, windows_directory) ||
-        !v9x_append_string(v9x_response, sizeof(v9x_response), &offset, current_directory) ||
-        !v9x_append_string(v9x_response, sizeof(v9x_response), &offset,
-                           state->pending_job)) {
-        return v9x_send_error(state, request_id, V9X_STATUS_INTERNAL_ERROR,
+    if (!v9x_append_string(conn->response, sizeof(conn->response), &offset, V9X_AGENT_VERSION) ||
+        !v9x_append_string(conn->response, sizeof(conn->response), &offset, V9X_BUILD_ID) ||
+        !v9x_append_string(conn->response, sizeof(conn->response), &offset, computer) ||
+        !v9x_append_string(conn->response, sizeof(conn->response), &offset, windows_version) ||
+        !v9x_append_string(conn->response, sizeof(conn->response), &offset, system_directory) ||
+        !v9x_append_string(conn->response, sizeof(conn->response), &offset, windows_directory) ||
+        !v9x_append_string(conn->response, sizeof(conn->response), &offset, current_directory) ||
+        !v9x_append_string(conn->response, sizeof(conn->response), &offset,
+                           machine->pending_job)) {
+        return v9x_send_error(conn, request_id, V9X_STATUS_INTERNAL_ERROR,
                               "info response overflow");
     }
     v9x_screen_info(&width, &height, &bits_per_pixel);
-    v9x_response[offset++] = v9x_desktop_ready() ? 1u : 0u;
-    v9x_response[offset++] = 0u;
-    v9x_write_u16(v9x_response + offset, 0u); offset += 2ul;
-    v9x_write_u32(v9x_response + offset, width); offset += 4ul;
-    v9x_write_u32(v9x_response + offset, height); offset += 4ul;
-    v9x_write_u32(v9x_response + offset, bits_per_pixel); offset += 4ul;
-    if (!v9x_append_string(v9x_response, sizeof(v9x_response), &offset,
-                           state->listen_address) ||
-        !v9x_append_string(v9x_response, sizeof(v9x_response), &offset,
-                           state->allowed_client)) {
-        return v9x_send_error(state, request_id, V9X_STATUS_INTERNAL_ERROR,
+    conn->response[offset++] = v9x_desktop_ready() ? 1u : 0u;
+    conn->response[offset++] = 0u;
+    v9x_write_u16(conn->response + offset, 0u); offset += 2ul;
+    v9x_write_u32(conn->response + offset, width); offset += 4ul;
+    v9x_write_u32(conn->response + offset, height); offset += 4ul;
+    v9x_write_u32(conn->response + offset, bits_per_pixel); offset += 4ul;
+    if (!v9x_append_string(conn->response, sizeof(conn->response), &offset,
+                           machine->listen_address) ||
+        !v9x_append_string(conn->response, sizeof(conn->response), &offset,
+                           machine->allowed_client)) {
+        return v9x_send_error(conn, request_id, V9X_STATUS_INTERNAL_ERROR,
                               "network info response overflow");
     }
-    return v9x_send_frame(state, V9X_MSG_INFO_RESPONSE, request_id,
-                          v9x_response, offset);
+    return v9x_send_frame(conn, V9X_MSG_INFO_RESPONSE, request_id,
+                          conn->response, offset);
 }
 
-int v9x_serve_client(SOCKET client, V9xAgentState *state)
+int v9x_serve_client(V9xConnection *conn)
 {
     V9xFrameHeader header;
     int handshaken = 0;
@@ -218,101 +247,110 @@ int v9x_serve_client(SOCKET client, V9xAgentState *state)
     unsigned short maximum;
     unsigned long exec_status;
     unsigned long target_request;
+    char cmd_detail[64];
     for (;;) {
-        if (!v9x_recv_exact(client, v9x_header_bytes, V9X_HEADER_SIZE)) return 1;
-        if (!v9x_decode_header(v9x_header_bytes, &header)) return 0;
+        if (!v9x_recv_exact(conn->socket, conn->header_bytes, V9X_HEADER_SIZE)) return 1;
+        if (!v9x_decode_header(conn->header_bytes, &header)) return 0;
         if (header.payload_length > V9X_MAX_PAYLOAD || header.reserved != 0ul ||
             header.request_id == 0ul) return 0;
         if (header.payload_length != 0ul &&
-            !v9x_recv_exact(client, v9x_payload, header.payload_length)) return 0;
+            !v9x_recv_exact(conn->socket, conn->payload, header.payload_length)) return 0;
+        v9x_format_cmd(cmd_detail, &header);
+        v9x_log_event("cmd", cmd_detail);
 
         if (!handshaken) {
             if (header.type != V9X_MSG_HELLO_REQUEST || header.payload_length < 6ul) {
-                (void)v9x_send_error(state, header.request_id,
+                (void)v9x_send_error(conn, header.request_id,
                                      V9X_STATUS_INVALID_PAYLOAD,
                                      "HELLO required");
                 return 0;
             }
-            minimum = v9x_read_u16(v9x_payload);
-            maximum = v9x_read_u16(v9x_payload + 2);
+            minimum = v9x_read_u16(conn->payload);
+            maximum = v9x_read_u16(conn->payload + 2);
             if (minimum > V9X_PROTOCOL_VERSION || maximum < V9X_PROTOCOL_VERSION) {
-                (void)v9x_send_error(state, header.request_id,
+                (void)v9x_send_error(conn, header.request_id,
                                      V9X_STATUS_UNSUPPORTED_VERSION,
                                      "no compatible version");
                 return 0;
             }
-            if ((unsigned long)v9x_read_u16(v9x_payload + 4) + 6ul !=
+            if ((unsigned long)v9x_read_u16(conn->payload + 4) + 6ul !=
                     header.payload_length ||
-                !v9x_is_ascii_text(v9x_payload + 6,
+                !v9x_is_ascii_text(conn->payload + 6,
                                    header.payload_length - 6ul)) {
-                (void)v9x_send_error(state, header.request_id,
+                (void)v9x_send_error(conn, header.request_id,
                                      V9X_STATUS_INVALID_PAYLOAD,
                                      "invalid client label");
                 return 0;
             }
-            if (!v9x_send_hello(state, header.request_id)) return 0;
+            if (!v9x_send_hello(conn, header.request_id)) return 0;
             handshaken = 1;
         } else if (header.version != V9X_PROTOCOL_VERSION) {
-            if (!v9x_send_error(state, header.request_id,
+            if (!v9x_send_error(conn, header.request_id,
                                 V9X_STATUS_UNSUPPORTED_VERSION,
                                 "unsupported frame version")) return 0;
         } else if (header.type == V9X_MSG_PING_REQUEST &&
                    header.payload_length == 0ul) {
-            if (!v9x_send_ping(state, header.request_id)) return 0;
+            if (!v9x_send_ping(conn, header.request_id)) return 0;
         } else if (header.type == V9X_MSG_EXEC_REQUEST) {
-            exec_status = v9x_execution_prepare(state, header.request_id,
-                                                v9x_payload,
+            exec_status = v9x_execution_prepare(conn, header.request_id,
+                                                conn->payload,
                                                 header.payload_length);
             if (exec_status != V9X_STATUS_OK) {
-                if (!v9x_send_error(state, header.request_id, exec_status,
+                if (!v9x_send_error(conn, header.request_id, exec_status,
                                     exec_status == V9X_STATUS_BUSY ?
                                         "execution already active" :
                                     exec_status == V9X_STATUS_CREATE_FAILED ?
                                         "execution worker creation failed" :
                                         "invalid execution request")) return 0;
             } else {
-                v9x_write_u32(v9x_response, GetTickCount());
-                if (!v9x_send_frame(state, V9X_MSG_EXEC_ACCEPTED,
-                                    header.request_id, v9x_response, 4ul)) {
-                    (void)v9x_execution_cancel(state, header.request_id);
-                    (void)v9x_execution_resume(state);
+                v9x_write_u32(conn->response, GetTickCount());
+                if (!v9x_send_frame(conn, V9X_MSG_EXEC_ACCEPTED,
+                                    header.request_id, conn->response, 4ul)) {
+                    (void)v9x_execution_cancel(conn, header.request_id);
+                    (void)v9x_execution_resume(conn);
                     return 0;
                 }
-                if (!v9x_execution_resume(state)) {
-                    if (!v9x_send_error(state, header.request_id,
+                if (!v9x_execution_resume(conn)) {
+                    if (!v9x_send_error(conn, header.request_id,
                                         V9X_STATUS_CREATE_FAILED,
                                         "execution thread did not start")) return 0;
                 }
             }
         } else if (header.type == V9X_MSG_CANCEL_REQUEST &&
                    header.payload_length == 4ul) {
-            target_request = v9x_read_u32(v9x_payload);
-            v9x_write_u32(v9x_response, target_request);
-            v9x_write_u32(v9x_response + 4,
-                          v9x_execution_cancel(state, target_request) ? 1ul : 0ul);
-            if (!v9x_send_frame(state, V9X_MSG_CANCEL_RESPONSE,
-                                header.request_id, v9x_response, 8ul)) return 0;
+            target_request = v9x_read_u32(conn->payload);
+            v9x_write_u32(conn->response, target_request);
+            v9x_write_u32(conn->response + 4,
+                          v9x_execution_cancel(conn, target_request) ? 1ul : 0ul);
+            if (!v9x_send_frame(conn, V9X_MSG_CANCEL_RESPONSE,
+                                header.request_id, conn->response, 8ul)) return 0;
         } else if (v9x_is_file_message(header.type)) {
-            if (!v9x_handle_file_message(state, header.type,
-                                         header.request_id, v9x_payload,
+            if (!v9x_handle_file_message(conn, header.type,
+                                         header.request_id, conn->payload,
                                          header.payload_length)) return 0;
         } else if (header.type == V9X_MSG_REBOOT_REQUEST ||
                    header.type == V9X_MSG_SHUTDOWN_REQUEST) {
-            if (!v9x_handle_power_message(state, header.type,
-                                          header.request_id, v9x_payload,
+            if (!v9x_handle_power_message(conn, header.type,
+                                          header.request_id, conn->payload,
                                           header.payload_length)) return 0;
+        } else if (header.type == V9X_MSG_UPDATE_REQUEST) {
+            if (!v9x_handle_update(conn, header.request_id, conn->payload,
+                                   header.payload_length)) return 0;
         } else if (header.type == V9X_MSG_SCREENSHOT_REQUEST) {
-            if (!v9x_capture_screenshot(state, header.request_id,
-                                        v9x_payload,
+            if (!v9x_capture_screenshot(conn, header.request_id,
+                                        conn->payload,
                                         header.payload_length)) return 0;
         } else if (header.type == V9X_MSG_INPUT_REQUEST) {
-            if (!v9x_handle_input(state, header.request_id, v9x_payload,
+            if (!v9x_handle_input(conn, header.request_id, conn->payload,
                                   header.payload_length)) return 0;
+        } else if (header.type == V9X_MSG_DOWNLOAD_REQUEST) {
+            if (!v9x_handle_download(conn, header.request_id, conn->payload,
+                                     header.payload_length)) return 0;
         } else if (header.type == V9X_MSG_INFO_REQUEST &&
                    header.payload_length == 0ul) {
-            if (!v9x_send_info(state, header.request_id)) return 0;
+            if (!v9x_send_info(conn, header.request_id)) return 0;
         } else {
-            if (!v9x_send_error(state, header.request_id,
+            if (!v9x_send_error(conn, header.request_id,
                                 V9X_STATUS_UNSUPPORTED_OPERATION,
                                 "unsupported operation")) return 0;
         }

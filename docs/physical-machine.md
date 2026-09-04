@@ -46,7 +46,7 @@ Test-NetConnection 192.168.10.98 -Port 9869
 ```
 
 `info` reports the active `Port`, `ListenAddress`, and `AllowedClient` values.
-All other commands—including files, execution, screenshots, and reboot—use the
+All other commands (including files, execution, screenshots, and reboot) use the
 same `-Host` and `-Port` options.
 
 The allowlist is source-IP filtering, not authentication. It does not protect

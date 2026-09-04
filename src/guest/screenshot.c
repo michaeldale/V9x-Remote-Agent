@@ -9,7 +9,6 @@
 static const char v9x_screen_helper[] = "C:\\V9XREMOTE\\V9XSHOT.EXE";
 static const char v9x_screen_capture[] = "C:\\V9XREMOTE\\TEMP\\CAPTURE.$$$";
 static const char v9x_screen_metadata[] = "C:\\V9XREMOTE\\TEMP\\CAPTURE.DAT";
-static unsigned char v9x_screen_response[320];
 
 static int v9x_screen_path(const unsigned char *payload, unsigned long length,
                            char *path)
@@ -43,17 +42,17 @@ static int v9x_ascii_path_equal(const char *left, const char *right)
     }
 }
 
-static int v9x_screen_error(V9xAgentState *state, DWORD request_id,
+static int v9x_screen_error(V9xConnection *conn, DWORD request_id,
                             DWORD status, DWORD native_error,
                             const char *detail)
 {
     unsigned long offset = 8ul;
-    v9x_write_u32(v9x_screen_response, status);
-    v9x_write_u32(v9x_screen_response + 4, native_error);
-    if (!v9x_append_string(v9x_screen_response, sizeof(v9x_screen_response),
+    v9x_write_u32(conn->screen_response, status);
+    v9x_write_u32(conn->screen_response + 4, native_error);
+    if (!v9x_append_string(conn->screen_response, sizeof(conn->screen_response),
                            &offset, detail)) return 0;
-    return v9x_send_frame(state, V9X_MSG_ERROR_RESPONSE, request_id,
-                          v9x_screen_response, offset);
+    return v9x_send_frame(conn, V9X_MSG_ERROR_RESPONSE, request_id,
+                          conn->screen_response, offset);
 }
 
 static int v9x_write_all(HANDLE file, const unsigned char *data, DWORD length,
@@ -158,7 +157,7 @@ static int v9x_run_screen_helper(DWORD *native_error)
     return 1;
 }
 
-int v9x_capture_screenshot(V9xAgentState *state, unsigned long request_id,
+int v9x_capture_screenshot(V9xConnection *conn, unsigned long request_id,
                            const unsigned char *payload,
                            unsigned long length)
 {
@@ -176,26 +175,31 @@ int v9x_capture_screenshot(V9xAgentState *state, unsigned long request_id,
     DWORD crc;
     unsigned long response_offset = 20ul;
     int success = 0;
+    int locked = 0;
 
     if (!v9x_screen_path(payload, length, path)) {
-        return v9x_screen_error(state, request_id, V9X_STATUS_INVALID_PAYLOAD,
+        return v9x_screen_error(conn, request_id, V9X_STATUS_INVALID_PAYLOAD,
                                 ERROR_INVALID_PARAMETER,
                                 "invalid screenshot path");
     }
     if (v9x_ascii_path_equal(path, v9x_screen_capture) ||
         v9x_ascii_path_equal(path, v9x_screen_metadata)) {
-        return v9x_screen_error(state, request_id, V9X_STATUS_INVALID_PAYLOAD,
+        return v9x_screen_error(conn, request_id, V9X_STATUS_INVALID_PAYLOAD,
                                 ERROR_INVALID_PARAMETER,
                                 "screenshot path is reserved");
     }
-    if (InterlockedCompareExchange(&state->exec_active, 0l, 0l) != 0l) {
-        return v9x_screen_error(state, request_id, V9X_STATUS_BUSY, 0ul,
+    if (v9x_execution_any_active(conn->machine)) {
+        return v9x_screen_error(conn, request_id, V9X_STATUS_BUSY, 0ul,
                                 "execution active");
     }
     if (!v9x_desktop_ready()) {
-        return v9x_screen_error(state, request_id, V9X_STATUS_BUSY, 0ul,
+        return v9x_screen_error(conn, request_id, V9X_STATUS_BUSY, 0ul,
                                 "desktop not ready for screenshot");
     }
+    /* The helper and its output files (CAPTURE.$$$/CAPTURE.DAT) are a single
+       machine-wide resource, so only one connection may capture at a time. */
+    EnterCriticalSection(&conn->machine->screenshot_lock);
+    locked = 1;
     v9x_log_line("screenshot-helper-start");
     if (!v9x_run_screen_helper(&native_error)) goto cleanup;
 
@@ -251,12 +255,12 @@ int v9x_capture_screenshot(V9xAgentState *state, unsigned long request_id,
     crc = v9x_crc32_begin();
     crc = v9x_crc32_update(crc, image, file_bytes);
     crc = v9x_crc32_end(crc);
-    v9x_write_u32(v9x_screen_response, width);
-    v9x_write_u32(v9x_screen_response + 4, height);
-    v9x_write_u32(v9x_screen_response + 8, source_bpp);
-    v9x_write_u32(v9x_screen_response + 12, file_bytes);
-    v9x_write_u32(v9x_screen_response + 16, crc);
-    if (!v9x_append_string(v9x_screen_response, sizeof(v9x_screen_response),
+    v9x_write_u32(conn->screen_response, width);
+    v9x_write_u32(conn->screen_response + 4, height);
+    v9x_write_u32(conn->screen_response + 8, source_bpp);
+    v9x_write_u32(conn->screen_response + 12, file_bytes);
+    v9x_write_u32(conn->screen_response + 16, crc);
+    if (!v9x_append_string(conn->screen_response, sizeof(conn->screen_response),
                            &response_offset, path)) goto cleanup;
     success = 1;
 
@@ -266,11 +270,12 @@ cleanup:
     if (allocation != 0) (void)GlobalFree(allocation);
     (void)DeleteFileA(v9x_screen_capture);
     (void)DeleteFileA(v9x_screen_metadata);
+    if (locked) LeaveCriticalSection(&conn->machine->screenshot_lock);
     if (!success) {
-        return v9x_screen_error(state, request_id, V9X_STATUS_IO_FAILED,
+        return v9x_screen_error(conn, request_id, V9X_STATUS_IO_FAILED,
                                 native_error, "screenshot helper failed");
     }
     v9x_log_line("screenshot-complete");
-    return v9x_send_frame(state, V9X_MSG_SCREENSHOT_RESPONSE, request_id,
-                          v9x_screen_response, response_offset);
+    return v9x_send_frame(conn, V9X_MSG_SCREENSHOT_RESPONSE, request_id,
+                          conn->screen_response, response_offset);
 }

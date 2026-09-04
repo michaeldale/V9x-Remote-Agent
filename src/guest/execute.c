@@ -10,27 +10,52 @@
 #define V9X_EXEC_CHUNK 1024ul
 #define V9X_EXEC_EOF_GRACE 2000ul
 
-typedef struct V9xExecutionJob {
-    V9xAgentState *state;
-    DWORD request_id;
-    DWORD timeout_ms;
-    DWORD stdout_limit;
-    DWORD stderr_limit;
-    BYTE mode;
-    BYTE show_window;
-    unsigned short options;
-    char application[260];
-    char command[2048];
-    char directory[260];
-} V9xExecutionJob;
-
-static V9xExecutionJob v9x_job;
-
 static void v9x_zero_bytes(void *target, unsigned long length)
 {
     unsigned char *bytes = (unsigned char *)target;
     unsigned long index;
     for (index = 0ul; index < length; ++index) bytes[index] = 0u;
+}
+
+static unsigned long v9x_exec_dec(char *target, unsigned long offset,
+                                  unsigned long value)
+{
+    char reversed[10];
+    unsigned long count = 0ul;
+    unsigned long index;
+    do {
+        reversed[count++] = (char)('0' + (value % 10ul));
+        value /= 10ul;
+    } while (value != 0ul && count < sizeof(reversed));
+    for (index = 0ul; index < count; ++index) {
+        target[offset + index] = reversed[count - index - 1ul];
+    }
+    return offset + count;
+}
+
+static unsigned long v9x_exec_label(char *target, unsigned long offset,
+                                    const char *key, unsigned long value)
+{
+    while (*key != '\0') target[offset++] = *key++;
+    offset = v9x_exec_dec(target, offset, value);
+    target[offset++] = ' ';
+    return offset;
+}
+
+/* Copy up to a bounded number of printable characters from a job string into
+   an audit detail buffer, replacing anything unprintable with '?'. */
+static unsigned long v9x_exec_text(char *target, unsigned long offset,
+                                   const char *text, unsigned long maximum)
+{
+    unsigned long index = 0ul;
+    while (text[index] != '\0' && index < maximum) {
+        unsigned char ch = (unsigned char)text[index];
+        if (ch < 0x20u || ch > 0x7eu) ch = '?';
+        target[offset++] = (char)ch;
+        ++index;
+    }
+    target[offset] = '\0';
+    return offset;
 }
 
 static int v9x_read_string(const unsigned char *payload, unsigned long length,
@@ -74,7 +99,7 @@ static int v9x_append_text(char *target, unsigned long capacity,
     return 1;
 }
 
-static int v9x_build_command_line(const V9xExecutionJob *job, char *target,
+static int v9x_build_command_line(const V9xExecSlot *job, char *target,
                                   unsigned long capacity)
 {
     unsigned long offset = 0ul;
@@ -150,7 +175,7 @@ static int v9x_create_capture_pipe(HANDLE *read_end, HANDLE *child_write)
     return 1;
 }
 
-static int v9x_send_pipe_data(V9xExecutionJob *job, HANDLE pipe_handle,
+static int v9x_send_pipe_data(V9xExecSlot *job, HANDLE pipe_handle,
                               unsigned short message_type, DWORD limit,
                               DWORD *total, DWORD *sent_total, DWORD *flags,
                               DWORD truncate_flag, int *broken)
@@ -176,7 +201,7 @@ static int v9x_send_pipe_data(V9xExecutionJob *job, HANDLE pipe_handle,
     if (*sent_total >= limit) send_count = 0ul;
     else if (send_count > limit - *sent_total) send_count = limit - *sent_total;
     if (send_count != 0ul) {
-        if (!v9x_send_frame(job->state, message_type, job->request_id,
+        if (!v9x_send_frame(job->owner, message_type, job->request_id,
                             buffer, send_count)) return 0;
         *sent_total += send_count;
     }
@@ -186,7 +211,7 @@ static int v9x_send_pipe_data(V9xExecutionJob *job, HANDLE pipe_handle,
 
 static DWORD WINAPI v9x_execution_worker(LPVOID parameter)
 {
-    V9xExecutionJob *job = (V9xExecutionJob *)parameter;
+    V9xExecSlot *job = (V9xExecSlot *)parameter;
     SECURITY_ATTRIBUTES security;
     STARTUPINFOA startup;
     PROCESS_INFORMATION process;
@@ -238,7 +263,18 @@ static DWORD WINAPI v9x_execution_worker(LPVOID parameter)
         result = V9X_EXEC_RESULT_CREATE_FAILED;
         goto complete_job;
     }
-    v9x_log_line("exec-start");
+    {
+        char detail[160];
+        unsigned long at = 0ul;
+        at = v9x_exec_label(detail, at, "rid=", job->request_id);
+        at = v9x_exec_label(detail, at, "mode=", job->mode);
+        detail[at++] = 'c'; detail[at++] = 'm'; detail[at++] = 'd';
+        detail[at++] = '=';
+        (void)v9x_exec_text(detail, at,
+                            job->mode == V9X_EXEC_MODE_SHELL ?
+                                job->command : job->application, 96ul);
+        v9x_log_event("exec-start", detail);
+    }
     if (!detach &&
         (!v9x_create_capture_pipe(&stdout_read, &stdout_write) ||
          !v9x_create_capture_pipe(&stderr_read, &stderr_write))) {
@@ -291,9 +327,9 @@ static DWORD WINAPI v9x_execution_worker(LPVOID parameter)
                                 job->stderr_limit, &stderr_total, &stderr_sent,
                                 &flags, V9X_EXEC_FLAG_STDERR_TRUNCATED,
                                 &stderr_broken)) {
-            InterlockedExchange(&job->state->exec_cancel, 1l);
+            InterlockedExchange(&job->cancel, 1l);
         }
-        if (InterlockedCompareExchange(&job->state->exec_cancel, 0l, 0l) != 0l) {
+        if (v9x_flag_read(&job->cancel) != 0l) {
             flags |= V9X_EXEC_FLAG_CANCELLED;
             result = V9X_EXEC_RESULT_CANCELLED;
             (void)TerminateProcess(process.hProcess, 0xfffffffeul);
@@ -364,98 +400,148 @@ complete_job:
     v9x_write_u32(complete + 16, stdout_total);
     v9x_write_u32(complete + 20, stderr_total);
     v9x_write_u32(complete + 24, flags);
-    (void)v9x_send_frame(job->state, V9X_MSG_EXEC_COMPLETE, job->request_id,
+    (void)v9x_send_frame(job->owner, V9X_MSG_EXEC_COMPLETE, job->request_id,
                          complete, sizeof(complete));
-    v9x_log_line("exec-complete");
-    InterlockedExchange(&job->state->exec_active, 0l);
+    {
+        char detail[160];
+        unsigned long at = 0ul;
+        at = v9x_exec_label(detail, at, "rid=", job->request_id);
+        at = v9x_exec_label(detail, at, "result=", result);
+        at = v9x_exec_label(detail, at, "exit=", exit_code);
+        at = v9x_exec_label(detail, at, "ms=", GetTickCount() - started);
+        at = v9x_exec_label(detail, at, "out=", stdout_total);
+        at = v9x_exec_label(detail, at, "err=", stderr_total);
+        at = v9x_exec_label(detail, at, "flags=", flags);
+        if (at != 0ul) detail[at - 1ul] = '\0';
+        v9x_log_event("exec-complete", detail);
+    }
+    InterlockedExchange(&job->cancel, 0l);
+    InterlockedExchange(&job->active, 0l);
     return 0ul;
 }
 
-unsigned long v9x_execution_prepare(V9xAgentState *state,
+unsigned long v9x_execution_prepare(V9xConnection *conn,
                                     unsigned long request_id,
                                     const unsigned char *payload,
                                     unsigned long length)
 {
+    V9xAgentState *machine = conn->machine;
     unsigned long offset = 16ul;
     DWORD thread_id = 0ul;
+    V9xExecSlot *slot = 0;
+    unsigned long i;
     if (length < 22ul) return V9X_STATUS_INVALID_PAYLOAD;
-    if (InterlockedCompareExchange(&state->exec_active, 1l, 0l) != 0l) {
-        return V9X_STATUS_BUSY;
+    /* Claim the first free pool slot atomically; BUSY only when every slot is
+       already running a job. The exchange winner owns the slot. */
+    for (i = 0ul; i < V9X_EXEC_POOL_SIZE; ++i) {
+        if (v9x_flag_acquire(&machine->exec_pool[i].active)) {
+            slot = &machine->exec_pool[i];
+            break;
+        }
     }
-    if (state->exec_thread != 0) {
-        CloseHandle(state->exec_thread);
-        state->exec_thread = 0;
+    if (slot == 0) return V9X_STATUS_BUSY;
+    if (slot->thread != 0) {
+        CloseHandle(slot->thread);
+        slot->thread = 0;
     }
-    v9x_zero_bytes(&v9x_job, sizeof(v9x_job));
-    v9x_job.state = state;
-    v9x_job.request_id = request_id;
-    v9x_job.mode = payload[0];
-    v9x_job.show_window = payload[1];
-    v9x_job.options = v9x_read_u16(payload + 2);
-    v9x_job.timeout_ms = v9x_read_u32(payload + 4);
-    v9x_job.stdout_limit = v9x_read_u32(payload + 8);
-    v9x_job.stderr_limit = v9x_read_u32(payload + 12);
-    if ((v9x_job.options & ~V9X_EXEC_OPTION_MASK) != 0u ||
-        v9x_job.mode > V9X_EXEC_MODE_SHELL || v9x_job.show_window > 1u ||
-        v9x_job.timeout_ms > V9X_EXEC_MAX_TIMEOUT ||
-        v9x_job.stdout_limit > V9X_EXEC_MAX_OUTPUT ||
-        v9x_job.stderr_limit > V9X_EXEC_MAX_OUTPUT ||
-        !v9x_read_string(payload, length, &offset, v9x_job.application,
+    slot->owner = conn;
+    slot->request_id = request_id;
+    slot->mode = payload[0];
+    slot->show_window = payload[1];
+    slot->options = v9x_read_u16(payload + 2);
+    slot->timeout_ms = v9x_read_u32(payload + 4);
+    slot->stdout_limit = v9x_read_u32(payload + 8);
+    slot->stderr_limit = v9x_read_u32(payload + 12);
+    if ((slot->options & ~V9X_EXEC_OPTION_MASK) != 0u ||
+        slot->mode > V9X_EXEC_MODE_SHELL || slot->show_window > 1u ||
+        slot->timeout_ms > V9X_EXEC_MAX_TIMEOUT ||
+        slot->stdout_limit > V9X_EXEC_MAX_OUTPUT ||
+        slot->stderr_limit > V9X_EXEC_MAX_OUTPUT ||
+        !v9x_read_string(payload, length, &offset, slot->application,
                          V9X_EXEC_MAX_APPLICATION) ||
-        !v9x_read_string(payload, length, &offset, v9x_job.command,
+        !v9x_read_string(payload, length, &offset, slot->command,
                          V9X_EXEC_MAX_COMMAND) ||
-        !v9x_read_string(payload, length, &offset, v9x_job.directory,
+        !v9x_read_string(payload, length, &offset, slot->directory,
                          V9X_EXEC_MAX_DIRECTORY) || offset != length ||
-        (v9x_job.mode == V9X_EXEC_MODE_DIRECT && v9x_job.application[0] == '\0') ||
-        (v9x_job.mode == V9X_EXEC_MODE_SHELL && v9x_job.command[0] == '\0')) {
-        InterlockedExchange(&state->exec_active, 0l);
+        (slot->mode == V9X_EXEC_MODE_DIRECT && slot->application[0] == '\0') ||
+        (slot->mode == V9X_EXEC_MODE_SHELL && slot->command[0] == '\0')) {
+        InterlockedExchange(&slot->active, 0l);
         return V9X_STATUS_INVALID_PAYLOAD;
     }
-    state->exec_request_id = request_id;
-    InterlockedExchange(&state->exec_cancel, 0l);
-    state->exec_thread = CreateThread(0, 65536ul, v9x_execution_worker,
-                                      &v9x_job, CREATE_SUSPENDED, &thread_id);
-    if (state->exec_thread == 0) {
-        InterlockedExchange(&state->exec_active, 0l);
+    InterlockedExchange(&slot->cancel, 0l);
+    slot->thread = CreateThread(0, 65536ul, v9x_execution_worker,
+                                slot, CREATE_SUSPENDED, &thread_id);
+    if (slot->thread == 0) {
+        InterlockedExchange(&slot->active, 0l);
         return V9X_STATUS_CREATE_FAILED;
     }
+    conn->pending_exec = slot;
     return V9X_STATUS_OK;
 }
 
-int v9x_execution_resume(V9xAgentState *state)
+int v9x_execution_resume(V9xConnection *conn)
 {
-    if (state->exec_thread != 0 && ResumeThread(state->exec_thread) != 0xfffffffful) {
+    V9xExecSlot *slot = conn->pending_exec;
+    conn->pending_exec = 0;
+    if (slot == 0) return 0;
+    if (slot->thread != 0 && ResumeThread(slot->thread) != 0xfffffffful) {
         return 1;
     }
-    if (state->exec_thread != 0) {
-        (void)TerminateThread(state->exec_thread, 1ul);
-        CloseHandle(state->exec_thread);
-        state->exec_thread = 0;
+    if (slot->thread != 0) {
+        (void)TerminateThread(slot->thread, 1ul);
+        CloseHandle(slot->thread);
+        slot->thread = 0;
     }
-    InterlockedExchange(&state->exec_active, 0l);
+    InterlockedExchange(&slot->active, 0l);
     return 0;
 }
 
-int v9x_execution_cancel(V9xAgentState *state, unsigned long request_id)
+/* Cancel is scoped to (owner, request_id): request ids are unique only per
+   owner, so never match on request_id alone. */
+int v9x_execution_cancel(V9xConnection *conn, unsigned long request_id)
 {
-    if (InterlockedCompareExchange(&state->exec_active, 0l, 0l) == 0l ||
-        state->exec_request_id != request_id) return 0;
-    InterlockedExchange(&state->exec_cancel, 1l);
-    return 1;
-}
-
-void v9x_execution_disconnect(V9xAgentState *state)
-{
-    if (InterlockedCompareExchange(&state->exec_active, 0l, 0l) != 0l) {
-        InterlockedExchange(&state->exec_cancel, 1l);
-        if (state->exec_thread != 0 &&
-            WaitForSingleObject(state->exec_thread, 5000ul) == WAIT_TIMEOUT) {
-            (void)TerminateThread(state->exec_thread, 1ul);
-            InterlockedExchange(&state->exec_active, 0l);
+    V9xAgentState *machine = conn->machine;
+    unsigned long i;
+    for (i = 0ul; i < V9X_EXEC_POOL_SIZE; ++i) {
+        V9xExecSlot *slot = &machine->exec_pool[i];
+        if (v9x_flag_read(&slot->active) != 0l &&
+            slot->owner == conn && slot->request_id == request_id) {
+            InterlockedExchange(&slot->cancel, 1l);
+            return 1;
         }
     }
-    if (state->exec_thread != 0) {
-        CloseHandle(state->exec_thread);
-        state->exec_thread = 0;
+    return 0;
+}
+
+void v9x_execution_disconnect(V9xConnection *conn)
+{
+    V9xAgentState *machine = conn->machine;
+    unsigned long i;
+    for (i = 0ul; i < V9X_EXEC_POOL_SIZE; ++i) {
+        V9xExecSlot *slot = &machine->exec_pool[i];
+        if (slot->owner != conn) continue;
+        if (v9x_flag_read(&slot->active) != 0l) {
+            InterlockedExchange(&slot->cancel, 1l);
+            if (slot->thread != 0 &&
+                WaitForSingleObject(slot->thread, 5000ul) == WAIT_TIMEOUT) {
+                (void)TerminateThread(slot->thread, 1ul);
+                InterlockedExchange(&slot->active, 0l);
+            }
+        }
+        if (slot->thread != 0) {
+            CloseHandle(slot->thread);
+            slot->thread = 0;
+        }
     }
+}
+
+int v9x_execution_any_active(V9xAgentState *machine)
+{
+    unsigned long i;
+    for (i = 0ul; i < V9X_EXEC_POOL_SIZE; ++i) {
+        if (v9x_flag_read(&machine->exec_pool[i].active) != 0l) {
+            return 1;
+        }
+    }
+    return 0;
 }

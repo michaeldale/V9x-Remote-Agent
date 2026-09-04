@@ -57,12 +57,17 @@ MSG_FILE_WRITE_COMPLETE = 0x8025
 MSG_FILE_OPEN_READ = 0x0026
 MSG_FILE_READ_COMPLETE = 0x8026
 MSG_FILE_READ_CHUNK = 0x9026
+MSG_DOWNLOAD = 0x0027
+MSG_DOWNLOAD_PROGRESS = 0x9027
+MSG_DOWNLOAD_COMPLETE = 0x8027
 MSG_INFO = 0x0030
 MSG_INFO_RESPONSE = 0x8030
 MSG_REBOOT = 0x0040
 MSG_REBOOT_ACCEPTED = 0x8040
 MSG_SHUTDOWN = 0x0041
 MSG_SHUTDOWN_ACCEPTED = 0x8041
+MSG_UPDATE = 0x0042
+MSG_UPDATE_ACCEPTED = 0x8042
 MSG_SCREENSHOT = 0x0050
 MSG_SCREENSHOT_RESPONSE = 0x8050
 MSG_INPUT = 0x0060
@@ -76,8 +81,10 @@ CAP_FILE_READ = 0x0020
 CAP_FILE_WRITE = 0x0040
 CAP_POWER = 0x0080
 CAP_SCREENSHOT = 0x0100
+CAP_DRIVER_UPDATE = 0x0200
 CAP_INPUT = 0x0400
 CAP_EXEC_DETACH = 0x0800
+CAP_HTTP_DOWNLOAD = 0x1000
 
 INPUT_OP_MOUSE_MOVE = 1
 INPUT_OP_MOUSE_BUTTON = 2
@@ -575,6 +582,45 @@ class V9xClient:
             raise V9xError("downloaded size or CRC32 does not match the guest")
         return data
 
+    def download(self, url, guest_path):
+        self.require(CAP_HTTP_DOWNLOAD, "http-download")
+        self.next_id()
+        self.send(MSG_DOWNLOAD, encode_string(url) + encode_string(guest_path))
+        old_timeout = self.timeout
+        self.sock.settimeout(600.0)
+        try:
+            while True:
+                _, msg_type, _, payload = self.expect(
+                    (MSG_DOWNLOAD_PROGRESS, MSG_DOWNLOAD_COMPLETE)
+                )
+                if msg_type == MSG_DOWNLOAD_COMPLETE:
+                    break
+            if len(payload) != 12:
+                raise V9xError("invalid DOWNLOAD_COMPLETE payload")
+            status, size, crc = struct.unpack("<III", payload)
+        finally:
+            self.sock.settimeout(old_timeout)
+        return {
+            "url": url,
+            "guest_path": guest_path,
+            "http_status": status,
+            "size": size,
+            "crc32": "%08X" % crc,
+        }
+
+    def update_apply(self, agent_size, agent_crc, helper_size, helper_crc):
+        self.require(CAP_DRIVER_UPDATE, "hot-update")
+        self.next_id()
+        self.send(
+            MSG_UPDATE,
+            struct.pack("<IIII", agent_size, agent_crc, helper_size, helper_crc),
+        )
+        _, _, _, payload = self.expect((MSG_UPDATE_ACCEPTED,))
+        if len(payload) != 8:
+            raise V9xError("invalid UPDATE_ACCEPTED payload")
+        boot, agent_bytes = struct.unpack("<II", payload)
+        return {"boot_counter": boot, "agent_size": agent_bytes}
+
     def screenshot(self, guest_path=DEFAULT_SCREENSHOT):
         self.require(CAP_SCREENSHOT, "screenshot")
         self.next_id()
@@ -661,6 +707,31 @@ class V9xClient:
         if offset != len(payload) or echoed != job_id:
             raise V9xError("power-control acceptance token does not match")
         return boot
+
+
+def wait_for_update(host, port, old_boot, wait_seconds):
+    deadline = time.monotonic() + wait_seconds
+    last_error = "no connection attempt succeeded"
+    while time.monotonic() < deadline:
+        time.sleep(0.5)
+        try:
+            candidate = V9xClient(host, port, timeout=3.0)
+        except (OSError, V9xError) as exc:
+            last_error = str(exc)
+            continue
+        try:
+            hello = candidate.hello
+            if hello["boot_counter"] != old_boot:
+                return hello
+            last_error = "reconnected with unchanged boot counter %d" % hello[
+                "boot_counter"
+            ]
+        finally:
+            candidate.close()
+    raise V9xError(
+        "agent did not relaunch with a new boot counter within %d seconds; "
+        "last error: %s" % (wait_seconds, last_error)
+    )
 
 
 def wait_for_reboot(host, port, old_boot, job_id, wait_seconds):
@@ -910,6 +981,32 @@ TOOLS = [
         },
     },
     {
+        "name": "v9x_download",
+        "description": "Have the guest fetch an http:// URL straight to a guest path over its own network connection (no host round-trip). HTTP only; https is rejected. Verified and written transactionally (64 MiB max).",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "url": {"type": "string", "description": "http:// URL to fetch (https is not supported)"},
+                "guest_path": guest_path_schema("Destination path in the guest"),
+            },
+            "required": ["url", "guest_path"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "v9x_update",
+        "description": "Upgrade the guest agent WITHOUT a reboot from a local install package folder (must contain V9XAGNT.EXE and V9XSHOT.EXE). Uploads and CRC-verifies the new binaries, hot-swaps them, and waits for the agent to relaunch with a new boot counter.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "package_dir": {"type": "string", "description": "Local folder with the new V9XAGNT.EXE and V9XSHOT.EXE (e.g. build\\install)"},
+                "wait_seconds": {"type": "integer", "description": "How long to wait for relaunch (default 120)"},
+            },
+            "required": ["package_dir"],
+            "additionalProperties": False,
+        },
+    },
+    {
         "name": "v9x_reboot_with_proof",
         "description": "Reboot and verify disconnect/reconnect with a changed agent-start counter and echoed resume token. The counter alone is not reboot proof. Call v9x_wait_desktop afterwards to complete confirmation before GUI work.",
         "inputSchema": {
@@ -1135,6 +1232,44 @@ class ToolHandler:
                 "mimeType": "image/png",
             },
         ]
+
+    def v9x_download(self, args):
+        with self.connect() as client:
+            return self.text(client.download(args["url"], args["guest_path"]))
+
+    def v9x_update(self, args):
+        package_dir = os.path.abspath(args["package_dir"])
+        agent_path = os.path.join(package_dir, "V9XAGNT.EXE")
+        helper_path = os.path.join(package_dir, "V9XSHOT.EXE")
+        if not os.path.isfile(agent_path) or not os.path.isfile(helper_path):
+            raise V9xError(
+                "install package must contain V9XAGNT.EXE and V9XSHOT.EXE: %s"
+                % package_dir
+            )
+        with open(agent_path, "rb") as handle:
+            agent_data = handle.read()
+        with open(helper_path, "rb") as handle:
+            helper_data = handle.read()
+        agent_crc = zlib.crc32(agent_data) & 0xFFFFFFFF
+        helper_crc = zlib.crc32(helper_data) & 0xFFFFFFFF
+        wait_seconds = int(args.get("wait_seconds", 120))
+        with self.connect() as client:
+            old_boot = client.hello["boot_counter"]
+            old_build = client.hello["build_id"]
+            client.put_bytes(agent_data, "C:\\V9XREMOTE\\V9XNEW.EXE")
+            client.put_bytes(helper_data, "C:\\V9XREMOTE\\V9XSNEW.EXE")
+            client.update_apply(len(agent_data), agent_crc, len(helper_data), helper_crc)
+        hello = wait_for_update(self.host, self.port, old_boot, wait_seconds)
+        return self.text(
+            {
+                "updated": True,
+                "previous_build": old_build,
+                "previous_boot_counter": old_boot,
+                "build_id": hello["build_id"],
+                "boot_counter": hello["boot_counter"],
+                "agent_bytes": len(agent_data),
+            }
+        )
 
     def v9x_reboot_with_proof(self, args):
         job_id = args.get("job_id") or ("mcp-%d" % (int(time.time()) % 100000000))

@@ -2,6 +2,104 @@
 
 All notable changes to the V9x Remote Agent. Dates are in YYYY-MM-DD.
 
+## 0.6.2 (2026-09-04)
+
+### Fixed
+- The notification-area icon, which had never appeared on any guest in any
+  release that shipped it. `v9x_tray_start` passed a NULL `lpThreadId` to
+  `CreateThread`, which Windows 9x rejects with `ERROR_INVALID_PARAMETER`
+  (Windows NT accepts it, so no modern host ever flagged the call). The window
+  and icon were created fine; the worker thread never existed, so
+  `Shell_NotifyIcon` was never reached. Measured as `tray-thread-failed gle=87`
+  on 98 SE. The owner window now also belongs to the worker thread and that
+  thread pumps its own message queue, instead of the window being created on
+  the main thread that blocks in `accept()` forever.
+- Tray failures are no longer silent. `v9x_tray_start` returned 0 for three
+  different reasons behind one `tray-icon-failed` line, and a failing
+  `Shell_NotifyIcon` was retried every second with its result discarded, so a
+  wholly broken feature could not be diagnosed from the log. Each failure now
+  names itself with its `GetLastError` (`tray-window-failed`,
+  `tray-loadicon-failed`, `tray-thread-failed`, `tray-notify-failed`) and
+  success logs `tray-icon-added`.
+
+### Added
+- `scripts\set-autologon.ps1`: report, enable or disable Windows 9x autologon
+  on a guest, and clear a logon dialog that is already up (`-Dismiss`). Purely
+  host-side, composed from existing verbs, no protocol change.
+- `scripts\capture-emulator-window.ps1`: capture the emulator's own window from
+  the host. `screenshot` needs Explorer, so it returns exit 43 for precisely
+  the states worth seeing - a logon dialog, a BIOS prompt, a shutdown hang.
+  This reads the window instead and needs nothing from the guest.
+- Documented what the agent can and cannot do before anyone logs on.
+  `RunServices` does start it before the logon dialog and everything except
+  `screenshot` and `wait-desktop` works there, so a guest that prompts at boot
+  stalls automation at its first `wait-desktop` while `ping` keeps succeeding.
+  `AGENTS.md` now says to call `info` before concluding a guest is hung.
+
+## 0.6.1 (2026-08-21)
+
+### Fixed
+- Windows 95 support. The agent imported `KERNEL32:InterlockedCompareExchange`,
+  which Windows 95 does not export (it arrived in Windows 98 and NT4), so the
+  loader refused to start `V9XAGNT.EXE` ("linked to missing export"). Every
+  compare-exchange was a 0/1 flag acquire or a plain read, so they are now the
+  `v9x_flag_acquire`/`v9x_flag_read` macros built on `InterlockedExchange`
+  (exported since Windows 95) and an aligned volatile read. Verified on a real
+  Windows 95 486; behaviour on 98 SE is unchanged.
+- `packaging/` text files are CRLF on disk again and a `.gitattributes` pins
+  them (`packaging/** text eol=crlf`, plus `*.BAT`/`*.REG`/`*.INI`/`*.CFG`).
+  They had been LF-only in the working tree since 16 Aug, so anything copied
+  straight from `packaging/` (bypassing `build-guest.ps1`, which normalises)
+  produced batch files that Win9x `COMMAND.COM` misparses with "Bad command or
+  file name" on every line.
+
+## 0.6.0 (2026-08-18)
+
+### Added
+- Concurrent execution pool. The agent now runs up to four `EXEC_REQUEST`
+  jobs at once instead of one; `V9X_STATUS_BUSY` is returned only when every
+  slot is in use. `EXEC_STDOUT`/`EXEC_STDERR`/`EXEC_COMPLETE` are already keyed
+  by request id, so streams interleave, and `CANCEL_REQUEST` is scoped to the
+  owning connection and request id.
+- Multiple simultaneous client connections. The listener serves each accepted
+  socket on its own thread with its own send lock and buffers, up to four
+  concurrent connections (excess are rejected). Reboot, shutdown, and
+  screenshot remain machine-wide and are refused while any execution is active.
+  Request ids are unique only per connection.
+- Upgrade without reboot. `UPDATE_REQUEST` (`0x0042`) verifies the size and
+  CRC32 of already-uploaded `V9XNEW.EXE`/`V9XSNEW.EXE`, writes `HOTSWAP.BAT`,
+  launches it detached, replies `UPDATE_ACCEPTED`, and exits so the batch can
+  swap the now-unlocked binaries and relaunch the agent. The RunServices entry
+  is never repointed, so an interrupted swap still recovers on the next boot.
+  Wires the previously reserved `V9X_CAP_DRIVER_UPDATE` capability bit.
+- HTTP download. `DOWNLOAD_REQUEST` (`0x0027`) fetches an `http://` URL straight
+  to a guest path over a hand-rolled HTTP/1.0 client (no new DLL dependency),
+  streaming `DOWNLOAD_PROGRESS` and committing through the same transactional
+  `.PART`/backup path as uploads. HTTPS is rejected with a clear error. New
+  `V9X_CAP_HTTP_DOWNLOAD` capability bit.
+- Structured audit log. `AGENT.LOG` lines now carry a local timestamp, the boot
+  counter, and per-event detail (executed command, transferred path and CRC,
+  download URL and HTTP status, and a full per-command dispatch trail). The log
+  rotates to `AGENT.OLD` past 256 KB.
+
+## 0.5.3 (2026-08-16)
+
+### Fixed
+- `INSTALL.BAT` no longer aborts on real Windows 98 SE hardware. It guarded its
+  target directory with a bare `IF NOT EXIST C:\V9XREMOTE`, but Win98 SE
+  `COMMAND.COM` evaluates `IF EXIST <directory>` as false for a directory that
+  exists. The guard therefore fired on every run, `MD` failed with "Unable to
+  create directory", and the install exited with "ERROR: V9x Remote Agent files
+  could not be copied" without installing or staging anything. Both guards now
+  test `C:\V9XREMOTE\NUL`. Found installing onto a Gateway Solo 2150.
+- `INSTALL.BAT` applies its registry file before clearing read-only attributes,
+  and clears them one named file at a time instead of sweeping
+  `C:\V9XREMOTE\*.*`. The wildcard sweep also walked the `TEMP` and `JOBS`
+  subdirectories and could fail with "General failure reading drive C", which
+  aborted the batch *after* the new binaries were staged but *before*
+  `UPDATE.REG` was applied - leaving a staged update that would never install
+  and a machine that silently kept running the old agent.
+
 ## 0.5.2 (2026-08-13)
 
 ### Fixed

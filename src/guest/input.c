@@ -2,19 +2,17 @@
 #include "v9xremote/protocol.h"
 #include "v9xremote/status.h"
 
-static unsigned char v9x_input_response[16];
-
-static int v9x_input_error(V9xAgentState *state, unsigned long request_id,
+static int v9x_input_error(V9xConnection *conn, unsigned long request_id,
                            unsigned long status, unsigned long native_error,
                            const char *detail)
 {
     unsigned long offset = 8ul;
-    v9x_write_u32(v9x_input_response, status);
-    v9x_write_u32(v9x_input_response + 4, native_error);
-    if (!v9x_append_string(v9x_input_response, sizeof(v9x_input_response),
+    v9x_write_u32(conn->input_response, status);
+    v9x_write_u32(conn->input_response + 4, native_error);
+    if (!v9x_append_string(conn->input_response, sizeof(conn->input_response),
                            &offset, detail)) return 0;
-    return v9x_send_frame(state, V9X_MSG_ERROR_RESPONSE, request_id,
-                          v9x_input_response, offset);
+    return v9x_send_frame(conn, V9X_MSG_ERROR_RESPONSE, request_id,
+                          conn->input_response, offset);
 }
 
 static long v9x_read_s32(const unsigned char *source)
@@ -175,32 +173,32 @@ static void v9x_input_apply(const unsigned char *payload, unsigned long count)
     }
 }
 
-int v9x_handle_input(V9xAgentState *state, unsigned long request_id,
+int v9x_handle_input(V9xConnection *conn, unsigned long request_id,
                      const unsigned char *payload, unsigned long length)
 {
     unsigned long count;
     POINT cursor;
     if (length < 2ul) {
-        return v9x_input_error(state, request_id, V9X_STATUS_INVALID_PAYLOAD,
+        return v9x_input_error(conn, request_id, V9X_STATUS_INVALID_PAYLOAD,
                                ERROR_INVALID_PARAMETER, "input payload too short");
     }
     count = (unsigned long)v9x_read_u16(payload);
     if (count > V9X_INPUT_MAX_ACTIONS) {
-        return v9x_input_error(state, request_id, V9X_STATUS_LIMIT_EXCEEDED,
+        return v9x_input_error(conn, request_id, V9X_STATUS_LIMIT_EXCEEDED,
                                ERROR_INVALID_PARAMETER, "too many input actions");
     }
     if (!v9x_input_validate(payload, length, count)) {
-        return v9x_input_error(state, request_id, V9X_STATUS_INVALID_PAYLOAD,
+        return v9x_input_error(conn, request_id, V9X_STATUS_INVALID_PAYLOAD,
                                ERROR_INVALID_PARAMETER, "malformed input actions");
     }
     v9x_input_apply(payload, count);
     cursor.x = 0l;
     cursor.y = 0l;
     (void)GetCursorPos(&cursor);
-    v9x_write_u32(v9x_input_response, count);
-    v9x_write_u32(v9x_input_response + 4, (unsigned long)(long)cursor.x);
-    v9x_write_u32(v9x_input_response + 8, (unsigned long)(long)cursor.y);
+    v9x_write_u32(conn->input_response, count);
+    v9x_write_u32(conn->input_response + 4, (unsigned long)(long)cursor.x);
+    v9x_write_u32(conn->input_response + 8, (unsigned long)(long)cursor.y);
     v9x_log_line("input-complete");
-    return v9x_send_frame(state, V9X_MSG_INPUT_RESPONSE, request_id,
-                          v9x_input_response, 12ul);
+    return v9x_send_frame(conn, V9X_MSG_INPUT_RESPONSE, request_id,
+                          conn->input_response, 12ul);
 }

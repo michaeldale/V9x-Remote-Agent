@@ -60,6 +60,7 @@ $sources = @(
     "src\common\crc32.c",
     "src\common\frame.c",
     "src\guest\agent.c",
+    "src\guest\download.c",
     "src\guest\entry.c",
     "src\guest\execute.c",
     "src\guest\files.c",
@@ -68,7 +69,8 @@ $sources = @(
     "src\guest\power.c",
     "src\guest\protocol.c",
     "src\guest\screenshot.c",
-    "src\guest\tray.c"
+    "src\guest\tray.c",
+    "src\guest\update.c"
 )
 $objects = @()
 foreach ($relativeSource in $sources) {
@@ -141,13 +143,14 @@ foreach ($requiredImport in @('Accept', 'Bind', 'CreateFileA', 'CreateMutexA',
                                'FindNextFileA', 'GetExitCodeProcess',
                                'GetFileAttributesA', 'GetFileSize',
                                'GetPrivateProfileIntA', 'GetPrivateProfileStringA',
-                               'GetVersion', 'ExitWindowsEx', 'FindWindowA',
-                               'GetSystemMetrics', 'Inet_addr', 'Listen', 'MoveFileA',
+                               'GetVersion', 'GetLocalTime', 'ExitWindowsEx', 'FindWindowA',
+                               'GetSystemMetrics', 'Inet_addr', 'Connect', 'Listen', 'MoveFileA',
                                'PeekNamedPipe', 'Recv', 'Send', 'Socket',
                                'TerminateProcess', 'WSAStartup',
                                'GetCursorPos', 'SetCursorPos', 'MapVirtualKeyA',
                                'VkKeyScanA', 'keybd_event', 'mouse_event',
                                'CreateWindowExA', 'DestroyWindow', 'LoadIconA',
+                               'PeekMessageA', 'DispatchMessageA',
                                'Shell_NotifyIconA', 'gethostname', 'gethostbyname',
                                'inet_ntoa')) {
     if ($dumpText -notmatch "(?im)\s$([regex]::Escape($requiredImport))\s*$") {

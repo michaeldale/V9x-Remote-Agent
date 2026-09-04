@@ -165,7 +165,9 @@ class JsonRpcTests(unittest.TestCase):
         self.assertIn("v9x_reboot_with_proof", names)
         self.assertIn("v9x_click", names)
         self.assertIn("v9x_key", names)
-        self.assertEqual(len(tools), 20)
+        self.assertIn("v9x_download", names)
+        self.assertIn("v9x_update", names)
+        self.assertEqual(len(tools), 22)
 
     def test_unknown_method_errors(self):
         responses = self.run_server(

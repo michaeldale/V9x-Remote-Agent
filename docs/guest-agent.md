@@ -46,8 +46,14 @@ While it is running, the agent adds an icon to the Windows notification area.
 Hovering over the icon shows the agent version, listening port, and IPv4
 address. When `bind_address` is `0.0.0.0`, the displayed address is resolved
 from the guest machine name after Winsock starts; if resolution is unavailable,
-the tooltip keeps the configured `0.0.0.0` value. The tray worker waits for
-Explorer during boot and restores the icon if Explorer is restarted.
+the tooltip keeps the configured `0.0.0.0` value. The tray worker owns the
+icon's window, waits for Explorer during boot, pumps its own message queue, and
+restores the icon if Explorer is restarted. Success is logged as
+`tray-icon-added`; each failure names itself with a `gle=` code
+(`tray-window-failed`, `tray-loadicon-failed`, `tray-thread-failed`,
+`tray-notify-failed`). The icon was broken in every release before 0.6.2 -
+see
+[decisions/2026-09-04-tray-icon-createthread-lpthreadid.md](decisions/2026-09-04-tray-icon-createthread-lpthreadid.md).
 
 The boot counter is flushed to `BOOT.DAT`. An accepted reboot or shutdown first
 flushes its resume token to `PENDING.DAT`; the next HELLO and INFO return both
@@ -62,6 +68,21 @@ the host retrieves the image through the transactional download path.
 The package registers the executable in the machine-wide Windows 9x
 `RunServices` key. The executable should be tested interactively once before
 enabling boot startup in the reference image.
+
+## Before anyone logs on
+
+`RunServices` runs before the logon dialog, so on a guest that prompts at boot
+the agent is already listening while that dialog sits on screen. Measured on
+98 SE: `ping`, `info`, `exec`, `shell`, `stat`, `put`, `get` and `input` all
+work in that state; `screenshot` returns guest error 6 (host exit 43) and
+`wait-desktop` times out (host exit 44), because both need Explorer and
+Explorer has not started yet.
+
+An unattended guest that prompts therefore stalls every run at its first
+`wait-desktop` while `ping` keeps succeeding. `scripts\set-autologon.ps1`
+reports and fixes that, and `-Dismiss` clears a dialog that is already up. Full
+evidence and the Windows 9x autologon rules are in
+[decisions/2026-09-04-prelogon-reachability-and-autologon.md](decisions/2026-09-04-prelogon-reachability-and-autologon.md).
 
 Network settings are read from `C:\V9XREMOTE\AGENT.INI` at process start:
 

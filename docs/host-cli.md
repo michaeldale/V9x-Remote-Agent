@@ -124,3 +124,55 @@ unattended consolidated probe can be selected with `-PreflightProgram` and
 directly through Windows SetupX, performs a proven reboot, waits for the
 desktop, and stores `DESKTOP.BMP` plus `cycle.json` under
 `build\driver-results\<job-id>`. It never performs first device association.
+
+## set-autologon.ps1
+
+`set-autologon.ps1` reports and changes Windows 9x autologon on a guest, and
+clears a logon dialog that is already on screen. It is a host-side composition
+of existing verbs (`exec`, `put`, `get`, `stat`, `shell`, `input`,
+`wait-desktop`) with no protocol change, so any agent that supports those verbs
+supports it.
+
+```powershell
+.\scripts\set-autologon.ps1                       # status only, changes nothing
+.\scripts\set-autologon.ps1 -Dismiss              # clear a dialog that is up now
+.\scripts\set-autologon.ps1 -Enable  -Json
+.\scripts\set-autologon.ps1 -Disable -Host 10.0.1.172
+```
+
+| Switch | Effect |
+|---|---|
+| none | Reports `PrimaryProvider`, user name, `.PWL` path and presence, `DesktopReady`, and an `Autologon` boolean. Works while the guest sits at the logon dialog. |
+| `-Enable` | Clears `HKLM\Network\Logon\PrimaryProvider` to Windows Logon if a network provider is set, and completes a pending logon dialog so Windows writes the password list. |
+| `-Disable` | Parks `C:\WINDOWS\<user>.PWL` as `C:\WINDOWS\V9XLOGON.PWL` (not deleted, so `-Enable` can restore it). The guest prompts from the next boot. |
+| `-Dismiss` | Sends one `ENTER` to a logon dialog that is up and waits for the desktop. Changes no configuration. |
+
+Autologon on Windows 9x needs two conditions together: an empty
+`PrimaryProvider`, and a `C:\WINDOWS\<user>.PWL` holding a blank password.
+The password list is only written when a logon completes, so it cannot be
+fabricated - `-Enable` on a guest with no `.PWL` and no dialog on screen
+reports that a reboot plus one `-Dismiss` is still needed. Reasoning and
+measurements:
+[decisions/2026-09-04-prelogon-reachability-and-autologon.md](decisions/2026-09-04-prelogon-reachability-and-autologon.md).
+
+## capture-emulator-window.ps1
+
+`capture-emulator-window.ps1` captures the emulator's own window to PNG from
+the host, with no involvement from the guest.
+
+```powershell
+.\scripts\capture-emulator-window.ps1 Win98SE-Native-S3 -OutFile .\screen.png
+.\scripts\capture-emulator-window.ps1 -ProcessId 4812 -OutFile .\screen.png -Json
+```
+
+The positional argument is matched against the emulator process command line,
+so an 86Box VM profile directory name identifies its window; `-ProcessName`
+defaults to `86Box`, and `-ProcessId` is the fallback when a name matches more
+than one running instance.
+
+Reach for this when `screenshot` cannot help by definition: at a logon dialog,
+a BIOS prompt or a shutdown hang, the guest has no ready desktop, so
+`screenshot` returns exit 43 for exactly the states worth looking at. It
+captures the host's rendering of the window, so the emulator's menu bar,
+toolbar and any window scaling are included - it is a diagnostic, not a
+substitute for the in-guest capture path.

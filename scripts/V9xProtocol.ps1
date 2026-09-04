@@ -269,6 +269,51 @@ function New-V9xOpenWritePayload {
     return $bytes.ToArray()
 }
 
+function New-V9xDownloadPayload {
+    param(
+        [Parameter(Mandatory = $true)][string]$Url,
+        [Parameter(Mandatory = $true)][string]$Destination
+    )
+    $bytes = [Collections.Generic.List[byte]]::new()
+    Add-V9xString -Bytes $bytes -Value $Url
+    Add-V9xString -Bytes $bytes -Value $Destination
+    return $bytes.ToArray()
+}
+
+function ConvertFrom-V9xDownloadComplete {
+    param([byte[]]$Payload)
+    if ($Payload.Length -ne 12) { throw 'Invalid DOWNLOAD_COMPLETE payload length.' }
+    [pscustomobject]@{
+        HttpStatus = [BitConverter]::ToUInt32($Payload, 0)
+        Size = [BitConverter]::ToUInt32($Payload, 4)
+        Crc32 = [BitConverter]::ToUInt32($Payload, 8)
+    }
+}
+
+function New-V9xUpdatePayload {
+    param(
+        [uint32]$AgentSize,
+        [uint32]$AgentCrc32,
+        [uint32]$HelperSize,
+        [uint32]$HelperCrc32
+    )
+    $bytes = [Collections.Generic.List[byte]]::new()
+    $bytes.AddRange([BitConverter]::GetBytes($AgentSize))
+    $bytes.AddRange([BitConverter]::GetBytes($AgentCrc32))
+    $bytes.AddRange([BitConverter]::GetBytes($HelperSize))
+    $bytes.AddRange([BitConverter]::GetBytes($HelperCrc32))
+    return $bytes.ToArray()
+}
+
+function ConvertFrom-V9xUpdateAccepted {
+    param([byte[]]$Payload)
+    if ($Payload.Length -ne 8) { throw 'Invalid UPDATE_ACCEPTED payload length.' }
+    [pscustomobject]@{
+        BootCounter = [BitConverter]::ToUInt32($Payload, 0)
+        AgentSize = [BitConverter]::ToUInt32($Payload, 4)
+    }
+}
+
 function Add-V9xInputAction {
     param([Collections.Generic.List[byte]]$Bytes, [hashtable]$Action)
     switch ($Action.Op) {
