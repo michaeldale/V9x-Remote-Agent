@@ -12,6 +12,20 @@ For a physical target, pass its LAN address directly:
 .\scripts\v9xctl.ps1 info -Host 192.168.10.98 -Port 9869 -Json
 ```
 
+Getting help:
+
+- `.\scripts\v9xctl.ps1 help` (or no verb at all) prints the verb list, the
+  connection options and worked examples. With no verb the text goes to
+  stderr and the exit code is 10; `help` writes to stdout and exits 0.
+- A verb without its required parameter (`exec` without `-Application`, `put`
+  without `-Destination`, and so on) prints that verb's usage line, an
+  example, and the target it would have used, then exits 10.
+- `Get-Help .\scripts\v9xctl.ps1 -Examples` shows the comment-based help;
+  `-?` works too. Verbs tab-complete.
+- A connection failure (exit 20) names the address and port it tried and
+  reminds you of `-Host`/`-Port`, since a forgotten `-Host` is the usual
+  cause.
+
 See [physical-machine.md](physical-machine.md) for guest configuration and
 containment requirements.
 

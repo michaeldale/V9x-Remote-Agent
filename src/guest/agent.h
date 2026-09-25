@@ -70,8 +70,14 @@ typedef struct V9xAgentState {
     WORD listen_port;
     char listen_address[16];
     char allowed_client[16];
+    /* Activity picture for the tray icon. `active_connections` counts claimed
+       connection slots; `activity` is bumped for every frame received or sent,
+       and only ever compared for change, so wrap-around is harmless. */
+    volatile LONG active_connections;
+    volatile LONG activity;
     HWND tray_window;
     HICON tray_icon;
+    HICON tray_icon_busy;
 } V9xAgentState;
 
 /* Per-connection context: one static slot per concurrent client. Owns the

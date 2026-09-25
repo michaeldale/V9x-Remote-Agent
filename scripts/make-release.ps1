@@ -51,6 +51,13 @@ foreach ($script in @('v9xctl.ps1', 'V9xProtocol.ps1', 'make-install-media.ps1')
 }
 if (Test-Path -LiteralPath (Join-Path $repoRoot 'mcp')) {
     Copy-Item -Path (Join-Path $repoRoot 'mcp') -Destination (Join-Path $stageDir 'mcp') -Recurse
+    # Compiled Python embeds the absolute source path of the machine that
+    # produced it, so __pycache__ must never ship in a public artifact: built
+    # on a dev box those .pyc files carry the private workspace path, and the
+    # publish scrub gate guards only the mirror, not this zip. Running the MCP
+    # tests just before staging is what creates them.
+    Get-ChildItem -LiteralPath (Join-Path $stageDir 'mcp') -Directory -Recurse -Filter '__pycache__' |
+        Remove-Item -Recurse -Force -Confirm:$false
 }
 Copy-Item -Path (Join-Path $repoRoot 'docs') -Destination (Join-Path $stageDir 'docs') -Recurse
 foreach ($file in @('README.md', 'AGENTS.md', 'LICENSE', 'CHANGELOG.md', 'SECURITY.md')) {

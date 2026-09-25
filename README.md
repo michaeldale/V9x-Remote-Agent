@@ -180,6 +180,9 @@ expose the listener to a LAN or the Internet. Details in
 
 Working notes, newest first:
 
+- [docs/decisions/2026-09-24-tray-activity-icon-without-gdi.md](docs/decisions/2026-09-24-tray-activity-icon-without-gdi.md):
+  how the tray icon flashes green during activity when the agent may not
+  import GDI32
 - [docs/decisions/2026-09-04-prelogon-reachability-and-autologon.md](docs/decisions/2026-09-04-prelogon-reachability-and-autologon.md):
   what the agent can and cannot do before anyone logs on, and the Windows 9x
   autologon rules behind `scripts\set-autologon.ps1`

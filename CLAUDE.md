@@ -71,10 +71,31 @@ commit per release. Publish only when explicitly asked.
   let the script re-clone it with `-Remote <public repo URL>`, which the old
   mirror's `.git\config` still holds. Prefer that over a `safe.directory`
   exception.
-- The accompanying GitHub release is named `V9x Remote Agent v<version>`, its
-  body is the `CHANGELOG.md` sections added since the last public release, and
-  it attaches exactly the three `build\release` artifacts
-  (`v9xremote-<version>.zip`, `V9XREMOTE.ISO`, `SHA256SUMS`).
+- **Do not create the GitHub release by hand.** Pushing the `v<version>` tag
+  fires `.github/workflows/release.yml`, which builds the artifacts on a clean
+  runner and creates the release itself, named `V9x Remote Agent v<version>`
+  with the top `CHANGELOG.md` section as its body and the three `build\release`
+  artifacts attached (`v9xremote-<version>.zip`, `V9XREMOTE.ISO`,
+  `SHA256SUMS`). A manual `gh release create` races that workflow and makes it
+  fail with "a release with the same tag name already exists", which is exactly
+  what happened on 0.6.2. Push the tag, then watch
+  `gh run list --repo <public repo> --limit 3`.
+- Because CI builds the published artifacts, the release contents come from the
+  tagged tree on a clean machine, not from the dev box. That is the point: do
+  not replace them with local builds.
+- **Never pipe these scripts through `2>&1`.** `git push` and
+  `python -m unittest` write progress to stderr, and PowerShell 5.1 turns a
+  native command's redirected stderr into `NativeCommandError` records, which
+  `$ErrorActionPreference = 'Stop'` then makes terminating. It aborts
+  `make-release.ps1` at the MCP tests and `publish-github.ps1` between the
+  branch push and the tag push, both of which look like real failures and are
+  not. If it happens, check what actually landed with `git ls-remote` before
+  re-running anything.
+- `build\install` is not cleaned between builds, so anything dropped in there
+  by hand persists and ends up inside the release zip. `make-install-media.ps1`
+  is the backstop: it rejects file names that are not ISO9660 Level 2, which is
+  how a stray `v9xra061.zip` from August was caught. Check that directory if
+  the ISO step fails on a name.
 
 ## Working documents
 

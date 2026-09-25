@@ -9,7 +9,9 @@ Nothing requires clicking inside the emulator.
 
 - **PowerShell CLI** (Windows hosts): `scripts\v9xctl.ps1`, one process per
   operation, add `-Json` for machine-readable output. Default target
-  `127.0.0.1:9869`; override with `-Host`/`-Port`.
+  `127.0.0.1:9869`; override with `-Host`/`-Port`. `.\scripts\v9xctl.ps1 help`
+  prints the verb list with examples; a verb missing a required parameter
+  prints its own usage line and exits 10.
 - **MCP server** (any host with Python 3.9+): `mcp/v9x_mcp.py` exposes the
   same operations as MCP tools, including screenshots returned as images.
   Setup in [mcp/README.md](mcp/README.md).

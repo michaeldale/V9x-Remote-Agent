@@ -2,6 +2,28 @@
 
 All notable changes to the V9x Remote Agent. Dates are in YYYY-MM-DD.
 
+## 0.6.3 (2026-09-24)
+
+### Added
+- The notification-area icon now shows activity. Its body flashes lime while
+  any client is connected or any execution is running, and a short hold keeps
+  it flashing after the last frame so even a bare `ping` blinks once. The
+  agent counts claimed connection slots and every frame it receives or sends;
+  the tray worker samples those counters every 100 ms and swaps the icon at
+  250 ms intervals. Nothing about the protocol changes.
+- The icon itself is now drawn by the agent as a 16-colour icon resource in
+  memory (`CreateIconFromResource`) instead of borrowing `IDI_APPLICATION`:
+  the agent may not import GDI32, so this is the only way to have two colour
+  variants of one picture. If icon creation fails the agent logs
+  `tray-createicon-failed` and falls back to the stock icon without flashing.
+- `scripts\v9xctl.ps1` explains itself. Running it with no verb, an unknown
+  verb, or `help` prints the verb list, the connection options (`-Host`,
+  `-Port`, `-ConnectTimeoutSeconds`) and worked examples instead of an
+  interactive prompt for `Action`; a verb missing its required parameter
+  prints that verb's usage line and an example. Comment-based help backs
+  `Get-Help .\scripts\v9xctl.ps1 -Examples`, verbs tab-complete, and a
+  connection failure now names the target it tried and how to override it.
+
 ## 0.6.2 (2026-09-04)
 
 ### Fixed

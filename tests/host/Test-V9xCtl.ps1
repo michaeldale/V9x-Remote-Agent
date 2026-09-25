@@ -3,6 +3,44 @@ $repoRoot = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
 $protocolScript = Join-Path $repoRoot 'scripts\V9xProtocol.ps1'
 $clientScript = Join-Path $repoRoot 'scripts\v9xctl.ps1'
 
+# Usage paths need no fixture: no verb and a verb missing its parameter exit
+# 10 with help text that names -Host/-Port; 'help' exits 0 on stdout. The
+# usage text goes to stderr, and under $ErrorActionPreference = 'Stop' a
+# redirected native stderr line becomes a terminating NativeCommandError, so
+# these calls run with the preference relaxed and stringify each record.
+function Invoke-V9xCtlUsage {
+    param([string[]]$Arguments)
+    $previous = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $lines = @(& powershell.exe -NoProfile -ExecutionPolicy Bypass -File $clientScript @Arguments 2>&1 |
+            ForEach-Object { "$_" })
+        return [pscustomobject]@{ ExitCode = $LASTEXITCODE; Text = ($lines -join "`n") }
+    } finally {
+        $ErrorActionPreference = $previous
+    }
+}
+$usage = Invoke-V9xCtlUsage -Arguments @()
+if ($usage.ExitCode -ne 10) { throw "v9xctl with no verb exited $($usage.ExitCode), expected 10." }
+if ($usage.Text -notmatch '-Host <address>' -or $usage.Text -notmatch '-Port <n>' -or
+    $usage.Text -notmatch '(?m)^\s+exec\s' -or $usage.Text -notmatch 'Examples:') {
+    throw 'v9xctl usage text did not list -Host, -Port, the verbs and examples.'
+}
+$help = Invoke-V9xCtlUsage -Arguments @('help')
+if ($help.ExitCode -ne 0) { throw "v9xctl help exited $($help.ExitCode), expected 0." }
+if ($help.Text -notmatch 'info -Host 192\.168\.10\.98 -Port 9869') {
+    throw 'v9xctl help did not print the -Host/-Port example.'
+}
+$verb = Invoke-V9xCtlUsage -Arguments @('exec', '-Host', '10.9.8.7')
+if ($verb.ExitCode -ne 10) { throw "v9xctl exec without -Application exited $($verb.ExitCode), expected 10." }
+if ($verb.Text -notmatch 'exec requires -Application' -or $verb.Text -notmatch '-Host 10\.9\.8\.7 -Port 9869') {
+    throw 'v9xctl verb usage did not name the missing parameter and the target.'
+}
+$unknown = Invoke-V9xCtlUsage -Arguments @('pnig')
+if ($unknown.ExitCode -ne 10 -or $unknown.Text -notmatch "unknown verb 'pnig'") {
+    throw 'v9xctl did not reject an unknown verb with usage text and exit 10.'
+}
+
 $portProbe = [Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback, 0)
 $portProbe.Start()
 $port = ([Net.IPEndPoint]$portProbe.LocalEndpoint).Port

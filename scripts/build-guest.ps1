@@ -150,6 +150,8 @@ foreach ($requiredImport in @('Accept', 'Bind', 'CreateFileA', 'CreateMutexA',
                                'GetCursorPos', 'SetCursorPos', 'MapVirtualKeyA',
                                'VkKeyScanA', 'keybd_event', 'mouse_event',
                                'CreateWindowExA', 'DestroyWindow', 'LoadIconA',
+                               'CreateIconFromResource', 'DestroyIcon',
+                               'InterlockedIncrement', 'InterlockedDecrement',
                                'PeekMessageA', 'DispatchMessageA',
                                'Shell_NotifyIconA', 'gethostname', 'gethostbyname',
                                'inet_ntoa')) {

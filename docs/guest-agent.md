@@ -50,10 +50,21 @@ the tooltip keeps the configured `0.0.0.0` value. The tray worker owns the
 icon's window, waits for Explorer during boot, pumps its own message queue, and
 restores the icon if Explorer is restarted. Success is logged as
 `tray-icon-added`; each failure names itself with a `gle=` code
-(`tray-window-failed`, `tray-loadicon-failed`, `tray-thread-failed`,
-`tray-notify-failed`). The icon was broken in every release before 0.6.2 -
-see
+(`tray-window-failed`, `tray-createicon-failed`, `tray-loadicon-failed`,
+`tray-thread-failed`, `tray-notify-failed`). The icon was broken in every
+release before 0.6.2 - see
 [decisions/2026-09-04-tray-icon-createthread-lpthreadid.md](decisions/2026-09-04-tray-icon-createthread-lpthreadid.md).
+
+The icon is a small application window: black outline, navy title bar, white
+body. The body flashes lime (250 ms on, 250 ms off) while the agent is busy:
+any client connected, any execution running, or a frame received or sent in
+the last 750 ms, so even a `ping` produces one visible blink and a long
+`exec` flashes for its whole duration. Both icon variants are built by the
+agent in memory as 16-colour icon resources and created with
+`CreateIconFromResource`, because the agent is not allowed to import GDI32;
+if that fails the agent logs `tray-createicon-failed` and uses the stock
+`IDI_APPLICATION` icon without activity feedback. See
+[decisions/2026-09-24-tray-activity-icon-without-gdi.md](decisions/2026-09-24-tray-activity-icon-without-gdi.md).
 
 The boot counter is flushed to `BOOT.DAT`. An accepted reboot or shutdown first
 flushes its resume token to `PENDING.DAT`; the next HELLO and INFO return both

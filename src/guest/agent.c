@@ -76,6 +76,7 @@ static V9xConnection *v9x_claim_connection(V9xAgentState *state, SOCKET client)
                 }
             }
             InitializeCriticalSection(&conn->send_lock);
+            InterlockedIncrement(&state->active_connections);
             return conn;
         }
     }
@@ -96,6 +97,7 @@ static DWORD WINAPI v9x_connection_thread(LPVOID parameter)
     conn->socket = INVALID_SOCKET;
     DeleteCriticalSection(&conn->send_lock);
     v9x_log_line("client-disconnected");
+    InterlockedDecrement(&conn->machine->active_connections);
     InterlockedExchange(&conn->in_use, 0l);
     return 0ul;
 }
@@ -156,8 +158,11 @@ void v9x_agent_run(void)
     state.listen_port = 9869u;
     state.listen_address[0] = '\0';
     state.allowed_client[0] = '\0';
+    state.active_connections = 0l;
+    state.activity = 0l;
     state.tray_window = 0;
     state.tray_icon = 0;
+    state.tray_icon_busy = 0;
     for (slot = 0; slot < V9X_MAX_CONNECTIONS; ++slot) {
         v9x_connections[slot].in_use = 0l;
         v9x_connections[slot].socket = INVALID_SOCKET;
@@ -243,6 +248,7 @@ void v9x_agent_run(void)
                 closesocket(conn->socket);
                 conn->socket = INVALID_SOCKET;
                 DeleteCriticalSection(&conn->send_lock);
+                InterlockedDecrement(&state.active_connections);
                 InterlockedExchange(&conn->in_use, 0l);
                 continue;
             }

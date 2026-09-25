@@ -108,6 +108,7 @@ int v9x_send_frame(V9xConnection *conn, unsigned short type,
         result = 0;
     }
     LeaveCriticalSection(&conn->send_lock);
+    if (result) InterlockedIncrement(&conn->machine->activity);
     return result;
 }
 
@@ -255,6 +256,7 @@ int v9x_serve_client(V9xConnection *conn)
             header.request_id == 0ul) return 0;
         if (header.payload_length != 0ul &&
             !v9x_recv_exact(conn->socket, conn->payload, header.payload_length)) return 0;
+        InterlockedIncrement(&conn->machine->activity);
         v9x_format_cmd(cmd_detail, &header);
         v9x_log_event("cmd", cmd_detail);
 

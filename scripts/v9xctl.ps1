@@ -1,9 +1,77 @@
+<#
+.SYNOPSIS
+Drive a Windows 9x guest running the V9x Remote Agent: run programs, move
+files, take screenshots, inject input, reboot with proof.
+
+.DESCRIPTION
+One bounded operation per invocation. The first argument is the verb; the
+remaining parameters depend on the verb. Every call opens a new connection to
+the agent, so the target is chosen per call with -Host and -Port (default
+127.0.0.1:9869, which is the usual emulator port forward).
+
+Run with no verb, or with the verb 'help', for a compact verb list with
+examples. Add -Json for compact machine-readable output. Exit codes are
+deterministic and listed in AGENTS.md (20 means the agent was unreachable).
+
+.PARAMETER Action
+The verb: ping, info, exec, shell, stat, list, mkdir, put, get, push-tree,
+download, update, reboot, shutdown, wait-desktop, screenshot, input, help.
+
+.PARAMETER EndpointHost
+Address of the agent (alias -Host). 127.0.0.1 for an emulator with a port
+forward, or the guest's LAN address for a physical machine or bridged VM.
+
+.PARAMETER Port
+TCP port the agent listens on (default 9869, the 'port' key in AGENT.INI).
+
+.PARAMETER ConnectTimeoutSeconds
+How long to wait for the TCP connection and for each response (default 10).
+
+.PARAMETER Json
+Emit the result as one compact JSON object instead of a formatted list.
+
+.EXAMPLE
+.\scripts\v9xctl.ps1 ping
+Liveness check against the default 127.0.0.1:9869.
+
+.EXAMPLE
+.\scripts\v9xctl.ps1 info -Host 192.168.10.98 -Port 9869 -Json
+Agent version and state on a physical machine at 192.168.10.98.
+
+.EXAMPLE
+.\scripts\v9xctl.ps1 exec -Application C:\WINDOWS\NOTEPAD.EXE -TimeoutSeconds 30 -Json
+Run a program, capture its output, and fail after 30 seconds.
+
+.EXAMPLE
+.\scripts\v9xctl.ps1 shell -Command "DIR C:\ /W" -Json
+Run a COMMAND.COM built-in.
+
+.EXAMPLE
+.\scripts\v9xctl.ps1 put -Source .\out\MYAPP.EXE -Destination C:\V9XREMOTE\JOBS\myjob\MYAPP.EXE
+Upload one file, CRC32-verified.
+
+.EXAMPLE
+.\scripts\v9xctl.ps1 screenshot -OutFile .\shot.png -Host 127.0.0.1 -Port 9869
+Capture the guest screen to a PNG.
+
+.EXAMPLE
+.\scripts\v9xctl.ps1 reboot -JobId myjob-reboot-1 -WaitSeconds 180 -Json
+Reboot and wait for the agent to come back with proof.
+
+.LINK
+AGENTS.md
+docs/host-cli.md
+#>
 [CmdletBinding()]
 param(
-    [Parameter(Position = 0, Mandatory = $true)]
-    [ValidateSet('ping', 'info', 'exec', 'shell', 'stat', 'list', 'mkdir',
-                 'put', 'get', 'push-tree', 'reboot', 'shutdown', 'wait-desktop',
-                 'screenshot', 'input', 'download', 'update')]
+    [Parameter(Position = 0)]
+    [ArgumentCompleter({
+        param($commandName, $parameterName, $wordToComplete)
+        @('ping', 'info', 'exec', 'shell', 'stat', 'list', 'mkdir',
+          'put', 'get', 'push-tree', 'download', 'update', 'reboot', 'shutdown',
+          'wait-desktop', 'screenshot', 'input', 'help') |
+            Where-Object { $_ -like "$wordToComplete*" }
+    })]
     [string]$Action,
     [Alias('Host')]
     [string]$EndpointHost = '127.0.0.1',
@@ -337,35 +405,194 @@ function Initialize-V9xGuestDirectory {
     }
 }
 
-if ($Action -eq 'exec' -and [string]::IsNullOrWhiteSpace($Application)) {
-    [Console]::Error.WriteLine('Usage error: exec requires -Application.')
+# Verb catalogue: drives usage output and required-parameter checks. Order is
+# the order verbs are listed in the help text.
+$script:V9xVerbs = [ordered]@{
+    'ping' = @{
+        Purpose = 'Liveness check; returns uptime and boot counter'
+        Usage = 'ping'
+        Example = 'ping -Host 127.0.0.1 -Port 9869'
+    }
+    'info' = @{
+        Purpose = 'Agent version, build ID, computer name, screen mode, pending job'
+        Usage = 'info'
+        Example = 'info -Json'
+    }
+    'exec' = @{
+        Purpose = 'Run a Win32 EXE directly and capture stdout/stderr'
+        Usage = 'exec -Application <guest EXE> [-Arguments <text>] [-WorkingDirectory <guest dir>] [-TimeoutSeconds <n>] [-ExpectedExitCode <n>] [-ShowWindow] [-Detach]'
+        Example = 'exec -Application C:\WINDOWS\NOTEPAD.EXE -Arguments C:\README.TXT -TimeoutSeconds 30 -Json'
+        Required = @{ Application = '-Application' }
+    }
+    'shell' = @{
+        Purpose = 'Run a command through COMMAND.COM /C (built-ins, batch files)'
+        Usage = 'shell -Command <text> [-TimeoutSeconds <n>] [-Detach]'
+        Example = 'shell -Command "DIR C:\ /W" -Json'
+        Required = @{ ShellCommand = '-Command' }
+    }
+    'stat' = @{
+        Purpose = 'Existence, size and attributes of one guest path'
+        Usage = 'stat -Path <guest path>'
+        Example = 'stat -Path C:\WINDOWS\WIN.INI'
+        Required = @{ RemotePath = '-Path' }
+    }
+    'list' = @{
+        Purpose = 'Directory listing (bounded to 16 KiB)'
+        Usage = 'list -Path <guest dir>'
+        Example = 'list -Path C:\V9XREMOTE\JOBS -Json'
+        Required = @{ RemotePath = '-Path' }
+    }
+    'mkdir' = @{
+        Purpose = 'Create a guest directory (idempotent)'
+        Usage = 'mkdir -Path <guest dir>'
+        Example = 'mkdir -Path C:\V9XREMOTE\JOBS\myjob'
+        Required = @{ RemotePath = '-Path' }
+    }
+    'put' = @{
+        Purpose = 'Upload one file to the guest, CRC32-verified'
+        Usage = 'put -Source <local file> -Destination <guest path>'
+        Example = 'put -Source .\out\MYAPP.EXE -Destination C:\V9XREMOTE\JOBS\myjob\MYAPP.EXE'
+        Required = @{ Source = '-Source'; Destination = '-Destination' }
+    }
+    'get' = @{
+        Purpose = 'Download one file from the guest, CRC32-verified'
+        Usage = 'get -Source <guest path> -Destination <local file>'
+        Example = 'get -Source C:\V9XREMOTE\AGENT.LOG -Destination .\agent.log'
+        Required = @{ Source = '-Source'; Destination = '-Destination' }
+    }
+    'push-tree' = @{
+        Purpose = 'Upload a directory tree'
+        Usage = 'push-tree -Source <local dir> -Destination <guest dir>'
+        Example = 'push-tree -Source .\build\install -Destination C:\V9XREMOTE\JOBS\install'
+        Required = @{ Source = '-Source'; Destination = '-Destination' }
+    }
+    'download' = @{
+        Purpose = 'Guest fetches an http:// URL to a guest path'
+        Usage = 'download -Url <http://...> -Destination <guest path>'
+        Example = 'download -Url http://10.0.2.2:8000/DRIVER.ZIP -Destination C:\V9XREMOTE\JOBS\drv\DRIVER.ZIP'
+        Required = @{ Url = '-Url'; Destination = '-Destination' }
+    }
+    'update' = @{
+        Purpose = 'Hot-upgrade the agent from an install-package folder'
+        Usage = 'update -Source <install package dir> [-WaitSeconds <n>]'
+        Example = 'update -Source .\build\install -WaitSeconds 60 -Json'
+        Required = @{ Source = '-Source' }
+    }
+    'reboot' = @{
+        Purpose = 'Reboot the guest and prove it came back'
+        Usage = 'reboot [-JobId <token>] [-WaitSeconds <n>]'
+        Example = 'reboot -JobId myjob-reboot-1 -WaitSeconds 180 -Json'
+    }
+    'shutdown' = @{
+        Purpose = 'Controlled shutdown'
+        Usage = 'shutdown [-JobId <token>]'
+        Example = 'shutdown -JobId myjob-off-1'
+    }
+    'wait-desktop' = @{
+        Purpose = 'Block until the Explorer desktop is ready'
+        Usage = 'wait-desktop [-WaitSeconds <n>]'
+        Example = 'wait-desktop -WaitSeconds 120 -Json'
+    }
+    'screenshot' = @{
+        Purpose = 'Capture the guest screen (PNG/JPEG/GIF/TIFF/BMP by extension)'
+        Usage = 'screenshot -OutFile <local image>'
+        Example = 'screenshot -OutFile .\shot.png'
+        Required = @{ Destination = '-OutFile' }
+    }
+    'input' = @{
+        Purpose = 'Inject mouse/keyboard actions'
+        Usage = 'input -Sequence "<verb args>; <verb args>; ..."'
+        Example = 'input -Sequence "move 100,200; click left; type Hello; key ENTER"'
+        Required = @{ Sequence = '-Sequence' }
+    }
+}
+
+# The version lives in include\v9xremote\version.h (the single source of
+# truth); read it rather than duplicating it here.
+function Get-V9xToolVersion {
+    $header = Join-Path (Split-Path -Parent $PSScriptRoot) 'include\v9xremote\version.h'
+    if (Test-Path -LiteralPath $header -PathType Leaf) {
+        $text = Get-Content -LiteralPath $header -Raw
+        if ($text -match '#define V9X_AGENT_VERSION "([^"]+)"') { return $Matches[1] }
+    }
+    return 'unknown'
+}
+
+function Write-V9xUsage {
+    param([IO.TextWriter]$Writer, [string]$Problem)
+    if ($Problem) {
+        $Writer.WriteLine("Usage error: $Problem")
+        $Writer.WriteLine()
+    }
+    $Writer.WriteLine("v9xctl $(Get-V9xToolVersion) - drive a Windows 9x guest running the V9x Remote Agent")
+    $Writer.WriteLine("Protocol version $('{0}.{1}' -f ($script:V9xVersion -shr 8), ($script:V9xVersion -band 0xFF))")
+    $Writer.WriteLine()
+    $Writer.WriteLine('  .\scripts\v9xctl.ps1 <verb> [verb options] [-Host <address>] [-Port <n>] [-Json]')
+    $Writer.WriteLine()
+    $Writer.WriteLine('Connection (every call opens a fresh connection; the target is chosen per call):')
+    $Writer.WriteLine('  -Host <address>             agent address; default 127.0.0.1 (emulator port forward)')
+    $Writer.WriteLine('  -Port <n>                   agent TCP port; default 9869 (AGENT.INI "port")')
+    $Writer.WriteLine('  -ConnectTimeoutSeconds <n>  connect/response timeout; default 10')
+    $Writer.WriteLine('  -Json                       compact JSON output for scripts and agents')
+    $Writer.WriteLine()
+    $Writer.WriteLine('Verbs:')
+    foreach ($name in $script:V9xVerbs.Keys) {
+        $Writer.WriteLine(('  {0,-14}{1}' -f $name, $script:V9xVerbs[$name].Purpose))
+    }
+    $Writer.WriteLine(('  {0,-14}{1}' -f 'help', 'This text (also: -? and Get-Help .\scripts\v9xctl.ps1 -Examples)'))
+    $Writer.WriteLine()
+    $Writer.WriteLine('Examples:')
+    $Writer.WriteLine('  .\scripts\v9xctl.ps1 ping')
+    $Writer.WriteLine('  .\scripts\v9xctl.ps1 info -Host 192.168.10.98 -Port 9869 -Json')
+    $Writer.WriteLine('  .\scripts\v9xctl.ps1 exec -Application C:\WINDOWS\NOTEPAD.EXE -TimeoutSeconds 30 -Json')
+    $Writer.WriteLine('  .\scripts\v9xctl.ps1 shell -Command "DIR C:\ /W"')
+    $Writer.WriteLine('  .\scripts\v9xctl.ps1 put -Source .\out\MYAPP.EXE -Destination C:\V9XREMOTE\JOBS\myjob\MYAPP.EXE')
+    $Writer.WriteLine('  .\scripts\v9xctl.ps1 screenshot -OutFile .\shot.png -Host 127.0.0.1 -Port 9869')
+    $Writer.WriteLine('  .\scripts\v9xctl.ps1 reboot -JobId myjob-reboot-1 -WaitSeconds 180 -Json')
+    $Writer.WriteLine()
+    $Writer.WriteLine('Exit codes: 0 ok, 10 usage, 20 agent unreachable, 22/23 protocol, 30-33 execution,')
+    $Writer.WriteLine('40 file transfer, 41-42 power control, 43 screenshot, 44 desktop not ready.')
+    $Writer.WriteLine('Full reference: AGENTS.md and docs\host-cli.md.')
+}
+
+function Write-V9xVerbUsage {
+    param([IO.TextWriter]$Writer, [string]$Verb, [string]$Problem)
+    $entry = $script:V9xVerbs[$Verb]
+    $Writer.WriteLine("Usage error: $Problem")
+    $Writer.WriteLine()
+    $Writer.WriteLine("  $($entry.Purpose).")
+    $Writer.WriteLine()
+    $Writer.WriteLine("  .\scripts\v9xctl.ps1 $($entry.Usage) [-Host <address>] [-Port <n>] [-Json]")
+    $Writer.WriteLine()
+    $Writer.WriteLine('Example:')
+    $Writer.WriteLine("  .\scripts\v9xctl.ps1 $($entry.Example)")
+    $Writer.WriteLine()
+    $Writer.WriteLine("Target: -Host $EndpointHost -Port $Port (defaults 127.0.0.1 and 9869). Run '.\scripts\v9xctl.ps1 help' for all verbs.")
+}
+
+if ([string]::IsNullOrWhiteSpace($Action) -or $Action -in @('help', '-h', '--help', '/?')) {
+    if ([string]::IsNullOrWhiteSpace($Action)) {
+        Write-V9xUsage -Writer ([Console]::Error) -Problem 'no verb given.'
+        exit 10
+    }
+    Write-V9xUsage -Writer ([Console]::Out)
+    exit 0
+}
+$Action = $Action.ToLowerInvariant()
+if (-not $script:V9xVerbs.Contains($Action)) {
+    Write-V9xUsage -Writer ([Console]::Error) -Problem "unknown verb '$Action'."
     exit 10
 }
-if ($Action -eq 'shell' -and [string]::IsNullOrWhiteSpace($ShellCommand)) {
-    [Console]::Error.WriteLine('Usage error: shell requires -Command.')
-    exit 10
-}
-if ($Action -in @('stat', 'list', 'mkdir') -and [string]::IsNullOrWhiteSpace($RemotePath)) {
-    [Console]::Error.WriteLine("Usage error: $Action requires -Path.")
-    exit 10
-}
-if ($Action -in @('put', 'get', 'push-tree') -and
-    ([string]::IsNullOrWhiteSpace($Source) -or [string]::IsNullOrWhiteSpace($Destination))) {
-    [Console]::Error.WriteLine("Usage error: $Action requires -Source and -Destination.")
-    exit 10
-}
-if ($Action -eq 'screenshot' -and [string]::IsNullOrWhiteSpace($Destination)) {
-    [Console]::Error.WriteLine('Usage error: screenshot requires -Destination (alias -OutFile).')
-    exit 10
-}
-if ($Action -eq 'download' -and
-    ([string]::IsNullOrWhiteSpace($Url) -or [string]::IsNullOrWhiteSpace($Destination))) {
-    [Console]::Error.WriteLine('Usage error: download requires -Url and -Destination (guest path).')
-    exit 10
-}
-if ($Action -eq 'update' -and [string]::IsNullOrWhiteSpace($Source)) {
-    [Console]::Error.WriteLine('Usage error: update requires -Source (install package folder).')
-    exit 10
+$verbEntry = $script:V9xVerbs[$Action]
+if ($verbEntry.ContainsKey('Required')) {
+    $missing = @($verbEntry.Required.Keys |
+        Where-Object { [string]::IsNullOrWhiteSpace((Get-Variable -Name $_ -ValueOnly)) } |
+        ForEach-Object { $verbEntry.Required[$_] } | Sort-Object)
+    if ($missing.Count -ne 0) {
+        Write-V9xVerbUsage -Writer ([Console]::Error) -Verb $Action `
+            -Problem "$Action requires $($missing -join ' and ')."
+        exit 10
+    }
 }
 if ($Action -eq 'put' -and -not (Test-Path -LiteralPath $Source -PathType Leaf)) {
     [Console]::Error.WriteLine("Local source file not found: $Source")
@@ -923,12 +1150,15 @@ try {
     exit $outcomeExit
 } catch [Net.Sockets.SocketException] {
     [Console]::Error.WriteLine("Transport error: $($_.Exception.Message)")
+    [Console]::Error.WriteLine("Target was ${EndpointHost}:$Port. Is the guest up and the agent's port forwarded? Choose another target with -Host <address> -Port <n>.")
     exit 20
 } catch [IO.IOException] {
     [Console]::Error.WriteLine("Transport error: $($_.Exception.Message)")
+    [Console]::Error.WriteLine("Target was ${EndpointHost}:$Port. Is the guest up and the agent's port forwarded? Choose another target with -Host <address> -Port <n>.")
     exit 20
 } catch [TimeoutException] {
     [Console]::Error.WriteLine("Transport error: $($_.Exception.Message)")
+    [Console]::Error.WriteLine("Target was ${EndpointHost}:$Port. Is the guest up and the agent's port forwarded? Choose another target with -Host <address> -Port <n>.")
     exit 20
 } catch {
     [Console]::Error.WriteLine("Protocol error: $($_.Exception.Message)")

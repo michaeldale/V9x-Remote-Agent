@@ -78,7 +78,8 @@ if ($DryRun) {
 git -C $MirrorDir commit -m $Message
 if ($LASTEXITCODE -ne 0) { throw 'git commit failed.' }
 if ($Tag) {
-    git -C $MirrorDir tag "v$version"
+    # Annotated, to match the public repo's existing tags.
+    git -C $MirrorDir tag -a "v$version" -m "V9x Remote Agent $version"
     if ($LASTEXITCODE -ne 0) { throw "Tagging v$version failed (does the tag already exist?)." }
 }
 git -C $MirrorDir push origin main
