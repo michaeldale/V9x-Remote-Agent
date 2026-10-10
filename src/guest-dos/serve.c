@@ -131,7 +131,8 @@ static int v9x_send_ping(V9xDos *dos, unsigned long request_id)
                           dos->response, 8ul);
 }
 
-static int v9x_send_info(V9xDos *dos, unsigned long request_id)
+static int v9x_send_info(V9xDos *dos, unsigned long request_id,
+                         unsigned long flags)
 {
     char os_version[64];
     char current_directory[260];
@@ -186,6 +187,12 @@ static int v9x_send_info(V9xDos *dos, unsigned long request_id)
                            dos->allowed_client)) {
         return v9x_send_error(dos, request_id, V9X_STATUS_INTERNAL_ERROR,
                               "network info response overflow");
+    }
+    if ((flags & V9X_INFO_FLAG_EXTENDED) != 0ul &&
+        !v9x_append_string(dos->response, sizeof(dos->response), &offset,
+                           dos->install_id)) {
+        return v9x_send_error(dos, request_id, V9X_STATUS_INTERNAL_ERROR,
+                              "install id response overflow");
     }
     return v9x_send_frame(dos, V9X_MSG_INFO_RESPONSE, request_id,
                           dos->response, offset);
@@ -261,8 +268,10 @@ void v9x_serve_client(V9xDos *dos)
                                          dos->payload,
                                          header.payload_length)) return;
         } else if (header.type == V9X_MSG_INFO_REQUEST &&
-                   header.payload_length == 0ul) {
-            if (!v9x_send_info(dos, header.request_id)) return;
+                   (header.payload_length == 0ul || header.payload_length == 4ul)) {
+            if (!v9x_send_info(dos, header.request_id,
+                               header.payload_length == 4ul
+                                   ? v9x_read_u32(dos->payload) : 0ul)) return;
         } else {
             if (!v9x_send_error(dos, header.request_id,
                                 V9X_STATUS_UNSUPPORTED_OPERATION,

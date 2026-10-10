@@ -1,4 +1,7 @@
 @ECHO OFF
+REM Windows 2000 ignores RunServices, which INSTALL.REG writes; SETUP.EXE
+REM registers the Run key there instead. %OS% is unset on Win9x.
+IF "%OS%"=="Windows_NT" GOTO WINNT
 IF NOT EXIST V9XAGNT.EXE GOTO MISSING
 IF NOT EXIST V9XSHOT.EXE GOTO MISSING
 IF NOT EXIST AGENT.INI GOTO MISSING
@@ -78,4 +81,7 @@ ECHO ERROR: The install package is incomplete. V9XAGNT.EXE and V9XSHOT.EXE are r
 GOTO END
 :FAILED
 ECHO ERROR: V9x Remote Agent files could not be copied. No binary update was left staged.
+GOTO END
+:WINNT
+ECHO This is Windows NT/2000: run SETUP.EXE to install the agent.
 :END

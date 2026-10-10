@@ -14,7 +14,7 @@ examples. Add -Json for compact machine-readable output. Exit codes are
 deterministic and listed in AGENTS.md (20 means the agent was unreachable).
 
 .PARAMETER Action
-The verb: ping, info, exec, shell, stat, list, mkdir, put, get, push-tree,
+The verb: discover, ping, info, inventory, exec, shell, stat, list, mkdir, put, get, push-tree,
 download, update, reboot, shutdown, wait-desktop, screenshot, input, help.
 
 .PARAMETER EndpointHost
@@ -23,6 +23,19 @@ forward, or the guest's LAN address for a physical machine or bridged VM.
 
 .PARAMETER Port
 TCP port the agent listens on (default 9869, the 'port' key in AGENT.INI).
+
+.PARAMETER Id
+Install ID of the agent (the install_id in its AGENT.INI, shown by info,
+inventory and discover). The target is found by mDNS discovery instead of
+-Host/-Port, and found again if it comes back from a reboot on a new address.
+Needs agent 0.8.0+ with discovery=1.
+
+.PARAMETER QueryAddress
+Send the discovery query unicast to this address[:port] (default port 5353)
+instead of multicasting it on every interface.
+
+.PARAMETER DiscoverSeconds
+How long discover (and -Id) listen for answers (default 3).
 
 .PARAMETER ConnectTimeoutSeconds
 How long to wait for the TCP connection and for each response (default 10).
@@ -44,7 +57,7 @@ Run a program, capture its output, and fail after 30 seconds.
 
 .EXAMPLE
 .\scripts\v9xctl.ps1 shell -Command "DIR C:\ /W" -Json
-Run a COMMAND.COM built-in.
+Run a COMMAND.COM built-in (CMD.EXE on Windows 2000).
 
 .EXAMPLE
 .\scripts\v9xctl.ps1 put -Source .\out\MYAPP.EXE -Destination C:\V9XREMOTE\JOBS\myjob\MYAPP.EXE
@@ -67,7 +80,7 @@ param(
     [Parameter(Position = 0)]
     [ArgumentCompleter({
         param($commandName, $parameterName, $wordToComplete)
-        @('ping', 'info', 'exec', 'shell', 'stat', 'list', 'mkdir',
+        @('discover', 'ping', 'info', 'inventory', 'exec', 'shell', 'stat', 'list', 'mkdir',
           'put', 'get', 'push-tree', 'download', 'update', 'reboot', 'shutdown',
           'wait-desktop', 'screenshot', 'input', 'help') |
             Where-Object { $_ -like "$wordToComplete*" }
@@ -103,6 +116,11 @@ param(
     [switch]$ShowWindow,
     [switch]$Detach,
     [string]$Sequence,
+    [ValidatePattern('^$|^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$')]
+    [string]$Id,
+    [string]$QueryAddress,
+    [ValidateRange(1, 30)]
+    [int]$DiscoverSeconds = 3,
     [switch]$Json
 )
 
@@ -159,6 +177,11 @@ function ConvertTo-V9xInputActions {
                 $coordinates = $rest -split '[, ]+'
                 if ($coordinates.Count -ne 2) { throw "move needs X,Y (got '$rest')." }
                 $actions.Add(@{ Op = 'move'; X = [int]$coordinates[0]; Y = [int]$coordinates[1] })
+            }
+            'moverel' {
+                $coordinates = $rest -split '[, ]+'
+                if ($coordinates.Count -ne 2) { throw "moverel needs DX,DY (got '$rest')." }
+                $actions.Add(@{ Op = 'moverel'; X = [int]$coordinates[0]; Y = [int]$coordinates[1] })
             }
             'click' {
                 $button = Resolve-V9xButton $rest
@@ -228,6 +251,99 @@ function Connect-V9xSession {
     }
 }
 
+function Get-V9xLocalIPv4 {
+    [Net.NetworkInformation.NetworkInterface]::GetAllNetworkInterfaces() |
+        Where-Object {
+            $_.OperationalStatus -eq [Net.NetworkInformation.OperationalStatus]::Up -and
+            $_.NetworkInterfaceType -ne [Net.NetworkInformation.NetworkInterfaceType]::Loopback -and
+            $_.SupportsMulticast
+        } |
+        ForEach-Object { $_.GetIPProperties().UnicastAddresses } |
+        Where-Object { $_.Address.AddressFamily -eq [Net.Sockets.AddressFamily]::InterNetwork } |
+        ForEach-Object { $_.Address }
+}
+
+# One-shot mDNS query (RFC 6762 5.1) for _v9xremote._tcp.local. It is sent from
+# an ephemeral port, so agents answer by unicast straight back to it and the
+# host's own mDNS service keeps port 5353. Multicast goes out of every up IPv4
+# interface; -Target sends the query unicast to one address[:port] instead,
+# for a guest behind a port forward or on a routed subnet. Returns one object
+# per agent; stops early once InstallId (when given) has answered.
+function Invoke-V9xDiscovery {
+    param([int]$Seconds, [string]$Target, [string]$InstallId)
+    $query = New-V9xMdnsQuery -Id ([uint16](Get-Random -Minimum 1 -Maximum 65535))
+    $sockets = New-Object System.Collections.Generic.List[Net.Sockets.UdpClient]
+    $replies = New-Object System.Collections.Generic.List[object]
+    try {
+        if ($Target) {
+            $parts = $Target.Split(':')
+            $targetPort = if ($parts.Count -gt 1) { [int]$parts[1] } else { 5353 }
+            $endpoint = [Net.IPEndPoint]::new([Net.IPAddress]::Parse($parts[0]), $targetPort)
+            $socket = [Net.Sockets.UdpClient]::new(0)
+            $sockets.Add($socket)
+            [void]$socket.Send($query, $query.Length, $endpoint)
+        } else {
+            $group = [Net.IPEndPoint]::new([Net.IPAddress]::Parse('224.0.0.251'), 5353)
+            $locals = @(Get-V9xLocalIPv4)
+            if ($locals.Count -eq 0) { $locals = @([Net.IPAddress]::Any) }
+            foreach ($local in $locals) {
+                $socket = $null
+                try {
+                    $socket = [Net.Sockets.UdpClient]::new([Net.IPEndPoint]::new($local, 0))
+                    if ($local -ne [Net.IPAddress]::Any) {
+                        $socket.Client.SetSocketOption([Net.Sockets.SocketOptionLevel]::IP,
+                            [Net.Sockets.SocketOptionName]::MulticastInterface, $local.GetAddressBytes())
+                    }
+                    $socket.Client.SetSocketOption([Net.Sockets.SocketOptionLevel]::IP,
+                        [Net.Sockets.SocketOptionName]::MulticastTimeToLive, 255)
+                    [void]$socket.Send($query, $query.Length, $group)
+                    $sockets.Add($socket)
+                } catch {
+                    if ($null -ne $socket) { $socket.Dispose() }
+                }
+            }
+            if ($sockets.Count -eq 0) { throw [Net.Sockets.SocketException]::new(10051) }
+        }
+        $deadline = [DateTime]::UtcNow.AddSeconds($Seconds)
+        while ([DateTime]::UtcNow -lt $deadline) {
+            $idle = $true
+            foreach ($socket in $sockets) {
+                while ($socket.Available -gt 0) {
+                    $idle = $false
+                    $remote = [Net.IPEndPoint]::new([Net.IPAddress]::Any, 0)
+                    try {
+                        $bytes = $socket.Receive([ref]$remote)
+                    } catch [Net.Sockets.SocketException] {
+                        break   # ICMP unreachable surfaces as a reset; ignore it
+                    }
+                    try { $packet = ConvertFrom-V9xMdnsPacket -Packet $bytes } catch { continue }
+                    if (-not $packet.IsResponse) { continue }
+                    $replies.Add([pscustomobject]@{ Source = $remote.Address.ToString(); Packet = $packet })
+                    if ($InstallId -and @(ConvertTo-V9xDiscoveredAgents -Replies $replies.ToArray() |
+                            Where-Object { $_.InstallId -eq $InstallId }).Count -ne 0) {
+                        $deadline = [DateTime]::UtcNow
+                    }
+                }
+            }
+            if ($idle) { Start-Sleep -Milliseconds 50 }
+        }
+    } finally {
+        foreach ($socket in $sockets) { $socket.Dispose() }
+    }
+    return ConvertTo-V9xDiscoveredAgents -Replies $replies.ToArray()
+}
+
+# -Id: find the agent with that install ID and point -Host/-Port at it.
+function Update-V9xTargetFromId {
+    param([int]$Seconds)
+    $found = @(Invoke-V9xDiscovery -Seconds $Seconds -Target $QueryAddress -InstallId $Id |
+        Where-Object { $_.InstallId -eq $Id })
+    if ($found.Count -eq 0) { return $false }
+    $script:EndpointHost = $found[-1].Address
+    $script:Port = [int]$found[-1].Port
+    return $true
+}
+
 function Read-V9xOperationFrame {
     param(
         [IO.Stream]$Stream,
@@ -270,7 +386,7 @@ function Invoke-V9xPutInternal {
           [string]$GuestPath)
     $file = Get-Item -LiteralPath $LocalPath -ErrorAction Stop
     if ($file.PSIsContainer) { throw "Local source is a directory: $LocalPath" }
-    if ($file.Length -gt 67108864) { throw "Local source exceeds the 64 MiB v1 limit: $LocalPath" }
+    if ($file.Length -gt 268435456) { throw "Local source exceeds the 256 MiB protocol limit: $LocalPath" }
     [uint32]$size = $file.Length
     [uint32]$crc = Get-V9xFileCrc32 -LiteralPath $file.FullName
     [uint32]$id = $RequestId.Value
@@ -408,6 +524,11 @@ function Initialize-V9xGuestDirectory {
 # Verb catalogue: drives usage output and required-parameter checks. Order is
 # the order verbs are listed in the help text.
 $script:V9xVerbs = [ordered]@{
+    'discover' = @{
+        Purpose = 'Find agents on the LAN by mDNS (agent 0.8.0+ with discovery=1); no connection'
+        Usage = 'discover [-DiscoverSeconds <n>] [-QueryAddress <ip[:port]>] [-Id <install id>]'
+        Example = 'discover -DiscoverSeconds 5 -Json'
+    }
     'ping' = @{
         Purpose = 'Liveness check; returns uptime and boot counter'
         Usage = 'ping'
@@ -418,6 +539,11 @@ $script:V9xVerbs = [ordered]@{
         Usage = 'info'
         Example = 'info -Json'
     }
+    'inventory' = @{
+        Purpose = 'Hardware/software inventory: OS build, CPU, memory, drives, display, IPs, BIOS, devices (agent 0.7.0+)'
+        Usage = 'inventory'
+        Example = 'inventory -Json'
+    }
     'exec' = @{
         Purpose = 'Run a Win32 EXE directly and capture stdout/stderr'
         Usage = 'exec -Application <guest EXE> [-Arguments <text>] [-WorkingDirectory <guest dir>] [-TimeoutSeconds <n>] [-ExpectedExitCode <n>] [-ShowWindow] [-Detach]'
@@ -425,7 +551,7 @@ $script:V9xVerbs = [ordered]@{
         Required = @{ Application = '-Application' }
     }
     'shell' = @{
-        Purpose = 'Run a command through COMMAND.COM /C (built-ins, batch files)'
+        Purpose = 'Run a command through COMMAND.COM /C, or CMD.EXE /C on Windows 2000 (built-ins, batch files)'
         Usage = 'shell -Command <text> [-TimeoutSeconds <n>] [-Detach]'
         Example = 'shell -Command "DIR C:\ /W" -Json'
         Required = @{ ShellCommand = '-Command' }
@@ -473,7 +599,7 @@ $script:V9xVerbs = [ordered]@{
         Required = @{ Url = '-Url'; Destination = '-Destination' }
     }
     'update' = @{
-        Purpose = 'Hot-upgrade the agent from an install-package folder'
+        Purpose = 'Upgrade the agent from an install-package folder (hot; staged with a reboot for agents before 0.6.0)'
         Usage = 'update -Source <install package dir> [-WaitSeconds <n>]'
         Example = 'update -Source .\build\install -WaitSeconds 60 -Json'
         Required = @{ Source = '-Source' }
@@ -533,6 +659,9 @@ function Write-V9xUsage {
     $Writer.WriteLine('  -Host <address>             agent address; default 127.0.0.1 (emulator port forward)')
     $Writer.WriteLine('  -Port <n>                   agent TCP port; default 9869 (AGENT.INI "port")')
     $Writer.WriteLine('  -ConnectTimeoutSeconds <n>  connect/response timeout; default 10')
+    $Writer.WriteLine('  -Id <install id>            find the agent by install ID over mDNS instead of -Host/-Port')
+    $Writer.WriteLine('  -QueryAddress <ip[:port]>   send the mDNS query to one address, not multicast')
+    $Writer.WriteLine('  -DiscoverSeconds <n>        how long discovery listens; default 3')
     $Writer.WriteLine('  -Json                       compact JSON output for scripts and agents')
     $Writer.WriteLine()
     $Writer.WriteLine('Verbs:')
@@ -603,6 +732,55 @@ if ($Action -eq 'push-tree' -and -not (Test-Path -LiteralPath $Source -PathType 
     exit 11
 }
 
+if ($Action -eq 'discover') {
+    try {
+        $agents = @(Invoke-V9xDiscovery -Seconds $DiscoverSeconds -Target $QueryAddress -InstallId $Id)
+    } catch [Net.Sockets.SocketException] {
+        [Console]::Error.WriteLine("Discovery error: $($_.Exception.Message)")
+        exit 20
+    }
+    if ($Id) { $agents = @($agents | Where-Object { $_.InstallId -eq $Id }) }
+    if ($Json) {
+        [pscustomobject]@{ Success = $true; Count = $agents.Count; Agents = $agents } |
+            ConvertTo-Json -Depth 4 -Compress
+    } elseif ($agents.Count -eq 0) {
+        [Console]::Error.WriteLine('No agents answered. Discovery needs discovery=1 in the guest''s AGENT.INI and a LAN the host shares with it (bridged or physical, not SLiRP NAT); -QueryAddress <ip[:port]> queries one address directly.')
+    } else {
+        $agents | Format-Table Instance, Address, Port, AgentVersion, InstallId -AutoSize
+    }
+    exit $(if ($agents.Count -eq 0) { 20 } else { 0 })
+}
+if ($Id) {
+    $resolved = $false
+    try { $resolved = Update-V9xTargetFromId -Seconds $DiscoverSeconds } catch [Net.Sockets.SocketException] { }
+    if (-not $resolved) {
+        [Console]::Error.WriteLine("No agent with install ID $Id answered discovery within $DiscoverSeconds s.")
+        exit 20
+    }
+}
+
+$legacyUpdate = $false
+if ($Action -eq 'update') {
+    # Hot update arrived in 0.6.0, but the capability bit it is checked by
+    # (0x200, DRIVER_UPDATE) is older: 0.5.x sets it too and answers the
+    # UPDATE request with UNSUPPORTED_OPERATION, after both binaries have been
+    # uploaded. So decide by the version INFO reports. Asked before this
+    # verb's own connection opens, because 0.5.x serves one client at a time.
+    # Hashtable splatting: an array splatted into a script passes '-Host' as
+    # a positional value, not as a parameter name.
+    $target = @{ EndpointHost = $EndpointHost; Port = $Port
+                 ConnectTimeoutSeconds = $ConnectTimeoutSeconds; Json = $true }
+    if ($Id) { $target['Id'] = $Id }
+    $agentInfo = $null
+    try { $agentInfo = (& $PSCommandPath -Action info @target) -join "`n" | ConvertFrom-Json } catch { }
+    if ($null -ne $agentInfo) {
+        $agentVersion = $null
+        try { $agentVersion = [version]$agentInfo.AgentVersion } catch { }
+        $legacyUpdate = ([uint32]$agentInfo.Capabilities -band [uint32]0x00000200) -eq 0 -or
+            ($null -ne $agentVersion -and $agentVersion -lt [version]'0.6.0')
+    }
+}
+
 $client = $null
 $downloadTemp = $null
 $exitCategory = 22
@@ -618,7 +796,13 @@ try {
     if ($Action -in @('ping', 'info')) {
         $requestType = if ($Action -eq 'ping') { [uint16]0x0002 } else { [uint16]0x0030 }
         $expectedType = if ($Action -eq 'ping') { [uint16]0x8002 } else { [uint16]0x8030 }
-        $requestBytes = New-V9xFrameBytes -Type $requestType -RequestId $requestId
+        # INSTALL_ID (0x4000) agents take a flags word; bit 0 asks for the
+        # install ID after allowed_client. Older agents require an empty body.
+        $requestPayload = [byte[]]@()
+        if ($Action -eq 'info' -and ($hello.Capabilities -band [uint32]0x00004000) -ne 0) {
+            $requestPayload = [BitConverter]::GetBytes([uint32]1)
+        }
+        $requestBytes = New-V9xFrameBytes -Type $requestType -RequestId $requestId -Payload $requestPayload
         $stream.Write($requestBytes, 0, $requestBytes.Length)
         $frame = Read-V9xFrame -Stream $stream
         if ($frame.RequestId -ne $requestId) { throw 'Response request ID does not match.' }
@@ -666,9 +850,36 @@ try {
                 BitsPerPixel = $info.BitsPerPixel
                 ListenAddress = $info.ListenAddress
                 AllowedClient = $info.AllowedClient
+                InstallId = $info.InstallId
             }
         }
         if ($Json) { $result | ConvertTo-Json -Depth 4 -Compress } else { $result | Format-List }
+        exit 0
+    }
+
+    if ($Action -eq 'inventory') {
+        if (($hello.Capabilities -band [uint32]0x00002000) -eq 0) {
+            $exitCategory = 23
+            throw "Agent build '$($hello.BuildId)' does not advertise inventory support (needs agent 0.7.0+)."
+        }
+        $bytes = New-V9xFrameBytes -Type 0x0070 -RequestId $requestId
+        $stream.Write($bytes, 0, $bytes.Length)
+        $frame = Read-V9xOperationFrame -Stream $stream -RequestId $requestId `
+            -ExpectedTypes 0x8070 -GuestErrorExitCode 23
+        $records = ConvertFrom-V9xInventoryPayload -Payload $frame.Payload
+        if ($Json) {
+            [pscustomobject]@{
+                Success = $true; RequestId = $requestId; AgentBuild = $hello.BuildId
+                Endpoint = "${EndpointHost}:$Port"; Records = $records
+            } | ConvertTo-Json -Depth 6 -Compress
+        } else {
+            foreach ($record in $records) {
+                $pairs = foreach ($property in $record.Fields.PSObject.Properties) {
+                    "$($property.Name)=$(@($property.Value) -join ',')"
+                }
+                '{0,-8} {1}' -f $record.Record, ($pairs -join '  ')
+            }
+        }
         exit 0
     }
 
@@ -760,6 +971,8 @@ try {
                     }
                 } catch {
                     $lastReconnectError = $_.Exception.Message
+                    # -Id: the guest may come back on a new address (DHCP); look it up again.
+                    if ($Id) { try { [void](Update-V9xTargetFromId -Seconds 2) } catch { } }
                 }
             }
             if ($null -eq $resumed) {
@@ -913,11 +1126,85 @@ try {
         exit 0
     }
 
-    if ($Action -eq 'update') {
-        if (($hello.Capabilities -band [uint32]0x00000200) -eq 0) {
-            $exitCategory = 23
-            throw "Agent build '$($hello.BuildId)' does not advertise hot-update support."
+    if ($legacyUpdate) {
+        # Agents before 0.6.0 cannot hot-update. Drive the staged route they do
+        # support, with every guest path fixed and 8.3: COMMAND.COM runs
+        # INSTALL.BAT now and UPDATE.BAT from RunServices at the next boot, and
+        # a long folder name there stops the boot at a prompt. Each step is this
+        # script's own verb, run in-process on a fresh connection.
+        $packageRoot = (Get-Item -LiteralPath $Source).FullName
+        foreach ($name in 'V9XAGNT.EXE', 'V9XSHOT.EXE', 'INSTALL.BAT', 'UPDATE.BAT', 'README.TXT') {
+            if (-not (Test-Path -LiteralPath (Join-Path $packageRoot $name) -PathType Leaf)) {
+                $exitCategory = 11
+                throw "Install package must contain $name for a staged update: $packageRoot"
+            }
         }
+        $packageVersion = ''
+        $readmeTitle = Get-Content -LiteralPath (Join-Path $packageRoot 'README.TXT') -TotalCount 1
+        if ($readmeTitle -match '([0-9]+\.[0-9]+\.[0-9]+)\s*$') { $packageVersion = $Matches[1] }
+        $oldBuild = $hello.BuildId
+        $oldBootCounter = $hello.BootCounter
+        $client.Dispose()
+        $client = $null
+        $legacyPackage = 'C:\V9XPKG'
+        function Invoke-V9xLegacyStep([string]$Step, [int]$FailExit, [hashtable]$StepArgs) {
+            $all = $target.Clone()
+            foreach ($key in $StepArgs.Keys) { $all[$key] = $StepArgs[$key] }
+            $output = & $PSCommandPath @all
+            $code = $LASTEXITCODE
+            $parsed = $null
+            if ($output) { try { $parsed = ($output -join "`n") | ConvertFrom-Json } catch { } }
+            if ($code -ne 0) {
+                $exception = [InvalidOperationException]::new("Staged update: $Step failed (exit $code).")
+                $exception.Data['V9xExitCode'] = $(if ($code -eq 20) { 20 } else { $FailExit })
+                throw $exception
+            }
+            $parsed
+        }
+        [void](Invoke-V9xLegacyStep 'copying the package to C:\V9XPKG' 41 `
+            @{ Action = 'push-tree'; Source = $packageRoot; Destination = $legacyPackage })
+        $install = Invoke-V9xLegacyStep 'running INSTALL.BAT' 41 `
+            @{ Action = 'shell'; ShellCommand = 'INSTALL.BAT'
+               WorkingDirectory = $legacyPackage; TimeoutSeconds = 120 }
+        if ($install.Stdout -notmatch 'update staged') {
+            $exception = [InvalidOperationException]::new(
+                "Staged update: INSTALL.BAT did not stage the update. Its output: $($install.Stdout.Trim())")
+            $exception.Data['V9xExitCode'] = 41
+            throw $exception
+        }
+        $staged = Invoke-V9xLegacyStep 'checking V9XNEW.EXE' 41 `
+            @{ Action = 'stat'; RemotePath = 'C:\V9XREMOTE\V9XNEW.EXE' }
+        if (-not $staged.Exists) {
+            $exception = [InvalidOperationException]::new('Staged update: V9XNEW.EXE is missing after INSTALL.BAT.')
+            $exception.Data['V9xExitCode'] = 41
+            throw $exception
+        }
+        $rebootJob = 'v9x-update-' + [DateTime]::UtcNow.ToString('yyyyMMdd-HHmmss')
+        [void](Invoke-V9xLegacyStep 'rebooting to apply UPDATE.BAT' 42 `
+            @{ Action = 'reboot'; JobId = $rebootJob; WaitSeconds = [Math]::Max($WaitSeconds, 300) })
+        $after = Invoke-V9xLegacyStep 'reading the new agent version' 42 @{ Action = 'info' }
+        $leftover = Invoke-V9xLegacyStep 'checking UPDATE.BAT cleaned up' 42 `
+            @{ Action = 'stat'; RemotePath = 'C:\V9XREMOTE\V9XNEW.EXE' }
+        if ($leftover.Exists -or ($packageVersion -and $after.AgentVersion -ne $packageVersion)) {
+            $exception = [InvalidOperationException]::new(
+                "Staged update did not apply: agent is $($after.AgentVersion) $($after.BuildId), package is $packageVersion. UPDATE.BAT logs failures to C:\V9XREMOTE\UPDATE.LOG.")
+            $exception.Data['V9xExitCode'] = 42
+            throw $exception
+        }
+        # Best effort: the package copy is only scratch.
+        [void](& $PSCommandPath -Action shell -ShellCommand "DELTREE /Y $legacyPackage" @target)
+        $result = [pscustomobject]@{
+            Success = $true; RequestId = $requestId; Mode = 'Staged'
+            PreviousBuild = $oldBuild; PreviousBootCounter = $oldBootCounter
+            AgentVersion = $after.AgentVersion; AgentBuild = $after.BuildId
+            BootCounter = $after.BootCounter; Reconnected = $true
+            Endpoint = "${EndpointHost}:$Port"
+        }
+        if ($Json) { $result | ConvertTo-Json -Depth 4 -Compress } else { $result | Format-List }
+        exit 0
+    }
+
+    if ($Action -eq 'update') {
         $packageRoot = (Get-Item -LiteralPath $Source).FullName
         $agentSource = Join-Path $packageRoot 'V9XAGNT.EXE'
         $helperSource = Join-Path $packageRoot 'V9XSHOT.EXE'
@@ -956,6 +1243,8 @@ try {
                 }
             } catch {
                 $lastReconnectError = $_.Exception.Message
+                # -Id: the guest may come back on a new address (DHCP); look it up again.
+                if ($Id) { try { [void](Update-V9xTargetFromId -Seconds 2) } catch { } }
             }
         }
         if ($null -eq $resumed) {

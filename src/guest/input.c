@@ -40,6 +40,7 @@ static int v9x_input_validate(const unsigned char *payload, unsigned long length
         opcode = payload[offset++];
         switch (opcode) {
         case V9X_INPUT_OP_MOUSE_MOVE:
+        case V9X_INPUT_OP_MOUSE_MOVE_RELATIVE:
             if (offset + 8ul > length) return 0;
             offset += 8ul;
             break;
@@ -91,6 +92,24 @@ static void v9x_input_mouse_button(unsigned char button, unsigned char down)
     mouse_event(flags, 0ul, 0ul, 0ul, 0ul);
 }
 
+static long v9x_input_step(long remaining)
+{
+    if (remaining > V9X_INPUT_RELATIVE_STEP) return V9X_INPUT_RELATIVE_STEP;
+    if (remaining < -V9X_INPUT_RELATIVE_STEP) return -V9X_INPUT_RELATIVE_STEP;
+    return remaining;
+}
+
+static void v9x_input_mouse_relative(long dx, long dy)
+{
+    while (dx != 0l || dy != 0l) {
+        long step_x = v9x_input_step(dx);
+        long step_y = v9x_input_step(dy);
+        mouse_event(MOUSEEVENTF_MOVE, (DWORD)step_x, (DWORD)step_y, 0ul, 0ul);
+        dx -= step_x;
+        dy -= step_y;
+    }
+}
+
 static void v9x_input_key(unsigned char vk, unsigned char down)
 {
     UINT scan = MapVirtualKeyA((UINT)vk, 0u);
@@ -139,6 +158,11 @@ static void v9x_input_apply(const unsigned char *payload, unsigned long count)
         case V9X_INPUT_OP_MOUSE_MOVE:
             (void)SetCursorPos((int)v9x_read_s32(payload + offset),
                                (int)v9x_read_s32(payload + offset + 4ul));
+            offset += 8ul;
+            break;
+        case V9X_INPUT_OP_MOUSE_MOVE_RELATIVE:
+            v9x_input_mouse_relative(v9x_read_s32(payload + offset),
+                                     v9x_read_s32(payload + offset + 4ul));
             offset += 8ul;
             break;
         case V9X_INPUT_OP_MOUSE_BUTTON:

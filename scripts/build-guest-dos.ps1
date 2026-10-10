@@ -70,6 +70,7 @@ $sources = @(
     "src\common\bounds.c",
     "src\common\crc32.c",
     "src\common\frame.c",
+    "src\common\installid.c",
     "src\guest-dos\config.c",
     "src\guest-dos\net.c",
     "src\guest-dos\serve.c",

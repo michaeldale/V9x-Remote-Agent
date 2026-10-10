@@ -214,25 +214,15 @@ static int v9x_tray_notify(V9xAgentState *state, DWORD message,
 
 static void v9x_tray_address(V9xAgentState *state, char *address)
 {
-    char host_name[128];
-    struct hostent *host;
+    unsigned long value;
     struct in_addr host_address;
     char *resolved;
 
     lstrcpynA(address, state->listen_address, 16);
-    if (lstrcmpA(state->listen_address, "0.0.0.0") != 0) {
-        return;
-    }
-    if (state->winsock_version != 0u &&
-        gethostname(host_name, sizeof(host_name)) == 0) {
-        host = gethostbyname(host_name);
-        if (host != 0 && host->h_addrtype == AF_INET &&
-            host->h_length == sizeof(host_address) &&
-            host->h_addr_list != 0 && host->h_addr_list[0] != 0) {
-            host_address.s_addr = *(unsigned long *)host->h_addr_list[0];
-            resolved = inet_ntoa(host_address);
-            if (resolved != 0) lstrcpynA(address, resolved, 16);
-        }
+    if (v9x_primary_address(state, &value)) {
+        host_address.s_addr = value;
+        resolved = inet_ntoa(host_address);
+        if (resolved != 0) lstrcpynA(address, resolved, 16);
     }
 }
 

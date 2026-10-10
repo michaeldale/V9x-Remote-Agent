@@ -51,6 +51,8 @@
 #define V9X_MSG_SCREENSHOT_RESPONSE 0x8050u
 #define V9X_MSG_INPUT_REQUEST       0x0060u
 #define V9X_MSG_INPUT_RESPONSE      0x8060u
+#define V9X_MSG_INVENTORY_REQUEST   0x0070u
+#define V9X_MSG_INVENTORY_RESPONSE  0x8070u
 #define V9X_MSG_ERROR_RESPONSE 0x8fffu
 
 #define V9X_CAP_INFO 0x00000001ul
@@ -66,15 +68,28 @@
 #define V9X_CAP_INPUT_INJECT   0x00000400ul
 #define V9X_CAP_EXEC_DETACH    0x00000800ul
 #define V9X_CAP_HTTP_DOWNLOAD  0x00001000ul
+#define V9X_CAP_INVENTORY      0x00002000ul
+/* INFO accepts a u32 flags payload; V9X_INFO_FLAG_EXTENDED appends the
+   install ID after allowed_client. Opt-in, so older hosts (which reject
+   trailing INFO data) never see it. */
+#define V9X_CAP_INSTALL_ID     0x00004000ul
+/* INPUT accepts V9X_INPUT_OP_MOUSE_MOVE_RELATIVE (agent 0.8.1+). Older agents
+   reject the whole request as malformed, so hosts check this bit first. */
+#define V9X_CAP_INPUT_RELATIVE 0x00008000ul
+#define V9X_INFO_FLAG_EXTENDED 0x00000001ul
 #define V9X_CAPABILITIES (V9X_CAP_INFO | V9X_CAP_PING | \
                           V9X_CAP_EXEC_DIRECT | V9X_CAP_EXEC_SHELL | \
                           V9X_CAP_EXEC_CANCEL | V9X_CAP_FILE_READ | \
                           V9X_CAP_FILE_WRITE | V9X_CAP_POWER_CONTROL | \
                           V9X_CAP_SCREENSHOT_BMP | V9X_CAP_DRIVER_UPDATE | \
                           V9X_CAP_INPUT_INJECT | V9X_CAP_EXEC_DETACH | \
-                          V9X_CAP_HTTP_DOWNLOAD)
+                          V9X_CAP_HTTP_DOWNLOAD | V9X_CAP_INVENTORY | \
+                          V9X_CAP_INSTALL_ID | V9X_CAP_INPUT_RELATIVE)
 
-#define V9X_MAX_FILE_SIZE 67108864ul
+#define V9X_MAX_FILE_SIZE 268435456ul
+/* DOWNLOAD streams straight to the guest disk, so it is not held to the
+ * PUT/GET limit; 2 GiB keeps every size well inside the u32 wire fields. */
+#define V9X_MAX_DOWNLOAD_SIZE 2147483647ul
 #define V9X_FILE_CHUNK_SIZE 32768ul
 
 #define V9X_EXEC_MODE_DIRECT 0u
@@ -104,6 +119,13 @@
 #define V9X_INPUT_OP_KEY          4u  /* u8 virtual-key, u8 down */
 #define V9X_INPUT_OP_TYPE         5u  /* u16 length, ASCII bytes */
 #define V9X_INPUT_OP_DELAY        6u  /* u16 milliseconds */
+/* s32 dx, s32 dy: a relative mouse_event, as a real mouse moves, for
+   programs that read motion deltas and recentre the cursor (games) and so
+   never see an absolute SetCursorPos jump as motion. Sent in steps of at most
+   V9X_INPUT_RELATIVE_STEP pixels so Windows' mouse acceleration (threshold 6
+   by default) leaves the distance unscaled. */
+#define V9X_INPUT_OP_MOUSE_MOVE_RELATIVE 7u
+#define V9X_INPUT_RELATIVE_STEP 4l
 
 #define V9X_INPUT_BUTTON_LEFT   0u
 #define V9X_INPUT_BUTTON_RIGHT  1u

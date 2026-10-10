@@ -33,6 +33,7 @@ int main(void)
     g_dos.start_ms = v9x_dos_now_ms();
     v9x_dos_load_config(&g_dos);
     v9x_log_line("agent-start");
+    v9x_dos_ensure_install_id(&g_dos);
 
     if (!v9x_net_init()) {
         v9x_log_line("net-init-failed");

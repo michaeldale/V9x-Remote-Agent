@@ -29,6 +29,39 @@ Getting help:
 See [physical-machine.md](physical-machine.md) for guest configuration and
 containment requirements.
 
+Finding agents by discovery (agent 0.8.0+ with `discovery=1`):
+
+```powershell
+.\scripts\v9xctl.ps1 discover                         # table of agents that answered
+.\scripts\v9xctl.ps1 discover -DiscoverSeconds 5 -Json
+.\scripts\v9xctl.ps1 info -Id 11d8b52d-b5e6-4bf2-ae56-8d39cd39c0ca
+```
+
+- `discover` opens no agent connection. It multicasts one mDNS query for
+  `_v9xremote._tcp.local` on every up IPv4 interface and lists each agent's
+  instance name, address, port, version and install ID.
+- It exits 20 when nothing answers, with a hint about `discovery=1` and
+  SLiRP.
+- `-Id <install id>` works with every verb: discovery finds that install and
+  sets `-Host`/`-Port` from its SRV and A records. `reboot`, `update` and
+  their reconnect loops look it up again while waiting, so a guest that comes
+  back on a new DHCP address is still followed.
+- `-QueryAddress <ip[:port]>` sends the query unicast to one address instead
+  of multicasting, for routed subnets or a forwarded UDP port.
+
+`update -Source <package dir>` hot-swaps agents from 0.6.0 on. For an older
+agent (INFO `AgentVersion` below 0.6.0; the capability bit cannot tell) it
+takes the staged route instead (0.9.1+): copy the package to `C:\V9XPKG`, run
+its `INSTALL.BAT` there, check `V9XNEW.EXE` is staged, reboot so `UPDATE.BAT`
+swaps it in, confirm the agent reports the package's version with nothing left
+staged, then remove `C:\V9XPKG`. That takes about a minute and one reboot
+(waiting at least 300 s whatever `-WaitSeconds` says), creates DOS VMs, and
+reports `Mode = Staged`. It exits 41 when staging fails and 42 when the update
+did not apply (`C:\V9XREMOTE\UPDATE.LOG` on the guest says why).
+- `-DiscoverSeconds` (default 3) is how long to listen. With `-Id`, listening
+  stops as soon as the install answers.
+- `info` shows `InstallId` for 0.8.0+ agents (empty for older ones).
+
 Exit codes:
 
 - `0`: success
@@ -83,7 +116,9 @@ File examples:
     -Destination C:\V9XREMOTE\JOBS\demo
 ```
 
-Uploads and downloads are limited to 64 MiB per file. `put` commits only after
+Uploads and gets are limited to 256 MiB per file (64 MiB on agents
+before 0.6.4, which reject larger transfers with exit 40); a guest `download`
+is limited to 2 GiB on agent 0.8.1+. `put` commits only after
 the guest verifies size and CRC32. `get` writes a uniquely named local `.part`
 and replaces the requested destination only after matching the guest's final
 size and CRC32.
@@ -118,6 +153,11 @@ Input injection:
 order as one atomic batch (at most 256 steps):
 
 - `move X,Y` moves the cursor to absolute screen pixels
+- `moverel DX,DY` moves the mouse by DX,DY pixels as real mouse motion (agent
+  0.8.1+). Use it for games that read motion deltas and recentre the cursor
+  (UT99's menus), which never see a `move` jump. The agent sends it in steps
+  of at most 4 pixels so Windows' mouse acceleration leaves the distance
+  unscaled; the game's own sensitivity still applies
 - `click [left|right|middle]`, `doubleclick [button]`, and `down`/`up [button]`
   for press/release (a `down`, one or more `move`s, then `up` is a drag)
 - `wheel N` scrolls N notches (negative scrolls toward the user)

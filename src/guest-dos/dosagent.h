@@ -16,6 +16,7 @@
    is launched from AUTOEXEC.BAT). See docs\dos-agent.md. */
 
 #include "v9xremote/protocol.h"
+#include "v9xremote/installid.h"
 
 /* Capabilities this DOS build advertises in HELLO/INFO. The host gates every op
    on its capability bit, so a client that asks for a dropped feature (cancel,
@@ -23,7 +24,8 @@
    Only the info/ping handshake, both exec modes, and file read/write are here. */
 #define V9X_DOS_CAPABILITIES (V9X_CAP_INFO | V9X_CAP_PING | \
                               V9X_CAP_EXEC_DIRECT | V9X_CAP_EXEC_SHELL | \
-                              V9X_CAP_FILE_READ | V9X_CAP_FILE_WRITE)
+                              V9X_CAP_FILE_READ | V9X_CAP_FILE_WRITE | \
+                              V9X_CAP_INSTALL_ID)
 
 /* Pseudo winsock-version reported in HELLO/INFO so a host can tell a DOS agent
    apart from a Win9x one (0x20 = "Watt-32", not a real Winsock number). */
@@ -69,6 +71,7 @@ typedef struct V9xDos {
     unsigned long start_ms;     /* v9x_dos_now_ms() at agent start */
     unsigned short listen_port;
     char allowed_client[16];    /* dotted-quad, empty = allow any */
+    char install_id[V9X_INSTALL_ID_SIZE]; /* AGENT.INI install_id */
     V9xDosWriteState write_state;
     unsigned char payload[V9X_MAX_PAYLOAD];
     unsigned char header_bytes[V9X_HEADER_SIZE];
@@ -108,6 +111,7 @@ void v9x_files_disconnect(V9xDos *dos);
 
 /* config.c - configuration, boot counter, clock, logging */
 void v9x_dos_load_config(V9xDos *dos);
+void v9x_dos_ensure_install_id(V9xDos *dos);
 unsigned long v9x_dos_increment_boot_counter(void);
 unsigned long v9x_dos_now_ms(void);
 void v9x_log_line(const char *event_name);

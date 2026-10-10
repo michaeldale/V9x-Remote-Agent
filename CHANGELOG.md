@@ -2,6 +2,200 @@
 
 All notable changes to the V9x Remote Agent. Dates are in YYYY-MM-DD.
 
+## 0.9.1 (2026-10-09)
+
+### Changed
+- `v9xctl update` also upgrades agents too old to hot-update (before 0.6.0).
+  It used to judge that by capability `0x0200`, but 0.5.x advertises that bit
+  too, so against 0.5.x it uploaded both binaries and then failed on
+  `UNSUPPORTED_OPERATION` (exit 41). It now reads INFO `AgentVersion` first
+  and, below 0.6.0, drives the staged route those agents support, with every
+  guest path fixed and 8.3:
+  copy the package to `C:\V9XPKG`, run its `INSTALL.BAT` there, check that
+  `V9XNEW.EXE` is staged, reboot so `UPDATE.BAT` swaps it in from
+  `RunServices`, confirm the agent now reports the package's version and
+  nothing is left staged, then remove `C:\V9XPKG`. A session that improvised
+  this by hand put the package in a long-named folder, and the boot-time step
+  stopped at a prompt until someone pressed a key. The result carries
+  `Mode = Staged`; failures exit 41 (staging) or 42 (did not apply, see
+  `C:\V9XREMOTE\UPDATE.LOG`). It creates DOS VMs (`INSTALL.BAT`,
+  `UPDATE.BAT`), which agents before 0.6.0 cannot avoid. Verified by staging
+  0.5.2 to 0.9.1 on a Windows 98 SE guest. Host-side only; the agent is
+  unchanged from 0.9.0 apart from its version.
+- The MCP `v9x_update` tool checks the agent version the same way and refuses
+  an agent before 0.6.0 before uploading anything, pointing at
+  `v9xctl update`.
+
+## 0.9.0 (2026-10-09)
+
+### Changed
+- Idle connections are closed: a client that sends nothing for
+  `AGENT.INI [agent] idle_timeout` seconds (default 300, `0` never) is
+  dropped and logged as `client-idle-timeout`, except while it owns a running
+  EXEC. Before, a client that vanished without a FIN or RST reaching the guest
+  held one of the four connection slots, and kept the tray icon busy, until
+  the agent restarted. Applies to Win9x and NT; uses `select()` only, so the
+  import table is unchanged.
+
+### Added
+- Windows 2000 support for the Win32 agent and `SETUP.EXE`. Windows 98
+  behaviour is unchanged: every difference is chosen at run time from
+  `GetVersion()` (`src/guest/platform.c`), and the import table is the same.
+  - Autostart: NT ignores `RunServices`, so on NT `SETUP.EXE` and the
+    hot-update swapper register `HKLM\...\CurrentVersion\Run` instead. The
+    agent then starts at logon, so pair it with autologon. Over an existing
+    install, `SETUP.EXE` stages the update by pointing `Run` at
+    `V9XNEW.EXE -hotswap` rather than `UPDATE.BAT`. `SETUP.EXE /uninstall`
+    clears both keys on NT.
+  - Reboot and shutdown enable `SeShutdownPrivilege` first, which NT requires
+    before `ExitWindowsEx` (also for SETUP.EXE's "Restart Windows now"). If
+    it cannot be enabled the request fails with `ACCESS_DENIED` instead of
+    being accepted and then doing nothing. The token calls are resolved with
+    `GetProcAddress`, so nothing new is imported.
+  - Shutdown on NT drops `EWX_POWEROFF` when the machine has no soft-off
+    (`GetPwrCapabilities` reports no `SystemS5`, as with the "Standard PC"
+    HAL and APM off), because that HAL turns a power-off request into a
+    reboot. Such a machine halts at "It is now safe to turn off your
+    computer" and the agent logs `shutdown-accepted-halt`. Win9x still
+    always powers off.
+  - Shell-mode EXEC runs `CMD.EXE /C` on NT, where `COMMAND.COM` is the
+    16-bit interpreter under NTVDM. The wire format is unchanged.
+  - Hot update: NT lets a running EXE be renamed, so on NT the swapper also
+    waits for the old agent's singleton mutex to disappear before swapping.
+  - Sockets are not inheritable on NT. NT Winsock sockets are kernel handles
+    that children inherit by default, so the hot-update swapper (and any
+    EXEC child) held the listening socket and the relaunched agent looped on
+    `listen-failed` forever. Every agent socket now has its inherit flag
+    cleared (`SetHandleInformation`, resolved at run time), and on NT the
+    swapper relaunches the agent with no inheritance, which also recovers an
+    agent built without the fix. The swap log says `run-set` on NT.
+  - `INSTALL.BAT` and `UNINSTALL.BAT` stop on NT and point at `SETUP.EXE`.
+  - INVENTORY reads the NT locations: `os` from `Windows NT\CurrentVersion`
+    (`version_number` like `5.0.2195`, plus `product_type`), `bios` from
+    `HARDWARE\DESCRIPTION\System` (plus `video_version`), and `display`
+    `bpp` and `refresh` from `EnumDisplaySettingsA`. Devices are the present
+    instances under `SYSTEM\CurrentControlSet\Enum`, with presence and
+    problem codes from `CFGMGR32` (`meta devices=live`); an instance with no
+    `Class` value is classified through its `ClassGUID`. `CFGMGR32` and
+    `EnumDisplaySettingsA` are resolved at run time. The 9x records are
+    unchanged, apart from `REG_MULTI_SZ` values now being read (joined with
+    ` / `) where before they were skipped.
+  - `allow_dos_vm=0` on NT refuses only a direct `exec` of a DOS or Win16
+    program (anything that is not a PE image), since `CMD.EXE` and console
+    EXEs start no VM there; `EXEC_SHELL` stays advertised. `SETUP.EXE` labels
+    the option "Allow DOS and 16-bit Windows programs (NTVDM)" on NT.
+
+## 0.8.1 (2026-10-07)
+
+### Changed
+- A guest `download` may fetch up to 2 GiB (`V9X_MAX_DOWNLOAD_SIZE`). It
+  streams straight to the guest disk, so it no longer shares the 256 MiB
+  `put`/`get` ceiling; a 256 MiB+ game archive failed with Win32 223
+  (`ERROR_FILE_TOO_LARGE`) on 0.8.0. The wire format is unchanged.
+
+### Added
+- Relative mouse moves: INPUT opcode 7 (`s32 dx, s32 dy`), capability bit
+  `V9X_CAP_INPUT_RELATIVE` (`0x8000`), `moverel DX,DY` in `v9xctl input`
+  and `relative=true` on the MCP `v9x_move` tool. Games that read motion
+  deltas and recentre the cursor (UT99's own menu cursor) never see an
+  absolute `move`. Sent as `mouse_event` motion in steps of at most 4 pixels,
+  below Windows' default acceleration threshold of 6.
+
+## 0.8.0 (2026-10-01)
+
+### Added
+- `SETUP.EXE`, a graphical install wizard (Welcome, Options, Install,
+  Finish), launched by `AUTORUN.INF` from the install CD. The Options page
+  sets LAN discovery, DOS programs (`allow_dos_vm`), TCP port, listen address
+  and allowed client, and shows the install ID. Over an existing install it
+  keeps the settings and ID and stages the update for the next boot, exactly
+  like `INSTALL.BAT`; run from `C:\V9XREMOTE` it only changes settings. It
+  registers in Add/Remove Programs (`SETUP.EXE /uninstall`), and `/S` runs
+  a silent install. `INSTALL.BAT` stays as the no-GUI path.
+- Install ID: an RFC 4122 v4 UUID in `AGENT.INI [agent] install_id`,
+  generated by SETUP.EXE or on the agent's first start, so a machine can be
+  recognised after its IP changes. Win9x and DOS agents both have it. It is
+  reported in INVENTORY `meta install_id`, and in INFO when the host asks
+  for it: capability `INSTALL_ID` (0x4000) means INFO accepts a u32 flags
+  payload, and flag 1 appends the ID after `allowed_client`. Older hosts
+  send no flags and see the old reply, so nothing breaks either way.
+- LAN discovery (Win9x agent): with `discovery=1` the agent runs an
+  mDNS/DNS-SD responder (RFC 6762/6763, Winsock 1.1 multicast, no Bonjour)
+  advertising `_v9xremote._tcp.local` with SRV, TXT (`id`, `ver`, `build`,
+  `dos`, `os`, `name`) and A records, re-announcing when its address
+  changes and sending a goodbye before a hot update or reboot. INVENTORY
+  `meta discovery` says `off`, `on` or `unavailable`. Off by default in
+  `AGENT.INI`; SETUP.EXE ticks it.
+- `v9xctl discover` lists agents that answer, and a global `-Id <install id>`
+  finds the target by discovery instead of `-Host/-Port`, and finds it again
+  if it comes back from a reboot on a new address. `-QueryAddress` sends the
+  query unicast to one address. The MCP server gains `v9x_discover` and
+  `--id`, with the loopback guard applied to the address discovery returns.
+
+## 0.7.1 (2026-09-26)
+
+### Fixed
+- `INVENTORY` lists only devices that are loaded now. It walks the
+  Configuration Manager's live tree (`HKEY_DYN_DATA\Config Manager\Enum`)
+  and follows each node's `HardWareKey` into `HKLM\Enum`, instead of reading
+  every instance under `Services\Class`, which also keeps devices the machine
+  had in the past. On a Velocity9x netbook 0.7.0 reported three display
+  adapters, five disk drives and a dozen USB controllers, and named the
+  stale "Standard PCI Graphics Adapter" as the display adapter; the `display`
+  record now names the first working live Display node (the GMA 950).
+  `device` records gain `id` (the hardware key, e.g. `PCI\VEN_8086&...`) and
+  `problem` (the Configuration Manager problem code, when nonzero). A final
+  `meta` record now always says `devices=live`, or `devices=registry` when
+  there is no live tree and the old walk is used.
+
+## 0.7.0 (2026-09-26)
+
+### Added
+- `INVENTORY` message (0x0070 -> 0x8070) and capability bit `INVENTORY`
+  (0x2000): a hardware and software inventory read with calls that are safe
+  on every 9x release. The reply is a list of typed records (`os`, `cpu`,
+  `memory`, `drive`, `display`, `net`, `bios`, `device`, `meta`), each a set
+  of string key/value fields, so fields can be added later without another
+  protocol change. It covers the Windows product/build/sub-version, DirectX
+  and IE versions, CPUID vendor/brand/family/model/stepping/features and a
+  measured clock speed, physical and page-file memory, per-drive type, label,
+  file system and size, the display adapter and resolution, host IP
+  addresses, BIOS strings and the PnP device list (DriverDesc of the Display,
+  Monitor, MEDIA, Net, disk controller, CD-ROM, modem, port, USB and input
+  classes). Only local fixed disks are probed, with critical-error dialogs
+  suppressed, so an empty floppy or CD drive or a dead network share never
+  stalls or prompts. CPUs without CPUID (386/486) report `vendor=unknown`.
+  The reply fits the 16 KiB response buffer; if it would not, the last
+  record is `meta truncated=1`.
+- `v9xctl inventory` prints it (grouped text, or `-Json`), and the MCP
+  server has a `v9x_inventory` tool. The DOS agent does not advertise it.
+
+## 0.6.4 (2026-09-25)
+
+### Changed
+- The per-file transfer limit is 256 MiB, up from 64 MiB, for `put`, `get`,
+  `push-tree` and `download` on both the Windows and DOS agents
+  (`V9X_MAX_FILE_SIZE`). The wire format is unchanged: sizes were already
+  32-bit and every path streams 32 KiB chunks to disk, so nothing is buffered
+  in guest memory. The PowerShell and MCP clients enforce the same ceiling.
+  An older agent still rejects anything over 64 MiB with `LIMIT_EXCEEDED`
+  (exit 40), so update the guest first.
+- Hot update no longer runs a batch file. The agent used to write
+  `HOTSWAP.BAT` and run it through `COMMAND.COM`, which creates a DOS virtual
+  machine; on the Velocity9x netbook that corrupts the display every time.
+  The staged `V9XNEW.EXE` is now launched with `-hotswap` and does the swap
+  itself: wait for the lock, rename and copy, re-assert the RunServices
+  entry with the registry API, relaunch. `HOTSWAP.LOG` keeps the same step
+  names. The agent now imports ADVAPI32 for the registry write. The update
+  *from* an older agent still goes through that agent's batch once.
+
+### Added
+- `allow_dos_vm=0` in `AGENT.INI` for guests whose display driver cannot
+  survive a DOS VM. The agent then withdraws the `EXEC_SHELL` capability (so
+  `shell` fails on the host with exit 23 without touching the guest) and
+  refuses `exec` of anything but Win32 GUI-subsystem executables with
+  `UNSUPPORTED_OPERATION`. Logged as `dos-vm-disallowed` at start. Default 1.
+
 ## 0.6.3 (2026-09-24)
 
 ### Added

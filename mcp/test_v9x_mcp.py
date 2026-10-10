@@ -2,7 +2,10 @@
 
 import io
 import json
+import os
+import socket
 import struct
+import threading
 import unittest
 import zlib
 
@@ -80,6 +83,41 @@ class HelloParseTests(unittest.TestCase):
     def test_trailing_data_rejected(self):
         with self.assertRaises(v9x_mcp.V9xError):
             v9x_mcp.parse_hello(self.build_hello() + b"\x00")
+
+
+class InventoryParseTests(unittest.TestCase):
+    @staticmethod
+    def record(record_type, fields):
+        body = v9x_mcp.encode_string(record_type) + struct.pack("<H", len(fields))
+        for key, value in fields:
+            body += v9x_mcp.encode_string(key) + v9x_mcp.encode_string(value)
+        return body
+
+    def build(self):
+        payload = struct.pack("<H", 3)
+        payload += self.record("cpu", [("vendor", "GenuineIntel"), ("mhz", "450")])
+        payload += self.record("drive", [("letter", "C"), ("type", "fixed"),
+                                         ("total", "8589934592")])
+        payload += self.record("net", [("ip", "10.0.0.5"), ("ip", "192.168.1.9"),
+                                       ("ip", "172.16.0.1")])
+        return payload
+
+    def test_parse_inventory(self):
+        records = v9x_mcp.parse_inventory(self.build())
+        self.assertEqual([r["record"] for r in records], ["cpu", "drive", "net"])
+        self.assertEqual(records[0]["fields"]["vendor"], "GenuineIntel")
+        self.assertEqual(records[1]["fields"]["total"], "8589934592")
+        self.assertEqual(records[2]["fields"]["ip"],
+                         ["10.0.0.5", "192.168.1.9", "172.16.0.1"])
+
+    def test_empty_inventory(self):
+        self.assertEqual(v9x_mcp.parse_inventory(struct.pack("<H", 0)), [])
+
+    def test_trailing_and_truncated_rejected(self):
+        with self.assertRaises(v9x_mcp.V9xError):
+            v9x_mcp.parse_inventory(self.build() + b"\x00")
+        with self.assertRaises(v9x_mcp.V9xError):
+            v9x_mcp.parse_inventory(self.build()[:-3])
 
 
 class BmpToPngTests(unittest.TestCase):
@@ -167,7 +205,9 @@ class JsonRpcTests(unittest.TestCase):
         self.assertIn("v9x_key", names)
         self.assertIn("v9x_download", names)
         self.assertIn("v9x_update", names)
-        self.assertEqual(len(tools), 22)
+        self.assertIn("v9x_inventory", names)
+        self.assertIn("v9x_discover", names)
+        self.assertEqual(len(tools), 24)
 
     def test_unknown_method_errors(self):
         responses = self.run_server(
@@ -246,6 +286,142 @@ class InputEncodingTests(unittest.TestCase):
         self.assertEqual(v9x_mcp.virtual_key("7"), 0x37)
         with self.assertRaises(v9x_mcp.V9xError):
             v9x_mcp.virtual_key("NOPE")
+
+
+class InfoInstallIdTests(unittest.TestCase):
+    def build_info(self, install_id=None):
+        payload = struct.pack("<IIIHHI", 3, 1000, 0x4003, 9869, 0x0101, 0x0A04)
+        for value in ("0.8.0", "b", "WIN98", "Windows 4.10", "S", "W", "C", ""):
+            payload += v9x_mcp.encode_string(value)
+        payload += bytes(16)
+        payload += v9x_mcp.encode_string("0.0.0.0") + v9x_mcp.encode_string("")
+        if install_id is not None:
+            payload += v9x_mcp.encode_string(install_id)
+        return payload
+
+    def test_install_id_is_optional(self):
+        self.assertEqual(v9x_mcp.parse_info(self.build_info())["install_id"], "")
+        info = v9x_mcp.parse_info(self.build_info(MDNS_FIXTURE_ID))
+        self.assertEqual(info["install_id"], MDNS_FIXTURE_ID)
+        self.assertEqual(info["computer_name"], "WIN98")
+
+    def test_hello_never_takes_an_install_id(self):
+        hello = HelloParseTests().build_hello() + v9x_mcp.encode_string(MDNS_FIXTURE_ID)
+        with self.assertRaises(v9x_mcp.V9xError):
+            v9x_mcp.parse_hello(hello)
+
+
+MDNS_FIXTURE_ID = "1a2b3c4d-0000-4000-8000-000000000001"
+
+
+def mdns_fixture():
+    """The announcement src/common/mdns.c builds for test_protocol.c's fixture
+    service (build-host-tests.ps1 keeps the file in step with the encoder)."""
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "tests", "host",
+                        "mdns-announce.hex")
+    with open(path, "r", encoding="ascii") as handle:
+        return bytes.fromhex(handle.read().strip())
+
+
+def localised_fixture(tcp_port):
+    """The fixture with its A record at 127.0.0.1 and SRV port set."""
+    packet = bytearray(mdns_fixture())
+    packet[-4:] = bytes([127, 0, 0, 1])
+    at = packet.find(b"\x00\x21\x80\x01")
+    packet[at + 14 : at + 16] = struct.pack(">H", tcp_port)
+    return bytes(packet)
+
+
+class MdnsCodecTests(unittest.TestCase):
+    def test_announcement_folds_into_one_agent(self):
+        packet = v9x_mcp.parse_mdns_packet(mdns_fixture())
+        self.assertTrue(packet["is_response"])
+        self.assertEqual(len(packet["records"]), 5)
+        agents = v9x_mcp.fold_mdns_replies([("10.1.1.1", packet)])
+        self.assertEqual(len(agents), 1)
+        agent = agents[0]
+        self.assertEqual(agent["instance"], "WIN98-1a2b3c4d")
+        self.assertEqual(agent["install_id"], MDNS_FIXTURE_ID)
+        self.assertEqual(agent["address"], "192.168.1.50")
+        self.assertEqual(agent["port"], 9869)
+        self.assertEqual(agent["agent_version"], "0.8.0")
+        self.assertEqual(agent["responded_from"], "10.1.1.1")
+
+    def test_goodbye_removes_agent(self):
+        packet = v9x_mcp.parse_mdns_packet(mdns_fixture())
+        goodbye = v9x_mcp.parse_mdns_packet(mdns_fixture())
+        for record in goodbye["records"]:
+            record["ttl"] = 0
+        self.assertEqual(v9x_mcp.fold_mdns_replies([("a", packet), ("a", goodbye)]), [])
+
+    def test_query_and_compression(self):
+        query = v9x_mcp.mdns_query(0x1234)
+        self.assertEqual(len(query), 39)
+        self.assertEqual(query[:2], b"\x12\x34")
+        self.assertEqual(query[-4:], b"\x00\x0c\x00\x01")
+        pointer = (bytes([0, 0, 0x84, 0, 0, 0, 0, 1, 0, 0, 0, 0]) + query[12:35]
+                   + bytes([0, 12, 0, 1, 0, 0, 0, 10, 0, 2, 0xC0, 12]))
+        record = v9x_mcp.parse_mdns_packet(pointer)["records"][0]
+        self.assertEqual(record["data"], "_v9xremote._tcp.local")
+        loop = bytes([0, 0, 0x84, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0xC0, 12, 0, 12, 0, 1,
+                      0, 0, 0, 10, 0, 0])
+        with self.assertRaises(v9x_mcp.V9xError):
+            v9x_mcp.parse_mdns_packet(loop)
+
+
+class DiscoveryTests(unittest.TestCase):
+    def responder(self, answer, rounds=1):
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.bind(("127.0.0.1", 0))
+        sock.settimeout(10)
+
+        def serve():
+            try:
+                for _ in range(rounds):
+                    request, source = sock.recvfrom(2048)
+                    if b"_v9xremote" in request and not request[2] & 0x80:
+                        sock.sendto(answer, source)
+            except OSError:
+                pass
+            finally:
+                sock.close()
+
+        thread = threading.Thread(target=serve, daemon=True)
+        thread.start()
+        return "127.0.0.1:%d" % sock.getsockname()[1], thread
+
+    def test_discover_agents_unicast(self):
+        target, thread = self.responder(localised_fixture(4242))
+        agents = v9x_mcp.discover_agents(2.0, target, MDNS_FIXTURE_ID)
+        thread.join(5)
+        self.assertEqual(len(agents), 1)
+        self.assertEqual(agents[0]["address"], "127.0.0.1")
+        self.assertEqual(agents[0]["port"], 4242)
+
+    def test_resolve_by_install_id(self):
+        target, thread = self.responder(localised_fixture(4243))
+        handler = v9x_mcp.ToolHandler("127.0.0.1", 9869, 1.0, install_id=MDNS_FIXTURE_ID,
+                                      query_address=target, discover_seconds=2.0)
+        self.assertEqual(handler.resolve(), ("127.0.0.1", 4243))
+        thread.join(5)
+
+    def test_resolve_keeps_the_loopback_guard(self):
+        target, thread = self.responder(mdns_fixture())
+        handler = v9x_mcp.ToolHandler("127.0.0.1", 9869, 1.0, install_id=MDNS_FIXTURE_ID,
+                                      query_address=target, discover_seconds=2.0)
+        with self.assertRaises(v9x_mcp.V9xError) as caught:
+            handler.resolve()
+        self.assertIn("--allow-remote", str(caught.exception))
+        thread.join(5)
+
+    def test_unknown_install_id(self):
+        target, thread = self.responder(localised_fixture(4244))
+        handler = v9x_mcp.ToolHandler("127.0.0.1", 9869, 1.0,
+                                      install_id="ffffffff-0000-4000-8000-000000000000",
+                                      query_address=target, discover_seconds=0.5)
+        with self.assertRaises(v9x_mcp.V9xError):
+            handler.resolve()
+        thread.join(5)
 
 
 class LoopbackGuardTests(unittest.TestCase):

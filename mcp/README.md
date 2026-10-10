@@ -31,12 +31,23 @@ Options: `--host` (default `127.0.0.1`), `--port` (default `9869`),
 unless you also pass `--allow-remote`, because the guest protocol is
 unauthenticated (see [../SECURITY.md](../SECURITY.md)).
 
+`--id <install id>` finds the guest by mDNS discovery instead of
+`--host/--port` (agent 0.8.0+ with `discovery=1`, on a LAN the host shares
+with the guest). The server looks the ID up again whenever a connection fails
+and while waiting out a reboot or update, so it follows a guest onto a new
+DHCP address. The loopback guard applies to whatever address discovery
+returns, so a LAN guest still needs `--allow-remote`.
+`--query-address ip[:port]` sends the query unicast, and `--discover-seconds`
+(default 3) sets how long to listen.
+
 ## Tools
 
 | Tool | Purpose |
 |---|---|
+| `v9x_discover` | List agents on the LAN (instance, address, port, version, install ID) by mDNS; opens no agent connection |
 | `v9x_ping` | Liveness, uptime, boot counter |
-| `v9x_info` | Full agent status (version, screen mode, desktop readiness...) |
+| `v9x_info` | Full agent status (version, screen mode, desktop readiness, install ID...) |
+| `v9x_inventory` | Hardware/software inventory records (agent 0.7.0+) |
 | `v9x_exec` | Run a Win32 EXE with captured stdout/stderr and a timeout |
 | `v9x_shell` | Run a `COMMAND.COM /C` command (DIR, batch files, VER...) |
 | `v9x_put_file` | Upload a local file, CRC32-verified |

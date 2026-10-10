@@ -65,10 +65,17 @@ root shell to the guest, because that is what it is.
 ## 4. Install the agent from the ISO
 
 1. Start the VM. In 86Box: Media > CD-ROM > Image, and pick `V9XREMOTE.ISO`.
-2. In the guest: `Start > Run > D:\INSTALL.BAT` (adjust the drive letter if
-   needed).
-3. Reboot Windows when the script says so. The agent starts with Windows via
-   `RunServices` and writes its log to `C:\V9XREMOTE\AGENT.LOG`.
+2. AutoPlay starts `SETUP.EXE`; if it does not, `Start > Run > D:\SETUP.EXE`
+   (adjust the drive letter if needed). Review the settings, click Install,
+   and leave "Restart Windows now" ticked on the last page.
+   `D:\INSTALL.BAT` installs the same thing without a window, with default
+   settings.
+3. After the restart the agent starts with Windows via `RunServices` and
+   writes its log to `C:\V9XREMOTE\AGENT.LOG`.
+
+LAN discovery is ticked in SETUP.EXE, but under SLiRP the host cannot hear
+it, so use `-Host 127.0.0.1 -Port <forward>` as below. Discovery is for
+physical machines and bridged VMs.
 
 ## 5. Verify from the host
 

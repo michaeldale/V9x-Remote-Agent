@@ -42,7 +42,8 @@ $libraries = @(
     (Join-Path $watcomRoot "lib386\nt\wsock32.lib"),
     (Join-Path $watcomRoot "lib386\nt\user32.lib"),
     (Join-Path $watcomRoot "lib386\nt\gdi32.lib"),
-    (Join-Path $watcomRoot "lib386\nt\shell32.lib")
+    (Join-Path $watcomRoot "lib386\nt\shell32.lib"),
+    (Join-Path $watcomRoot "lib386\nt\advapi32.lib")
 )
 $required = @($compiler, $linker, $dumper) + $libraries
 $missing = @($required | Where-Object { -not (Test-Path -LiteralPath $_) })
@@ -59,13 +60,19 @@ $sources = @(
     "src\common\bounds.c",
     "src\common\crc32.c",
     "src\common\frame.c",
+    "src\common\installid.c",
+    "src\common\mdns.c",
     "src\guest\agent.c",
+    "src\guest\discovery.c",
     "src\guest\download.c",
     "src\guest\entry.c",
     "src\guest\execute.c",
     "src\guest\files.c",
     "src\guest\input.c",
+    "src\guest\installid.c",
+    "src\guest\inventory.c",
     "src\guest\logging.c",
+    "src\guest\platform.c",
     "src\guest\power.c",
     "src\guest\protocol.c",
     "src\guest\screenshot.c",
@@ -124,7 +131,7 @@ $dllNames = @([regex]::Matches($dumpText, 'DLL name = <([^>]+)>') |
     ForEach-Object { $_.Groups[1].Value.ToUpperInvariant() } | Sort-Object -Unique)
 $unexpected = @($dllNames | Where-Object {
     $_ -notin @('KERNEL32.DLL', 'WSOCK32.DLL', 'USER32.DLL', 'GDI32.DLL',
-                 'SHELL32.DLL')
+                 'SHELL32.DLL', 'ADVAPI32.DLL')
 })
 if ($unexpected.Count -ne 0) {
     throw "Guest output imports unexpected DLLs: $($unexpected -join ', ')"
@@ -152,9 +159,20 @@ foreach ($requiredImport in @('Accept', 'Bind', 'CreateFileA', 'CreateMutexA',
                                'CreateWindowExA', 'DestroyWindow', 'LoadIconA',
                                'CreateIconFromResource', 'DestroyIcon',
                                'InterlockedIncrement', 'InterlockedDecrement',
+                               'GetCommandLineA', 'CopyFileA',
+                               'RegCreateKeyExA', 'RegSetValueExA', 'RegCloseKey',
                                'PeekMessageA', 'DispatchMessageA',
                                'Shell_NotifyIconA', 'gethostname', 'gethostbyname',
-                               'inet_ntoa')) {
+                               'inet_ntoa', 'RegOpenKeyExA', 'RegQueryValueExA',
+                               'RegEnumKeyExA', 'GlobalMemoryStatus',
+                               'GetLogicalDrives', 'GetDriveTypeA',
+                               'GetVolumeInformationA', 'GetDiskFreeSpaceA',
+                               'GetVersionExA', 'GetSystemInfo', 'SetErrorMode',
+                               'GetProcAddress', 'GetModuleHandleA',
+                               'QueryPerformanceCounter',
+                               'QueryPerformanceFrequency',
+                               'sendto', 'recvfrom', 'setsockopt', 'select',
+                               'WritePrivateProfileStringA')) {
     if ($dumpText -notmatch "(?im)\s$([regex]::Escape($requiredImport))\s*$") {
         throw "Guest output is missing expected import $requiredImport."
     }
@@ -199,10 +217,65 @@ foreach ($requiredImport in @('BitBlt', 'CreateCompatibleBitmap',
     }
 }
 
+# SETUP.EXE: the install wizard. Short-lived and interactive, so unlike the
+# agent it may use GDI32 (only for the stock dialog font). It reuses the
+# agent's install-ID objects.
+$setupObject = Join-Path $outputDir 'src_setup_setup.obj'
+$setupExecutable = Join-Path $outputDir 'SETUP.EXE'
+$setupMapFile = Join-Path $outputDir 'SETUP.MAP'
+$setupLinkFile = Join-Path $outputDir 'SETUP.LNK'
+& $compiler '-bt=nt' '-zq' '-wx' '-zl' '-s' '-os' "-dV9X_BUILD_ID=`"$BuildId`"" `
+    "-fo=$setupObject" (Join-Path $repoRoot 'src\setup\setup.c')
+if ($LASTEXITCODE -ne 0) { throw 'Open Watcom failed to compile src\setup\setup.c.' }
+$setupLinkLines = @(
+    'format windows nt',
+    'runtime windows=4.0',
+    'option quiet',
+    'option nodefaultlibs',
+    "option start='_V9xSetupEntry@0'",
+    'option stack=65536',
+    "option map='$setupMapFile'",
+    "name '$setupExecutable'",
+    "file '$setupObject'",
+    "file '$(Join-Path $outputDir 'src_guest_installid.obj')'",
+    "file '$(Join-Path $outputDir 'src_guest_platform.obj')'",
+    "file '$(Join-Path $outputDir 'src_common_installid.obj')'"
+)
+foreach ($library in @('kernel32', 'user32', 'gdi32', 'advapi32')) {
+    $setupLinkLines += "library '$(Join-Path $watcomRoot "lib386\nt\$library.lib")'"
+}
+Set-Content -LiteralPath $setupLinkFile -Encoding Ascii -Value $setupLinkLines
+& $linker "@$setupLinkFile"
+if ($LASTEXITCODE -ne 0) { throw 'Open Watcom failed to link SETUP.EXE.' }
+$setupDumpText = (@(& $dumper -e $setupExecutable 2>&1)) -join "`n"
+if ($LASTEXITCODE -ne 0) { throw 'wdump could not inspect SETUP.EXE.' }
+$setupDlls = @([regex]::Matches($setupDumpText, 'DLL name = <([^>]+)>') |
+    ForEach-Object { $_.Groups[1].Value.ToUpperInvariant() } | Sort-Object -Unique)
+$unexpected = @($setupDlls | Where-Object {
+    $_ -notin @('KERNEL32.DLL', 'USER32.DLL', 'GDI32.DLL', 'ADVAPI32.DLL')
+})
+if ($unexpected.Count -ne 0) { throw "SETUP.EXE imports unexpected DLLs: $($unexpected -join ', ')" }
+if ($setupDumpText -notmatch '(?im)subsystem major version number\s+=\s+0004H') {
+    throw 'SETUP.EXE does not target Windows subsystem version 4.0.'
+}
+if ($setupDumpText -match '(?i)GetCommandLineW|GetModuleFileNameW|__CHK|MSVCR|UCRT') {
+    throw 'SETUP.EXE contains a forbidden runtime or Unicode startup import.'
+}
+foreach ($requiredImport in @('CreateWindowExA', 'IsDialogMessageA', 'CopyFileA',
+                               'WritePrivateProfileStringA', 'RegSetValueExA',
+                               'RegDeleteValueA', 'RegDeleteKeyA', 'ExitWindowsEx',
+                               'GetStockObject', 'QueryPerformanceCounter')) {
+    if ($setupDumpText -notmatch "(?im)\s$([regex]::Escape($requiredImport))\s*$") {
+        throw "SETUP.EXE is missing expected import $requiredImport."
+    }
+}
+
 Copy-Item -LiteralPath $executable -Destination (Join-Path $packageDir 'V9XAGNT.EXE') -Force
 Copy-Item -LiteralPath $helperExecutable -Destination (Join-Path $packageDir 'V9XSHOT.EXE') -Force
+Copy-Item -LiteralPath $setupExecutable -Destination (Join-Path $packageDir 'SETUP.EXE') -Force
 foreach ($name in @('INSTALL.BAT', 'UNINSTALL.BAT', 'UPDATE.BAT', 'INSTALL.REG',
-                     'REMOVE.REG', 'UPDATE.REG', 'AGENT.INI', 'README.TXT')) {
+                     'REMOVE.REG', 'UPDATE.REG', 'AGENT.INI', 'README.TXT',
+                     'AUTORUN.INF')) {
     $sourceLines = @(Get-Content -LiteralPath (Join-Path $repoRoot "packaging\win98se\$name"))
     if ($name -eq 'README.TXT') {
         $sourceLines = $sourceLines -replace '@VERSION@', $agentVersion
@@ -221,6 +294,7 @@ Set-Content -LiteralPath (Join-Path $packageDir 'SHA256.TXT') -Encoding Ascii -V
 [pscustomobject]@{
     Executable = $executable
     ScreenshotHelper = $helperExecutable
+    Setup = $setupExecutable
     Package = $packageDir
     BuildId = $BuildId
     Bytes = $bytes.Length

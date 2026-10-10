@@ -1,49 +1,40 @@
 #include "agent.h"
+#include "platform_win.h"
 #include "v9xremote/crc32.h"
 #include "v9xremote/protocol.h"
 #include "v9xremote/status.h"
 
 /* Hot update: apply a new agent (and screenshot helper) without a reboot. A
    running .EXE is locked on Win9x, so the agent cannot overwrite itself in
-   place. Instead it verifies the already-uploaded staged binaries, writes a
-   small hot-swap batch, launches it detached, and exits; the batch spins until
-   the agent has released the lock, swaps the files, and relaunches the agent.
-   The RunServices entry is never repointed, so an interrupted swap still
-   recovers on the next reboot. */
+   place. Instead it verifies the already-uploaded staged binaries, launches
+   the staged agent binary itself with "-hotswap" (entry.c routes that into
+   v9x_hotswap_run below), and exits. The swapper spins until the agent has
+   released the lock, swaps the files, re-asserts the RunServices entry, and
+   relaunches the agent. The RunServices entry is never repointed, so an
+   interrupted swap still recovers on the next reboot. On NT the entry lives
+   in the Run key instead (v9x_platform_run_key), and SETUP.EXE stages an
+   update for the next logon by pointing Run at "V9XNEW.EXE -hotswap": no
+   agent is running then, so the swap is immediate.
 
+   Until 0.6.4 the swapper was a COMMAND.COM batch. That creates a DOS
+   virtual machine, hidden or not, and some display drivers (the Velocity9x
+   GMA driver on the netbook) corrupt the screen whenever one starts. The
+   staged binary is a Win32 GUI-subsystem PE, so running it needs no VM. */
+
+static const char v9x_update_agent[] = "C:\\V9XREMOTE\\V9XAGNT.EXE";
+static const char v9x_update_agent_old[] = "C:\\V9XREMOTE\\V9XAGNT.OLD";
 static const char v9x_update_agent_new[] = "C:\\V9XREMOTE\\V9XNEW.EXE";
+static const char v9x_update_helper[] = "C:\\V9XREMOTE\\V9XSHOT.EXE";
 static const char v9x_update_helper_new[] = "C:\\V9XREMOTE\\V9XSNEW.EXE";
-static const char v9x_update_script[] = "C:\\V9XREMOTE\\HOTSWAP.BAT";
+static const char v9x_update_log[] = "C:\\V9XREMOTE\\HOTSWAP.LOG";
+static const char v9x_update_relaunch[] = "C:\\V9XREMOTE\\V9XAGNT.EXE -service";
+static const char v9x_update_swap_command[] = "C:\\V9XREMOTE\\V9XNEW.EXE -hotswap";
+static const char v9x_update_run_value[] = "V9xRemoteAgent";
 
-/* Batch is authored with explicit CRLF line endings: Win9x COMMAND.COM mangles
-   bare-LF batch files.
-
-   The wait loop must NOT rely on COPY's exit code: Win9x COMMAND.COM COPY /Y
-   returns errorlevel 0 even when it silently fails to overwrite a locked,
-   running .EXE, so a COPY-based spin does not actually wait and the swap is
-   skipped. Instead it renames the running agent aside - a rename of a mapped
-   executable fails while the process holds it and succeeds the instant it
-   exits - and detects success with IF EXIST, the one primitive Win9x
-   COMMAND.COM evaluates reliably (the same trick INSTALL.BAT uses). Only once
-   V9XAGNT.EXE is gone (the old process has fully exited, releasing both the file
-   lock and the singleton mutex) does it copy the new binary in and relaunch. */
-static const char v9x_update_batch[] =
-    "@ECHO OFF\r\n"
-    "ECHO hotswap-start > C:\\V9XREMOTE\\HOTSWAP.LOG\r\n"
-    ":WAIT\r\n"
-    "IF NOT EXIST C:\\V9XREMOTE\\V9XAGNT.EXE GOTO SWAP\r\n"
-    "REN C:\\V9XREMOTE\\V9XAGNT.EXE V9XAGNT.OLD\r\n"
-    "IF EXIST C:\\V9XREMOTE\\V9XAGNT.EXE GOTO WAIT\r\n"
-    ":SWAP\r\n"
-    "ECHO agent-exited >> C:\\V9XREMOTE\\HOTSWAP.LOG\r\n"
-    "COPY /Y C:\\V9XREMOTE\\V9XNEW.EXE C:\\V9XREMOTE\\V9XAGNT.EXE\r\n"
-    "IF EXIST C:\\V9XREMOTE\\V9XAGNT.OLD DEL C:\\V9XREMOTE\\V9XAGNT.OLD\r\n"
-    "COPY /Y C:\\V9XREMOTE\\V9XSNEW.EXE C:\\V9XREMOTE\\V9XSHOT.EXE\r\n"
-    "DEL C:\\V9XREMOTE\\V9XNEW.EXE\r\n"
-    "DEL C:\\V9XREMOTE\\V9XSNEW.EXE\r\n"
-    "REGEDIT /S C:\\V9XREMOTE\\INSTALL.REG\r\n"
-    "ECHO agent-relaunch >> C:\\V9XREMOTE\\HOTSWAP.LOG\r\n"
-    "C:\\V9XREMOTE\\V9XAGNT.EXE -service\r\n";
+/* How long the swapper waits for the old agent to release its executable.
+   The agent exits about a second after accepting the update. */
+#define V9X_HOTSWAP_WAIT_MS 120000ul
+#define V9X_HOTSWAP_POLL_MS 250ul
 
 static int v9x_update_error(V9xConnection *conn, DWORD request_id, DWORD status,
                             DWORD native_error, const char *detail)
@@ -100,34 +91,12 @@ static int v9x_update_verify(V9xConnection *conn, const char *path,
     return v9x_crc32_end(running_crc) == expected_crc;
 }
 
-static int v9x_update_write_script(DWORD *native_error)
-{
-    HANDLE file;
-    DWORD written = 0ul;
-    DWORD length = (DWORD)(sizeof(v9x_update_batch) - 1ul);
-    file = CreateFileA(v9x_update_script, GENERIC_WRITE, 0, 0, CREATE_ALWAYS,
-                       FILE_ATTRIBUTE_NORMAL, 0);
-    if (file == INVALID_HANDLE_VALUE) {
-        *native_error = GetLastError();
-        return 0;
-    }
-    if (!WriteFile(file, v9x_update_batch, length, &written, 0) ||
-        written != length || !FlushFileBuffers(file)) {
-        *native_error = GetLastError();
-        CloseHandle(file);
-        return 0;
-    }
-    CloseHandle(file);
-    return 1;
-}
-
-/* Launch the hot-swap batch detached so it outlives this process. On Win9x a
-   child is independent of its parent, so the batch keeps running after the agent
-   calls ExitProcess. The agent runs from RunServices with no console and no
-   standard handles, so - exactly like the detached-exec path in execute.c -
-   COMMAND.COM must be handed inheritable NUL std handles, or it fails to run the
-   batch at all. */
-static int v9x_update_launch(DWORD *native_error)
+/* Launch a process with inheritable NUL standard handles. The agent runs from
+   RunServices with no console and no standard handles, and a child launched
+   without any at all fails on Win9x, exactly as the detached-exec path in
+   execute.c found. Both the swapper and the relaunched agent go through
+   here. The command line must be writable (CreateProcessA may modify it). */
+static int v9x_update_spawn(const char *command, DWORD *native_error)
 {
     STARTUPINFOA startup;
     PROCESS_INFORMATION process;
@@ -135,20 +104,31 @@ static int v9x_update_launch(DWORD *native_error)
     HANDLE nul;
     char command_line[96];
     unsigned long index;
-    static const char prefix[] = "COMMAND.COM /C ";
     for (index = 0ul; index < sizeof(security); ++index)
         ((unsigned char *)&security)[index] = 0u;
     for (index = 0ul; index < sizeof(startup); ++index)
         ((unsigned char *)&startup)[index] = 0u;
     for (index = 0ul; index < sizeof(process); ++index)
         ((unsigned char *)&process)[index] = 0u;
-    for (index = 0ul; prefix[index] != '\0'; ++index)
-        command_line[index] = prefix[index];
-    {
-        unsigned long at = index;
-        for (index = 0ul; v9x_update_script[index] != '\0'; ++index)
-            command_line[at + index] = v9x_update_script[index];
-        command_line[at + index] = '\0';
+    for (index = 0ul; command[index] != '\0' && index + 1ul < sizeof(command_line); ++index)
+        command_line[index] = command[index];
+    command_line[index] = '\0';
+    /* NT runs a child with no standard handles happily, and inheriting
+       nothing there means no socket can leak across the handover. That
+       includes the listening socket of an agent built before sockets were
+       made non-inheritable, which leaked into the swapper: relaunching without inheritance lets this swapper
+       exit with it, and the new agent's bind retry then succeeds. */
+    if (v9x_platform_is_nt()) {
+        startup.cb = sizeof(startup);
+        if (!CreateProcessA(0, command_line, 0, 0, FALSE,
+                            CREATE_NEW_PROCESS_GROUP, 0, "C:\\V9XREMOTE",
+                            &startup, &process)) {
+            *native_error = GetLastError();
+            return 0;
+        }
+        CloseHandle(process.hThread);
+        CloseHandle(process.hProcess);
+        return 1;
     }
     security.nLength = sizeof(security);
     security.bInheritHandle = TRUE;
@@ -210,11 +190,9 @@ int v9x_handle_update(V9xConnection *conn, unsigned long request_id,
         return v9x_update_error(conn, request_id, V9X_STATUS_CRC_MISMATCH,
                                 ERROR_CRC, "staged helper binary invalid");
     }
-    if (!v9x_update_write_script(&native_error)) {
-        return v9x_update_error(conn, request_id, V9X_STATUS_IO_FAILED,
-                                native_error, "hot-swap script write failed");
-    }
-    if (!v9x_update_launch(&native_error)) {
+    /* A fresh log per swap, as the batch used to write. */
+    (void)DeleteFileA(v9x_update_log);
+    if (!v9x_update_spawn(v9x_update_swap_command, &native_error)) {
         return v9x_update_error(conn, request_id, V9X_STATUS_CREATE_FAILED,
                                 native_error, "hot-swap launch failed");
     }
@@ -225,10 +203,138 @@ int v9x_handle_update(V9xConnection *conn, unsigned long request_id,
                         conn->power_response, 8ul)) {
         return 0;
     }
-    /* Give the accepted frame time to flush and the hot-swap child time to
-       spawn, then exit so the batch can replace the now-unlocked executable and
-       relaunch it. */
+    /* Give the accepted frame time to flush and the swapper time to spawn,
+       then exit so it can replace the now-unlocked executable and relaunch
+       it. */
+    v9x_mdns_goodbye();
     Sleep(1000ul);
     ExitProcess(0ul);
     return 1;
+}
+
+/* ---- The swapper: this process is V9XNEW.EXE running with -hotswap. ---- */
+
+static void v9x_hotswap_log(const char *line)
+{
+    HANDLE file;
+    DWORD written = 0ul;
+    unsigned long length = 0ul;
+    file = CreateFileA(v9x_update_log, GENERIC_WRITE, FILE_SHARE_READ, 0,
+                       OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, 0);
+    if (file == INVALID_HANDLE_VALUE) return;
+    (void)SetFilePointer(file, 0l, 0, FILE_END);
+    while (line[length] != '\0') ++length;
+    (void)WriteFile(file, line, length, &written, 0);
+    (void)WriteFile(file, "\r\n", 2ul, &written, 0);
+    CloseHandle(file);
+}
+
+/* Re-assert the RunServices entry natively, which is what the batch did
+   with REGEDIT /S INSTALL.REG. Failure is logged, not fatal: the entry
+   is already there on any guest that was installed with INSTALL.BAT. On
+   NT it is the Run entry, logged as "run-*". */
+static void v9x_hotswap_register(void)
+{
+    HKEY key;
+    DWORD disposition = 0ul;
+    LONG status;
+    int nt = v9x_platform_is_nt();
+    status = RegCreateKeyExA(HKEY_LOCAL_MACHINE, v9x_platform_run_key(), 0ul, 0,
+                             REG_OPTION_NON_VOLATILE, KEY_WRITE, 0, &key,
+                             &disposition);
+    if (status != ERROR_SUCCESS) {
+        v9x_hotswap_log(nt ? "run-open-failed" : "runservices-open-failed");
+        return;
+    }
+    status = RegSetValueExA(key, v9x_update_run_value, 0ul, REG_SZ,
+                            (const BYTE *)v9x_update_relaunch,
+                            (DWORD)(sizeof(v9x_update_relaunch)));
+    RegCloseKey(key);
+    if (status == ERROR_SUCCESS) {
+        v9x_hotswap_log(nt ? "run-set" : "runservices-set");
+    } else {
+        v9x_hotswap_log(nt ? "run-set-failed" : "runservices-set-failed");
+    }
+}
+
+int v9x_hotswap_run(void)
+{
+    unsigned long waited = 0ul;
+    DWORD native_error = 0ul;
+    v9x_hotswap_log("hotswap-start");
+
+    /* Wait for the old agent to exit. A rename of a mapped executable fails
+       while the process holds it and succeeds the instant it exits, so the
+       rename is both the wait and the first step of the swap. Once
+       V9XAGNT.EXE is gone the old process has fully exited, releasing both
+       the file lock and the singleton mutex (the relaunched agent tolerates
+       a briefly lingering mutex on its own). */
+    for (;;) {
+        if (GetFileAttributesA(v9x_update_agent) == 0xfffffffful) break;
+        (void)DeleteFileA(v9x_update_agent_old);
+        if (MoveFileA(v9x_update_agent, v9x_update_agent_old)) break;
+        if (waited >= V9X_HOTSWAP_WAIT_MS) {
+            v9x_hotswap_log("agent-still-running");
+            return 1;
+        }
+        Sleep(V9X_HOTSWAP_POLL_MS);
+        waited += V9X_HOTSWAP_POLL_MS;
+    }
+    /* NT, unlike Win9x, lets a running executable be renamed, so there the
+       rename above proves nothing. Wait for the outgoing agent's singleton
+       mutex to disappear instead: OpenMutexA fails once its last handle has
+       closed, which is when the process has exited. */
+    if (v9x_platform_is_nt()) {
+        for (;;) {
+            HANDLE mutex = OpenMutexA(SYNCHRONIZE, FALSE, V9X_AGENT_MUTEX_NAME);
+            if (mutex == 0) break;
+            CloseHandle(mutex);
+            if (waited >= V9X_HOTSWAP_WAIT_MS) {
+                /* Put the binary back; the old agent is still serving. */
+                (void)MoveFileA(v9x_update_agent_old, v9x_update_agent);
+                v9x_hotswap_log("agent-still-running");
+                return 1;
+            }
+            Sleep(V9X_HOTSWAP_POLL_MS);
+            waited += V9X_HOTSWAP_POLL_MS;
+        }
+    }
+    v9x_hotswap_log("agent-exited");
+
+    /* This process is V9XNEW.EXE, so copying it is reading a mapped image,
+       which Win9x allows; deleting it is not, so the relaunched agent does
+       that (v9x_hotswap_cleanup). */
+    if (!CopyFileA(v9x_update_agent_new, v9x_update_agent, FALSE)) {
+        v9x_hotswap_log("agent-copy-failed");
+        /* Put the old binary back so RunServices still finds an agent. */
+        (void)MoveFileA(v9x_update_agent_old, v9x_update_agent);
+        return 2;
+    }
+    (void)DeleteFileA(v9x_update_agent_old);
+    if (CopyFileA(v9x_update_helper_new, v9x_update_helper, FALSE)) {
+        (void)DeleteFileA(v9x_update_helper_new);
+    } else {
+        v9x_hotswap_log("helper-copy-failed");
+    }
+    v9x_hotswap_register();
+    v9x_hotswap_log("agent-relaunch");
+    if (!v9x_update_spawn(v9x_update_relaunch, &native_error)) {
+        v9x_hotswap_log("agent-relaunch-failed");
+        return 3;
+    }
+    return 0;
+}
+
+/* Called by the agent at start: remove the staged binary the swapper could
+   not delete because it was running from it. The swapper exits right after
+   spawning us, so a few short retries cover the race; a leftover is
+   harmless and is overwritten by the next update anyway. */
+void v9x_hotswap_cleanup(void)
+{
+    int attempt;
+    for (attempt = 0; attempt < 10; ++attempt) {
+        if (GetFileAttributesA(v9x_update_agent_new) == 0xfffffffful) return;
+        if (DeleteFileA(v9x_update_agent_new)) return;
+        Sleep(200ul);
+    }
 }

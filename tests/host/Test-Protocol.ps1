@@ -139,4 +139,29 @@ Assert-Equal 480 $screen.Height 'Screenshot height mismatch.'
 Assert-Equal ([uint32]0x12345678) $screen.Crc32 'Screenshot CRC mismatch.'
 Assert-Equal 'C:\V9XREMOTE\TEMP\SCREEN.BMP' $screen.GuestPath 'Screenshot path mismatch.'
 
+$inventoryPayload = [Collections.Generic.List[byte]]::new()
+$inventoryPayload.AddRange([BitConverter]::GetBytes([uint16]2))
+Add-V9xString -Bytes $inventoryPayload -Value 'cpu'
+$inventoryPayload.AddRange([BitConverter]::GetBytes([uint16]2))
+Add-V9xString -Bytes $inventoryPayload -Value 'vendor'
+Add-V9xString -Bytes $inventoryPayload -Value 'AuthenticAMD'
+Add-V9xString -Bytes $inventoryPayload -Value 'mhz'
+Add-V9xString -Bytes $inventoryPayload -Value '350'
+Add-V9xString -Bytes $inventoryPayload -Value 'net'
+$inventoryPayload.AddRange([BitConverter]::GetBytes([uint16]2))
+Add-V9xString -Bytes $inventoryPayload -Value 'ip'
+Add-V9xString -Bytes $inventoryPayload -Value '10.0.0.5'
+Add-V9xString -Bytes $inventoryPayload -Value 'ip'
+Add-V9xString -Bytes $inventoryPayload -Value '192.168.1.9'
+$inventory = ConvertFrom-V9xInventoryPayload -Payload $inventoryPayload.ToArray()
+Assert-Equal 2 $inventory.Count 'Inventory record count mismatch.'
+Assert-Equal 'cpu' $inventory[0].Record 'Inventory record type mismatch.'
+Assert-Equal 'AuthenticAMD' $inventory[0].Fields.vendor 'Inventory CPU vendor mismatch.'
+Assert-Equal '350' $inventory[0].Fields.mhz 'Inventory CPU speed mismatch.'
+Assert-Equal 2 @($inventory[1].Fields.ip).Count 'Repeated inventory keys were not collected.'
+Assert-Equal '192.168.1.9' @($inventory[1].Fields.ip)[1] 'Repeated inventory value mismatch.'
+$threw = $false
+try { $null = ConvertFrom-V9xInventoryPayload -Payload ($inventoryPayload.ToArray() + [byte]0) } catch { $threw = $true }
+Assert-Equal $true $threw 'Inventory trailing data was not rejected.'
+
 Write-Output 'PASS: host framing, execution payloads, parsing, and limits'

@@ -74,7 +74,8 @@ commit per release. Publish only when explicitly asked.
 - **Do not create the GitHub release by hand.** Pushing the `v<version>` tag
   fires `.github/workflows/release.yml`, which builds the artifacts on a clean
   runner and creates the release itself, named `V9x Remote Agent v<version>`
-  with the top `CHANGELOG.md` section as its body and the three `build\release`
+  with every `CHANGELOG.md` section newer than the previous `v*` tag as its
+  body (the public repo skips versions) and the three `build\release`
   artifacts attached (`v9xremote-<version>.zip`, `V9XREMOTE.ISO`,
   `SHA256SUMS`). A manual `gh release create` races that workflow and makes it
   fail with "a release with the same tag name already exists", which is exactly

@@ -5,10 +5,16 @@
 #include <windows.h>
 #include <winsock.h>
 #include "v9xremote/protocol.h"
+#include "v9xremote/installid.h"
 
 #define V9X_EXEC_POOL_SIZE 4
+#define V9X_DISCOVERY_OFF 0l
+#define V9X_DISCOVERY_ACTIVE 1l
+#define V9X_DISCOVERY_UNAVAILABLE 2l
 #define V9X_MAX_CONNECTIONS 4
 #define V9X_LIST_RESPONSE_MAX 16384ul
+/* Singleton mutex; the hot-update swapper also waits on it (see update.c). */
+#define V9X_AGENT_MUTEX_NAME "V9xRemoteAgent.Singleton"
 
 /* Windows 95's KERNEL32 does not export InterlockedCompareExchange (it arrived
    in Windows 98 and NT4), so the agent must never import it. Every
@@ -70,6 +76,26 @@ typedef struct V9xAgentState {
     WORD listen_port;
     char listen_address[16];
     char allowed_client[16];
+    /* AGENT.INI [agent] allow_dos_vm (default 1). When 0 the agent refuses
+       anything that would make Windows create a DOS virtual machine: shell
+       requests (COMMAND.COM), and direct execution of console-subsystem or
+       DOS programs. Some display drivers corrupt the screen whenever a VM
+       starts, even a hidden one. */
+    int allow_dos_vm;
+    /* AGENT.INI [agent] install_id: generated on first start when missing,
+       so every install carries one whichever way it was installed. */
+    char install_id[V9X_INSTALL_ID_SIZE];
+    /* AGENT.INI [agent] discovery (default 0). When 1 an mDNS/DNS-SD
+       responder advertises _v9xremote._tcp on the LAN. `discovery_status`
+       is V9X_DISCOVERY_OFF, _ACTIVE or _UNAVAILABLE (bind or join failed). */
+    int discovery;
+    volatile LONG discovery_status;
+    /* AGENT.INI [agent] idle_timeout in seconds (default 300, 0 = never).
+       A connection that sends nothing for this long is closed, unless it
+       owns a running EXEC (the host then only receives). Without it a
+       client that vanished without a FIN or RST pinned a connection slot
+       and kept the tray icon busy forever. */
+    DWORD idle_timeout_ms;
     /* Activity picture for the tray icon. `active_connections` counts claimed
        connection slots; `activity` is bumped for every frame received or sent,
        and only ever compared for change, so wrap-around is harmless. */
@@ -105,7 +131,13 @@ typedef struct V9xConnection {
 } V9xConnection;
 
 void v9x_agent_run(void);
+unsigned long v9x_capabilities(const V9xAgentState *machine);
+int v9x_hotswap_run(void);
+void v9x_hotswap_cleanup(void);
 int v9x_tray_start(V9xAgentState *state);
+int v9x_mdns_start(V9xAgentState *state);
+void v9x_mdns_goodbye(void);
+int v9x_primary_address(const V9xAgentState *state, unsigned long *address);
 int v9x_serve_client(V9xConnection *conn);
 int v9x_send_frame(V9xConnection *conn, unsigned short type,
                    unsigned long request_id, const unsigned char *payload,
@@ -118,6 +150,7 @@ int v9x_execution_resume(V9xConnection *conn);
 int v9x_execution_cancel(V9xConnection *conn, unsigned long request_id);
 void v9x_execution_disconnect(V9xConnection *conn);
 int v9x_execution_any_active(V9xAgentState *machine);
+int v9x_execution_owned(const V9xConnection *conn);
 int v9x_is_file_message(unsigned short type);
 int v9x_handle_file_message(V9xConnection *conn, unsigned short type,
                             unsigned long request_id,
@@ -140,6 +173,7 @@ int v9x_handle_download(V9xConnection *conn, unsigned long request_id,
                         const unsigned char *payload, unsigned long length);
 int v9x_handle_update(V9xConnection *conn, unsigned long request_id,
                       const unsigned char *payload, unsigned long length);
+int v9x_handle_inventory(V9xConnection *conn, unsigned long request_id);
 int v9x_desktop_ready(void);
 void v9x_screen_info(DWORD *width, DWORD *height, DWORD *bits_per_pixel);
 void v9x_log_line(const char *event_name);

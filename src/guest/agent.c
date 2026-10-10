@@ -1,6 +1,8 @@
 #include "agent.h"
+#include "installid_win.h"
+#include "platform_win.h"
 
-static const char v9x_mutex_name[] = "V9xRemoteAgent.Singleton";
+static const char v9x_mutex_name[] = V9X_AGENT_MUTEX_NAME;
 static const char v9x_root[] = "C:\\V9XREMOTE";
 static const char v9x_boot_path[] = "C:\\V9XREMOTE\\BOOT.DAT";
 static const char v9x_temp_root[] = "C:\\V9XREMOTE\\TEMP";
@@ -26,6 +28,56 @@ static void v9x_load_network_config(V9xAgentState *state)
                                    state->allowed_client,
                                    sizeof(state->allowed_client),
                                    v9x_config_path);
+    state->allow_dos_vm =
+        GetPrivateProfileIntA("agent", "allow_dos_vm", 1, v9x_config_path) != 0;
+    state->discovery =
+        GetPrivateProfileIntA("agent", "discovery", 0, v9x_config_path) != 0;
+    {
+        UINT seconds = GetPrivateProfileIntA("agent", "idle_timeout", 300,
+                                             v9x_config_path);
+        if (seconds > 86400u) seconds = 86400u;
+        state->idle_timeout_ms = (DWORD)seconds * 1000ul;
+    }
+    switch (v9x_install_id_ensure(v9x_config_path, state->install_id)) {
+    case 1: v9x_log_event("install-id-created", state->install_id); break;
+    case -1: v9x_log_event("install-id-unsaved", state->install_id); break;
+    default: break;
+    }
+}
+
+/* The address the agent is reachable on: the bind address when one is set,
+   otherwise the first address the host name resolves to. 0 when Winsock is
+   not up or nothing resolves. */
+int v9x_primary_address(const V9xAgentState *state, unsigned long *address)
+{
+    char host_name[128];
+    struct hostent *host;
+    if (lstrcmpA(state->listen_address, "0.0.0.0") != 0) {
+        *address = inet_addr(state->listen_address);
+        return *address != INADDR_NONE;
+    }
+    if (state->winsock_version == 0u ||
+        gethostname(host_name, sizeof(host_name)) != 0) {
+        return 0;
+    }
+    host = gethostbyname(host_name);
+    if (host == 0 || host->h_addrtype != AF_INET ||
+        host->h_length != sizeof(*address) || host->h_addr_list == 0 ||
+        host->h_addr_list[0] == 0) {
+        return 0;
+    }
+    *address = *(unsigned long *)host->h_addr_list[0];
+    return 1;
+}
+
+/* Advertised capabilities. EXEC_SHELL is withdrawn when DOS VMs are
+   disallowed so a client fails before sending anything rather than after.
+   On NT the shell is CMD.EXE, a native Win32 program, so it stays. */
+unsigned long v9x_capabilities(const V9xAgentState *machine)
+{
+    unsigned long caps = V9X_CAPABILITIES;
+    if (!machine->allow_dos_vm && !v9x_platform_is_nt()) caps &= ~V9X_CAP_EXEC_SHELL;
+    return caps;
 }
 
 static DWORD v9x_increment_boot_counter(void)
@@ -158,6 +210,11 @@ void v9x_agent_run(void)
     state.listen_port = 9869u;
     state.listen_address[0] = '\0';
     state.allowed_client[0] = '\0';
+    state.allow_dos_vm = 1;
+    state.install_id[0] = '\0';
+    state.discovery = 0;
+    state.discovery_status = V9X_DISCOVERY_OFF;
+    state.idle_timeout_ms = 300000ul;
     state.active_connections = 0l;
     state.activity = 0l;
     state.tray_window = 0;
@@ -171,7 +228,10 @@ void v9x_agent_run(void)
     v9x_load_pending_job(&state);
     InitializeCriticalSection(&state.screenshot_lock);
     v9x_log_line("agent-start");
+    if (!state.allow_dos_vm) v9x_log_line("dos-vm-disallowed");
+    v9x_hotswap_cleanup();
     if (!v9x_tray_start(&state)) v9x_log_line("tray-icon-failed");
+    if (state.discovery && !v9x_mdns_start(&state)) v9x_log_line("mdns-thread-failed");
 
     for (;;) {
         for (retry = 0; retry < 30; ++retry) {
@@ -209,6 +269,7 @@ void v9x_agent_run(void)
             Sleep(5000ul);
             continue;
         }
+        v9x_platform_no_inherit((HANDLE)listener);
         address.sin_family = AF_INET;
         address.sin_port = htons(state.listen_port);
         address.sin_addr.s_addr = bind_address;
@@ -228,6 +289,7 @@ void v9x_agent_run(void)
             if (client == INVALID_SOCKET) {
                 break;
             }
+            v9x_platform_no_inherit((HANDLE)client);
             if (restrict_client &&
                 client_address.sin_addr.s_addr != allowed_client) {
                 v9x_log_line("client-rejected");

@@ -9,7 +9,9 @@ Nothing requires clicking inside the emulator.
 
 - **PowerShell CLI** (Windows hosts): `scripts\v9xctl.ps1`, one process per
   operation, add `-Json` for machine-readable output. Default target
-  `127.0.0.1:9869`; override with `-Host`/`-Port`. `.\scripts\v9xctl.ps1 help`
+  `127.0.0.1:9869`; override with `-Host`/`-Port`, or with `-Id <install id>`
+  to find the guest by discovery and follow it across address changes.
+  `.\scripts\v9xctl.ps1 help`
   prints the verb list with examples; a verb missing a required parameter
   prints its own usage line and exits 10.
 - **MCP server** (any host with Python 3.9+): `mcp/v9x_mcp.py` exposes the
@@ -20,10 +22,12 @@ Nothing requires clicking inside the emulator.
 
 | Verb | Key parameters | Purpose |
 |---|---|---|
+| `discover` | `-DiscoverSeconds`, `-QueryAddress` | Find agents on the LAN by mDNS; no connection (agent 0.8.0+ with `discovery=1`; not under SLiRP) |
 | `ping` | | Liveness; returns uptime and boot counter |
 | `info` | | Agent version, build ID, computer name, screen mode, pending job |
+| `inventory` | | OS build, CPU, memory, drives, display adapter, IPs, BIOS, PnP devices (agent 0.7.0+) |
 | `exec` | `-Application`, `-Arguments`, `-WorkingDirectory`, `-TimeoutSeconds`, `-ExpectedExitCode`, `-ShowWindow`, `-Detach` | Run a Win32 EXE directly, capture stdout/stderr |
-| `shell` | `-Command`, `-TimeoutSeconds`, `-Detach` | Run through `COMMAND.COM /C` (built-ins, batch files) |
+| `shell` | `-Command`, `-TimeoutSeconds`, `-Detach` | Run through `COMMAND.COM /C` (`CMD.EXE /C` on Windows 2000; built-ins, batch files) |
 | `stat` | `-Path` | Existence, size, attributes |
 | `list` | `-Path` | Directory listing (bounded to 16 KiB) |
 | `mkdir` | `-Path` | Idempotent directory creation |
@@ -31,7 +35,7 @@ Nothing requires clicking inside the emulator.
 | `get` | `-Source`, `-Destination` | Download one file, CRC32-verified |
 | `push-tree` | `-Source`, `-Destination` | Recursive directory upload |
 | `download` | `-Url`, `-Destination` | Guest fetches an `http://` URL to a guest path (http only, CRC32-verified) |
-| `update` | `-Source`, `-WaitSeconds` | Hot-upgrade the agent from an install-package folder, no reboot |
+| `update` | `-Source`, `-WaitSeconds` | Upgrade the agent from an install-package folder: hot, no reboot; agents before 0.6.0 get the staged route with one reboot (`Mode = Staged`, v9xctl 0.9.1+) |
 | `reboot` | `-JobId`, `-WaitSeconds` | Reboot with proof (see below) |
 | `shutdown` | `-JobId` | Controlled shutdown |
 | `wait-desktop` | `-WaitSeconds` | Block until Explorer's desktop is ready |
@@ -102,11 +106,13 @@ A fully annotated version with sample outputs is in
   the agent's own files (`AGENT.LOG`, `BOOT.DAT`, `PENDING.DAT`, config).
 - Prefer uppercase 8.3 file names; paths are ASCII only (the protocol rejects
   non-ASCII). No spaces in guest paths avoids COMMAND.COM quoting pain.
-- Limits: 64 MiB per file transfer, 1 MiB captured stdout and stderr each
+- Limits: 256 MiB per file for put and get, 2 GiB for a guest `download` (agent 0.8.1+), 1 MiB captured stdout and stderr each
   (excess is truncated and flagged), 16 KiB directory listings,
   1 hour maximum execution timeout.
-- The guest serves one client at a time and one execution at a time; `ping`
-  and cancel stay responsive during a running execution.
+- The guest serves up to four connections and four concurrent executions;
+  `ping` and cancel stay responsive during a running execution. Reboot,
+  shutdown, screenshot and update are refused with BUSY while any execution
+  runs.
 
 ## Failure handling rules
 
@@ -144,6 +150,11 @@ A fully annotated version with sample outputs is in
   means a non-detached shell command left descendants running.
 - If the agent refuses connections right after a reboot, it is normal: retry
   `ping` for up to ~2 minutes while Windows boots.
+- **A guest with `allow_dos_vm=0` in `AGENT.INI` refuses `shell` (exit 23,
+  "does not advertise shell support") and `exec` of console or DOS programs
+  (`UNSUPPORTED_OPERATION`).** Its display driver corrupts the screen when a
+  DOS VM starts, so this is protection, not a fault. Use `get`/`put`/`stat`/
+  `list`/`mkdir` for file work and `exec` only Win32 GUI executables there.
 - **`wait-desktop` timing out (44) while `ping` still succeeds means nobody has
   logged on, not that the agent died.** `RunServices` starts the agent before
   the logon dialog, so on a guest that prompts at boot everything except
@@ -159,8 +170,10 @@ A fully annotated version with sample outputs is in
   protocol is unauthenticated by design and equals full guest control.
 - Never disable the `allowed_client` allowlist on a physical machine
   deployment.
-- Do not run `INSTALL.BAT`/`UPDATE.BAT` semantics by hand over exec unless
-  asked; agent updates have a staged flow (see
-  [docs/guest-agent.md](docs/guest-agent.md)).
+- Upgrade an agent of any age with `update` alone. Do not run
+  `INSTALL.BAT`/`UPDATE.BAT` semantics by hand over exec unless asked: for an
+  agent before 0.6.0 `update` already drives that staged route itself with
+  fixed 8.3 paths, and a hand-picked long folder name stops the boot-time
+  `UPDATE.BAT` at a prompt (see [docs/guest-agent.md](docs/guest-agent.md)).
 - The guest is a development sandbox: assume anything in it can be lost, and
   keep sources and results on the host.

@@ -20,7 +20,19 @@ the protocol has a single source of truth.
 
 Dropped versus the Win9x agent (DOS has no equivalent, capability bits cleared):
 live exec streaming, cancel, timeout, stderr capture, detach; screenshot, input
-injection, power control, hot-update, HTTP download; concurrent connections.
+injection, power control, hot-update, HTTP download, inventory; concurrent
+connections.
+
+Install ID (0.8.0+): on first start the agent generates an `install_id`
+and appends it to `C:\V9XREMOT\AGENT.INI` (logged as `install-id-created`).
+It advertises `INSTALL_ID` and returns the ID in the extended INFO reply, so
+`v9xctl info` shows `InstallId` like it does for the Win9x agent.
+
+LAN discovery (mDNS) is Win9x-only. The DOS agent is single-threaded and
+blocks while it serves a client or runs a command, so a responder could only
+answer between clients. On top of that, receiving multicast needs the packet
+driver in receive mode 4 or 5 (`pkt.rxmode` in `WATTCP.CFG`), which many
+NE2000-class drivers do not support.
 
 ### Execution differences
 

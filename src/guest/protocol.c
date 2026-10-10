@@ -1,4 +1,5 @@
 #include "agent.h"
+#include "platform_win.h"
 #include "v9xremote/protocol.h"
 #include "v9xremote/status.h"
 #include "v9xremote/version.h"
@@ -135,7 +136,7 @@ static int v9x_send_hello(V9xConnection *conn, unsigned long request_id)
     DWORD bits_per_pixel;
     v9x_write_u16(conn->response, V9X_PROTOCOL_VERSION);
     v9x_write_u16(conn->response + 2, 0u);
-    v9x_write_u32(conn->response + 4, V9X_CAPABILITIES);
+    v9x_write_u32(conn->response + 4, v9x_capabilities(machine));
     v9x_write_u32(conn->response + 8, V9X_MAX_PAYLOAD);
     v9x_write_u32(conn->response + 12, machine->boot_counter);
     v9x_write_u16(conn->response + 16, machine->listen_port);
@@ -169,7 +170,8 @@ static int v9x_send_ping(V9xConnection *conn, unsigned long request_id)
                           conn->response, 8ul);
 }
 
-static int v9x_send_info(V9xConnection *conn, unsigned long request_id)
+static int v9x_send_info(V9xConnection *conn, unsigned long request_id,
+                         unsigned long flags)
 {
     V9xAgentState *machine = conn->machine;
     char computer[64];
@@ -205,7 +207,7 @@ static int v9x_send_info(V9xConnection *conn, unsigned long request_id)
 
     v9x_write_u32(conn->response, machine->boot_counter);
     v9x_write_u32(conn->response + 4, GetTickCount() - machine->start_tick);
-    v9x_write_u32(conn->response + 8, V9X_CAPABILITIES);
+    v9x_write_u32(conn->response + 8, v9x_capabilities(machine));
     v9x_write_u16(conn->response + 12, machine->listen_port);
     v9x_write_u16(conn->response + 14, machine->winsock_version);
     v9x_write_u32(conn->response + 16, version);
@@ -236,8 +238,43 @@ static int v9x_send_info(V9xConnection *conn, unsigned long request_id)
         return v9x_send_error(conn, request_id, V9X_STATUS_INTERNAL_ERROR,
                               "network info response overflow");
     }
+    if ((flags & V9X_INFO_FLAG_EXTENDED) != 0ul &&
+        !v9x_append_string(conn->response, sizeof(conn->response), &offset,
+                           machine->install_id)) {
+        return v9x_send_error(conn, request_id, V9X_STATUS_INTERNAL_ERROR,
+                              "install id response overflow");
+    }
     return v9x_send_frame(conn, V9X_MSG_INFO_RESPONSE, request_id,
                           conn->response, offset);
+}
+
+#define V9X_IDLE_POLL_MS 5000ul
+
+/* Wait for the next request. Returns 0 when the client has sent nothing for
+   the configured idle timeout, so the caller drops it. Time spent while this
+   connection owns a running EXEC does not count: the host is then only
+   receiving output. select() readiness or error both return 1; recv reports
+   the error. FD_SET/FD_ZERO are macros, so nothing new is imported. */
+static int v9x_wait_request(V9xConnection *conn)
+{
+    fd_set readable;
+    struct timeval wait;
+    DWORD idle = 0ul;
+    DWORD limit = conn->machine->idle_timeout_ms;
+    if (limit == 0ul) return 1;
+    for (;;) {
+        FD_ZERO(&readable);
+        FD_SET(conn->socket, &readable);
+        wait.tv_sec = (long)(V9X_IDLE_POLL_MS / 1000ul);
+        wait.tv_usec = 0l;
+        if (select(0, &readable, 0, 0, &wait) != 0) return 1;
+        if (v9x_execution_owned(conn)) {
+            idle = 0ul;
+            continue;
+        }
+        idle += V9X_IDLE_POLL_MS;
+        if (idle >= limit) return 0;
+    }
 }
 
 int v9x_serve_client(V9xConnection *conn)
@@ -250,6 +287,10 @@ int v9x_serve_client(V9xConnection *conn)
     unsigned long target_request;
     char cmd_detail[64];
     for (;;) {
+        if (!v9x_wait_request(conn)) {
+            v9x_log_line("client-idle-timeout");
+            return 1;
+        }
         if (!v9x_recv_exact(conn->socket, conn->header_bytes, V9X_HEADER_SIZE)) return 1;
         if (!v9x_decode_header(conn->header_bytes, &header)) return 0;
         if (header.payload_length > V9X_MAX_PAYLOAD || header.reserved != 0ul ||
@@ -303,6 +344,10 @@ int v9x_serve_client(V9xConnection *conn)
                                         "execution already active" :
                                     exec_status == V9X_STATUS_CREATE_FAILED ?
                                         "execution worker creation failed" :
+                                    exec_status == V9X_STATUS_UNSUPPORTED_OPERATION ?
+                                        (v9x_platform_is_nt() ?
+                                         "refused: allow_dos_vm=0 and this is a DOS or Win16 program (NTVDM)" :
+                                         "refused: allow_dos_vm=0 and this would start a DOS VM (shell, console or DOS program)") :
                                         "invalid execution request")) return 0;
             } else {
                 v9x_write_u32(conn->response, GetTickCount());
@@ -349,8 +394,13 @@ int v9x_serve_client(V9xConnection *conn)
             if (!v9x_handle_download(conn, header.request_id, conn->payload,
                                      header.payload_length)) return 0;
         } else if (header.type == V9X_MSG_INFO_REQUEST &&
+                   (header.payload_length == 0ul || header.payload_length == 4ul)) {
+            if (!v9x_send_info(conn, header.request_id,
+                               header.payload_length == 4ul
+                                   ? v9x_read_u32(conn->payload) : 0ul)) return 0;
+        } else if (header.type == V9X_MSG_INVENTORY_REQUEST &&
                    header.payload_length == 0ul) {
-            if (!v9x_send_info(conn, header.request_id)) return 0;
+            if (!v9x_handle_inventory(conn, header.request_id)) return 0;
         } else {
             if (!v9x_send_error(conn, header.request_id,
                                 V9X_STATUS_UNSUPPORTED_OPERATION,

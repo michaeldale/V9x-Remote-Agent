@@ -1,8 +1,9 @@
 # V9x Remote Agent
 
 Remote control for Windows 9x development guests, built for AI-driven
-development and debugging. A 141 KB runtime-free agent runs inside Windows
-95/98/Me (typically an 86Box VM). A PowerShell CLI and an MCP server on the
+development and debugging. A small (about 500 KB) runtime-free agent runs
+inside Windows 95/98/Me, and since 0.9.0 Windows 2000 (typically an 86Box
+VM). A PowerShell CLI and an MCP server on the
 host let a developer, or an AI coding agent working on their behalf, build
 software on a modern machine, push it into the guest, run it, capture output
 and screenshots, and run a verified reboot workflow with reconnect, persisted
@@ -33,8 +34,21 @@ clean reboot without a human touching the emulator.
   resume token, a changed agent-start counter, and desktop readiness. The
   counter alone is not machine-reboot proof.
 - Desktop-ready polling and 24-bit BMP screenshot capture
-- Mouse and keyboard injection (move, click, drag, wheel, hotkeys, typed text)
-  so an agent can drive dialogs and installers the UI only exposes visually
+- Mouse and keyboard injection (move, click, drag, wheel, hotkeys, typed text,
+  relative motion for games) so an agent can drive dialogs and installers the
+  UI only exposes visually
+- Hardware and OS inventory in one call: OS build, CPU, memory, drives,
+  active display adapter and mode, IPs, BIOS, and loaded PnP devices
+- Agent upgrades from the host with `v9xctl update`: a hot swap with no
+  reboot on 0.6.0 and later, and a scripted one-reboot staged route for
+  older agents
+- Guest-side HTTP download (up to 2 GiB, CRC32-verified) for payloads too
+  big to push
+- Optional LAN discovery over standard mDNS/DNS-SD, plus a per-machine
+  install ID so `v9xctl -Id <id>` finds a guest again after its address
+  changes
+- A graphical `SETUP.EXE` installer and a notification-area icon that shows
+  the agent is running and flashes green while a host is talking to it
 - A small, versioned, fragmentation-safe TCP protocol (see
   [docs/protocol.md](docs/protocol.md)); the guest uses a small network agent
   plus a disposable screenshot helper, with audited imports and no runtime
@@ -78,7 +92,9 @@ Build with `scripts\build-guest-dos.ps1`; see [docs/dos-agent.md](docs/dos-agent
 
 2. Get `V9XREMOTE.ISO` (from the release download, or build it yourself with
    `.\scripts\make-install-media.ps1`), attach it as a CD image in 86Box,
-   then in the guest run `D:\INSTALL.BAT` and reboot Windows.
+   then in the guest run `D:\SETUP.EXE` (AutoPlay starts it) and let it
+   restart Windows. `D:\INSTALL.BAT` does the same without a window
+   (Windows 9x only; on Windows 2000 use `SETUP.EXE` as an administrator).
 
 3. From the host:
 
@@ -88,6 +104,28 @@ Build with `scripts\build-guest-dos.ps1`; see [docs/dos-agent.md](docs/dos-agent
 
    `{"Success":true,...}` means an AI agent can now drive the guest. Read
    [docs/ai-workflows.md](docs/ai-workflows.md) for the full loop.
+
+### What the guest side looks like
+
+`SETUP.EXE` asks for the few settings that matter, shows the machine's
+install ID, and logs each step. Over an existing install it keeps the
+settings and ID and stages the new version for the next restart; run again
+from `C:\V9XREMOTE` it only changes settings. `SETUP.EXE /S` installs
+silently and `SETUP.EXE /uninstall` removes the autostart.
+
+| Settings | Install |
+|---|---|
+| ![SETUP.EXE settings page: LAN discovery, DOS programs, TCP port, listen address, allowed client, install ID](docs/images/setup-settings.png) | ![SETUP.EXE install page listing each completed step](docs/images/setup-install.png) |
+
+Once installed, the agent starts with Windows before anyone logs on and puts
+an icon in the notification area. Its body flashes green while a host is
+connected or a program it started is running, and its tooltip gives the agent
+version, port, and IP address:
+
+![Agent tray icon: green while active, and its tooltip showing version, port and IP](docs/images/tray-icon.png)
+
+*All three were captured by the agent itself (`v9xctl screenshot`), with
+`v9xctl input` clicking through the wizard.*
 
 ## Host requirements
 
@@ -114,6 +152,11 @@ Build with `scripts\build-guest-dos.ps1`; see [docs/dos-agent.md](docs/dos-agent
 .\scripts\v9xctl.ps1 reboot -JobId demo-reboot -WaitSeconds 180 -Json
 .\scripts\v9xctl.ps1 wait-desktop -WaitSeconds 120
 .\scripts\v9xctl.ps1 screenshot -Destination .\desktop.bmp -Json
+.\scripts\v9xctl.ps1 input -Sequence "move 80,486; click left; type notepad; key ENTER"
+.\scripts\v9xctl.ps1 inventory -Json
+.\scripts\v9xctl.ps1 download -Url http://10.0.2.2:8000/big.zip -Destination C:\V9XREMOTE\JOBS\big.zip
+.\scripts\v9xctl.ps1 update -Source .\build\install -WaitSeconds 300 -Json
+.\scripts\v9xctl.ps1 discover
 ```
 
 Exit code 0 means success. Transport and protocol failures use 20 to 23;
@@ -162,8 +205,9 @@ For a physical Windows 9x machine, use the same package and configure
 Protocol v1 is intentionally unauthenticated: anyone who can reach TCP 9869
 has full control of the guest. Keep 86Box in SLiRP/NAT mode, protect the
 forwarded port with the host firewall, and never bridge the guest NIC or
-expose the listener to a LAN or the Internet. Details in
-[SECURITY.md](SECURITY.md).
+expose the listener to a LAN or the Internet. LAN discovery (`discovery=1`)
+advertises the agent to every host on its segment, so enable it only on an
+isolated development network. Details in [SECURITY.md](SECURITY.md).
 
 ## Documentation
 
@@ -175,11 +219,19 @@ expose the listener to a LAN or the Internet. Details in
 - [docs/guest-agent.md](docs/guest-agent.md): guest runtime behaviour and AGENT.INI
 - [docs/protocol.md](docs/protocol.md): the wire protocol
 - [docs/physical-machine.md](docs/physical-machine.md): real retro hardware
+- [docs/dos-agent.md](docs/dos-agent.md): the DOS build
 - [docs/design.md](docs/design.md): the original staged design document
 - [CHANGELOG.md](CHANGELOG.md)
 
 Working notes, newest first:
 
+- [docs/decisions/2026-10-01-mdns-discovery-and-install-id.md](docs/decisions/2026-10-01-mdns-discovery-and-install-id.md):
+  SETUP.EXE, LAN discovery over standard mDNS/DNS-SD, and the install ID that
+  identifies a machine across address changes
+
+- [docs/decisions/2026-09-25-no-dos-vm-guests.md](docs/decisions/2026-09-25-no-dos-vm-guests.md):
+  `allow_dos_vm=0` and the native hot swap, for guests whose display driver
+  corrupts the screen when a DOS VM starts
 - [docs/decisions/2026-09-24-tray-activity-icon-without-gdi.md](docs/decisions/2026-09-24-tray-activity-icon-without-gdi.md):
   how the tray icon flashes green during activity when the agent may not
   import GDI32

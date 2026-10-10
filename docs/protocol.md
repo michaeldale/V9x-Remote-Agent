@@ -33,12 +33,96 @@ job. The strings are followed by the same 16-byte desktop/screen block used by
 `HELLO_RESPONSE`. Older M1-M3 responses that end after the original fields
 remain accepted by the host parser.
 
+An agent that advertises `V9X_CAP_INSTALL_ID` (`0x4000`, 0.8.0+, Win9x and
+DOS) also accepts an `INFO_REQUEST` whose payload is one u32 of flags. Flag
+`0x1` (`V9X_INFO_FLAG_EXTENDED`) appends one more string after
+allowed-client: the install ID, a lowercase RFC 4122 v4 UUID from
+`AGENT.INI [agent] install_id`. Hosts send the flags only when the capability
+is present (older agents require an empty INFO payload), and agents append
+the ID only when asked (older hosts reject trailing INFO data), so every
+host/agent combination keeps working.
+
+`INVENTORY_REQUEST` (`0x0070`, empty payload, capability `V9X_CAP_INVENTORY`
+`0x2000`, agent 0.7.0+) returns `INVENTORY_RESPONSE` (`0x8070`): a u16 record
+count, then per record a type string, a u16 field count, and that many
+key string / value string pairs. The format is deliberately schema-free:
+clients must ignore record types and keys they do not know, and a key may
+repeat inside one record. Values are printable ASCII (other bytes become `?`);
+sizes are decimal strings so they are not limited to 32 bits. Records emitted
+today:
+
+| Record | Fields |
+|---|---|
+| `os` (1) | `product_name`, `version_number`, `sub_version`, `plus_version`, `product_type` (NT only: `WinNT`, `ServerNT`, `LanmanNT`), `major`, `minor`, `build`, `platform`, `csd`, `registered_owner`, `registered_org`, `directx`, `ie_version`, `clean_boot` |
+| `cpu` (1) | `count`, `type`, `vendor`, `brand`, `family`, `model`, `stepping`, `features` (space separated: fpu tsc cmov mmx mmxext 3dnow 3dnowext sse sse2 sse3), `mhz`, `reg_vendor`, `reg_identifier` |
+| `memory` (1) | `total_phys`, `avail_phys`, `total_page`, `avail_page` (bytes), `load` (percent) |
+| `drive` (per letter) | `letter`, `type` (removable/fixed/network/cdrom/ramdisk/unknown); fixed and RAM disks add `label`, `fs`, `serial`, `total`, `free` (bytes) |
+| `display` (1) | `desc`, `provider`, `width`, `height`, `bpp`, `refresh` (NT only, Hz) |
+| `net` (1) | `hostname`, `ip` (repeated) |
+| `bios` (0-1) | `date`, `name` (9x only), `version`, `video_version` (NT only) |
+| `device` (many) | `class`, `desc`, `provider`, `driver_date`, `id` (hardware key; on NT the device instance ID), `problem` (Configuration Manager code, only when nonzero) |
+| `meta` (1, last) | `devices` (`live`: loaded devices from `HKEY_DYN_DATA\Config Manager\Enum`, or on NT the present instances under `HKLM\SYSTEM\CurrentControlSet\Enum` as reported by `CFGMGR32`; `registry`: every installed instance, used when there is no live tree), `truncated=1` when the reply hit the 16 KiB response buffer, `install_id` (0.8.0+), `discovery` (0.8.0+: `off`, `on`, or `unavailable` when the mDNS socket could not bind or join) |
+
+Fields with no value are omitted. Only fixed and RAM disks are probed, with
+critical-error dialogs suppressed, so removable, CD-ROM and network drives
+report letter and type only. The clock speed is measured by timing the TSC
+against the performance counter for about 200 ms, so the reply takes at least
+that long on a TSC-capable CPU.
+
+On Windows 2000 (agent 0.9.0+) the same records come from the NT locations:
+`os` from `SOFTWARE\Microsoft\Windows NT\CurrentVersion` (`version_number`
+is `CurrentVersion.CurrentBuildNumber`, e.g. `5.0.2195`), `bios` from
+`HARDWARE\DESCRIPTION\System` (multi-string values are joined with ` / `),
+`bpp` and `refresh` from `EnumDisplaySettingsA`, and device names from
+`SYSTEM\CurrentControlSet\Control\Class`. Keys a platform has no value for
+are simply absent.
+
 The reported port and network strings reflect `AGENT.INI`. IPv4 filtering is
 performed before protocol handshake, so a disallowed source is disconnected
 without receiving a HELLO response.
 
 Unknown operations return `ERROR_RESPONSE` (`0x8fff`). Malformed framing closes
 the connection. Operational requests before HELLO receive an error and close.
+
+## Discovery (mDNS / DNS-SD)
+
+Separate from the TCP protocol. With `AGENT.INI [agent] discovery=1` the Win9x
+agent (0.8.0+) runs a responder on UDP 5353, joined to 224.0.0.251 through
+Winsock 1.1, that follows RFC 6762 and RFC 6763. It advertises one instance:
+
+| Name | Type | Data | TTL |
+|---|---|---|---|
+| `_v9xremote._tcp.local` | PTR | `<COMPUTERNAME>-<id8>._v9xremote._tcp.local` | 4500 |
+| `_services._dns-sd._udp.local` | PTR | `_v9xremote._tcp.local` | 4500 |
+| `<COMPUTERNAME>-<id8>._v9xremote._tcp.local` | SRV | 0 0 `<port>` `v9x-<id8>.local` | 120 |
+| same | TXT | `id=<install id>`, `ver=`, `build=`, `dos=0/1`, `os=<major.minor>`, `name=<computer name>` | 4500 |
+| `v9x-<id8>.local` | A | primary IPv4 (the bind address, or the first address the host name resolves to) | 120 |
+
+`<id8>` is the first 8 characters of the install ID. It makes both names
+unique to the install, which is why the agent skips RFC 6762 probing (see
+[decisions/2026-10-01-mdns-discovery-and-install-id.md](decisions/2026-10-01-mdns-discovery-and-install-id.md)).
+SRV, TXT and A are unique records (cache-flush bit set); the PTRs are shared.
+
+- A query about any of these names gets them as answers, with the rest of the
+  instance (SRV, TXT, A) as additionals.
+- A query from a port other than 5353 is a one-shot legacy query (RFC 6762
+  6.7): the reply goes unicast to the sender, echoes its ID, clears the
+  cache-flush bit and caps TTLs at 10 s. That is how `v9xctl discover` and the
+  MCP server ask, so they never need port 5353 on the host.
+- A query with the QU bit set is also answered unicast; everything else is
+  answered to the group.
+- The agent announces twice, a second apart, when the responder starts and
+  whenever its address changes, and sends a goodbye (every TTL 0) before a hot
+  update or reboot.
+- Responses are written without name compression; queries are parsed with it.
+
+The C codec is `src/common/mdns.c`, with host decoders
+`ConvertFrom-V9xMdnsPacket` in `scripts/V9xProtocol.ps1` and
+`parse_mdns_packet` in `mcp/v9x_mcp.py`. `tests/host/mdns-announce.hex` is
+the C encoder's output for the test fixture; the host build checks that it
+still matches, and both host test suites decode it.
+
+The DOS agent has no responder; see [dos-agent.md](dos-agent.md).
 
 ## Concurrency
 
@@ -61,7 +145,7 @@ single helper and temp files.
 
 | Size | Field |
 |---:|---|
-| 1 | mode: 0 direct, 1 `COMMAND.COM /C` |
+| 1 | mode: 0 direct, 1 shell: `COMMAND.COM /C` on Win9x, `CMD.EXE /C` on NT (0.9.0+) |
 | 1 | show-window flag; ignored for direct-mode GUI-subsystem targets |
 | 2 | option flags: bit `0x0001` detach; other bits must be zero |
 | 4 | timeout milliseconds, maximum 3,600,000 |
@@ -122,7 +206,9 @@ responsive while execution workers are active.
 ## Files
 
 Protocol v1 file paths are non-empty length-prefixed ASCII strings. Individual
-files are limited to 67,108,864 bytes and data chunks to 32,768 bytes.
+files are limited to 268,435,456 bytes (256 MiB; 64 MiB before agent 0.6.4)
+and data chunks to 32,768 bytes. A guest `DOWNLOAD` is held to 2 GiB instead
+(agent 0.8.1+), since it streams straight to the guest disk.
 
 - `FILE_STAT_REQUEST` (`0x0020`) carries a path. Its 16-byte response contains
   existence and directory bytes, reserved u16, size, attributes, and native
@@ -179,14 +265,20 @@ execution slot is active on any connection, and the calling connection's active
 file transaction is cleaned before the Windows power request.
 
 `UPDATE_REQUEST` (`0x0042`, capability `V9X_CAP_DRIVER_UPDATE` `0x0200`) applies a
-new agent without a reboot. The host first uploads the new `V9XAGNT.EXE` and
+new agent without a reboot. The request exists from agent 0.6.0, but the
+capability bit is older: 0.5.x advertises `0x0200` too and answers
+`UPDATE_REQUEST` with `UNSUPPORTED_OPERATION`, so a host must check the INFO
+`AgentVersion` (as `v9xctl update` does from 0.9.1) rather than the bit alone. The host first uploads the new `V9XAGNT.EXE` and
 `V9XSHOT.EXE` as `C:\V9XREMOTE\V9XNEW.EXE` and `V9XSNEW.EXE` (normal upload path,
 CRC-verified on arrival), then sends a 16-byte payload: staged agent size and
 CRC32, then staged helper size and CRC32. The guest re-verifies each staged file
-(size, CRC32, and MZ header), writes `HOTSWAP.BAT`, launches it detached, replies
-`UPDATE_ACCEPTED` (`0x8042`, current boot counter and staged agent size), and
-exits. The batch waits for the executable lock to clear, swaps the binaries, and
-relaunches the agent, which comes back with an incremented boot counter. The host
+(size, CRC32, and MZ header), launches the staged binary itself as
+`V9XNEW.EXE -hotswap` (a Win32 process; agents before 0.6.4 wrote and ran a
+`HOTSWAP.BAT` through COMMAND.COM instead), replies `UPDATE_ACCEPTED`
+(`0x8042`, current boot counter and staged agent size), and exits. The swapper
+waits for the executable lock to clear, swaps the binaries, re-asserts the
+RunServices entry, relaunches the agent, and records each step in
+`HOTSWAP.LOG`; the agent comes back with an incremented boot counter. The host
 confirms the upgrade by reconnecting and observing the new boot counter (and
 `INFO` agent version). The RunServices entry is never repointed, so an
 interrupted swap still recovers on the next reboot. Refused with `BUSY` while any
@@ -216,6 +308,7 @@ that many actions, each a u8 opcode and opcode-specific little-endian fields:
 | 4 | key | u8 virtual-key code, u8 down |
 | 5 | type | u16 length, ASCII bytes (guest maps each via `VkKeyScan`, holding shift/ctrl/alt as needed) |
 | 6 | delay | u16 milliseconds (at most 10,000) |
+| 7 | relative mouse move | s32 dx, s32 dy (pixels, as `mouse_event(MOUSEEVENTF_MOVE)` motion in steps of at most 4 so acceleration does not scale it; agent 0.8.1+, advertised as `V9X_CAP_INPUT_RELATIVE` `0x8000`) |
 
 At most 256 actions per request. The guest validates the whole batch before
 applying any of it, then replies with `INPUT_RESPONSE` (`0x8060`): u32 actions

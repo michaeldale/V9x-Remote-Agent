@@ -161,6 +161,11 @@ function ConvertFrom-V9xInfoPayload {
     if ($offset -lt $Payload.Length) {
         $allowedClient = Read-V9xString -Bytes $Payload -Offset ([ref]$offset)
     }
+    # Only present when the request carried V9X_INFO_FLAG_EXTENDED (agent 0.8.0+).
+    $installId = ''
+    if ($offset -lt $Payload.Length) {
+        $installId = Read-V9xString -Bytes $Payload -Offset ([ref]$offset)
+    }
     if ($offset -ne $Payload.Length) { throw 'INFO response contains trailing data.' }
     [pscustomobject]@{
         BootCounter = [BitConverter]::ToUInt32($Payload, 0)
@@ -183,7 +188,38 @@ function ConvertFrom-V9xInfoPayload {
         BitsPerPixel = $bitsPerPixel
         ListenAddress = $listenAddress
         AllowedClient = $allowedClient
+        InstallId = $installId
     }
+}
+
+# INVENTORY_RESPONSE: u16 record count, then per record a type string, a u16
+# field count and that many (key, value) strings. A key repeated inside one
+# record (several net "ip" fields) is returned as an array.
+function ConvertFrom-V9xInventoryPayload {
+    param([byte[]]$Payload)
+    if ($Payload.Length -lt 2) { throw 'Truncated INVENTORY response.' }
+    $count = [BitConverter]::ToUInt16($Payload, 0)
+    $offset = 2
+    $records = New-Object System.Collections.Generic.List[object]
+    for ($recordIndex = 0; $recordIndex -lt $count; ++$recordIndex) {
+        $recordType = Read-V9xString -Bytes $Payload -Offset ([ref]$offset)
+        if ($offset + 2 -gt $Payload.Length) { throw 'Truncated INVENTORY record.' }
+        $fieldCount = [BitConverter]::ToUInt16($Payload, $offset)
+        $offset += 2
+        $fields = [ordered]@{}
+        for ($fieldIndex = 0; $fieldIndex -lt $fieldCount; ++$fieldIndex) {
+            $key = Read-V9xString -Bytes $Payload -Offset ([ref]$offset)
+            $value = Read-V9xString -Bytes $Payload -Offset ([ref]$offset)
+            if ($fields.Contains($key)) {
+                $fields[$key] = @($fields[$key]) + $value
+            } else {
+                $fields[$key] = $value
+            }
+        }
+        $records.Add([pscustomobject]@{ Record = $recordType; Fields = [pscustomobject]$fields })
+    }
+    if ($offset -ne $Payload.Length) { throw 'INVENTORY response contains trailing data.' }
+    return ,$records.ToArray()
 }
 
 function New-V9xExecPayload {
@@ -319,6 +355,11 @@ function Add-V9xInputAction {
     switch ($Action.Op) {
         'move' {
             $Bytes.Add([byte]1)
+            $Bytes.AddRange([BitConverter]::GetBytes([int]$Action.X))
+            $Bytes.AddRange([BitConverter]::GetBytes([int]$Action.Y))
+        }
+        'moverel' {
+            $Bytes.Add([byte]7)
             $Bytes.AddRange([BitConverter]::GetBytes([int]$Action.X))
             $Bytes.AddRange([BitConverter]::GetBytes([int]$Action.Y))
         }
@@ -461,4 +502,209 @@ function Get-V9xFileCrc32 {
     } finally {
         $stream.Dispose()
     }
+}
+
+# ---- mDNS / DNS-SD discovery (RFC 6762, RFC 6763): codec only. ----
+# DNS is big-endian, unlike the rest of the protocol. Mirrors src\common\mdns.c
+# and the Python codec in mcp\v9x_mcp.py.
+$script:V9xMdnsService = '_v9xremote._tcp.local'
+
+function Add-V9xDnsName {
+    param([Collections.Generic.List[byte]]$Bytes, [string]$Name)
+    foreach ($label in ($Name.TrimEnd('.') -split '\.')) {
+        $encoded = [Text.Encoding]::ASCII.GetBytes($label)
+        if ($encoded.Length -lt 1 -or $encoded.Length -gt 63) { throw "Invalid DNS label '$label'." }
+        $Bytes.Add([byte]$encoded.Length)
+        $Bytes.AddRange($encoded)
+    }
+    $Bytes.Add([byte]0)
+}
+
+function New-V9xMdnsQuery {
+    param([uint16]$Id = 0, [string]$Name = $script:V9xMdnsService, [uint16]$Type = 12)
+    $bytes = [Collections.Generic.List[byte]]::new()
+    $bytes.Add([byte]($Id -shr 8))
+    $bytes.Add([byte]($Id -band 0xff))
+    $bytes.AddRange([byte[]](0, 0, 0, 1, 0, 0, 0, 0, 0, 0))
+    Add-V9xDnsName -Bytes $bytes -Name $Name
+    $bytes.AddRange([byte[]](($Type -shr 8), ($Type -band 0xff), 0, 1))
+    return $bytes.ToArray()
+}
+
+function Read-V9xDnsName {
+    param([byte[]]$Bytes, [ref]$Offset)
+    $labels = New-Object System.Collections.Generic.List[string]
+    $at = $Offset.Value
+    $jumped = $false
+    $jumps = 0
+    while ($true) {
+        if ($at -ge $Bytes.Length) { throw 'Truncated DNS name.' }
+        $length = [int]$Bytes[$at]
+        if ($length -eq 0) {
+            if (-not $jumped) { $Offset.Value = $at + 1 }
+            break
+        }
+        if (($length -band 0xc0) -eq 0xc0) {
+            $jumps++
+            if ($at + 1 -ge $Bytes.Length -or $jumps -gt 16) { throw 'Invalid DNS compression pointer.' }
+            if (-not $jumped) { $Offset.Value = $at + 2 }
+            $jumped = $true
+            $at = (($length -band 0x3f) -shl 8) -bor [int]$Bytes[$at + 1]
+            continue
+        }
+        if (($length -band 0xc0) -ne 0 -or $at + 1 + $length -gt $Bytes.Length) { throw 'Invalid DNS label.' }
+        $labels.Add([Text.Encoding]::ASCII.GetString($Bytes, $at + 1, $length))
+        $at += 1 + $length
+    }
+    return ($labels -join '.')
+}
+
+function Read-V9xBigEndian {
+    param([byte[]]$Bytes, [int]$Offset, [int]$Count)
+    [uint32]$value = 0
+    for ($index = 0; $index -lt $Count; ++$index) {
+        $value = [uint32](($value * 256) + $Bytes[$Offset + $index])
+    }
+    return $value
+}
+
+# One DNS message -> header fields plus every answer/authority/additional
+# record. Data is decoded for A (dotted text), PTR (name), SRV (object) and
+# TXT (string array); other types keep their raw bytes.
+function ConvertFrom-V9xMdnsPacket {
+    param([byte[]]$Packet)
+    if ($Packet.Length -lt 12) { throw 'Truncated DNS header.' }
+    $questions = Read-V9xBigEndian -Bytes $Packet -Offset 4 -Count 2
+    $recordCount = (Read-V9xBigEndian -Bytes $Packet -Offset 6 -Count 2) +
+        (Read-V9xBigEndian -Bytes $Packet -Offset 8 -Count 2) +
+        (Read-V9xBigEndian -Bytes $Packet -Offset 10 -Count 2)
+    $offset = 12
+    for ($index = 0; $index -lt $questions; ++$index) {
+        [void](Read-V9xDnsName -Bytes $Packet -Offset ([ref]$offset))
+        $offset += 4
+    }
+    $records = New-Object System.Collections.Generic.List[object]
+    for ($index = 0; $index -lt $recordCount; ++$index) {
+        $name = Read-V9xDnsName -Bytes $Packet -Offset ([ref]$offset)
+        if ($offset + 10 -gt $Packet.Length) { throw 'Truncated DNS record.' }
+        $type = [int](Read-V9xBigEndian -Bytes $Packet -Offset $offset -Count 2)
+        $class = [int](Read-V9xBigEndian -Bytes $Packet -Offset ($offset + 2) -Count 2)
+        $ttl = Read-V9xBigEndian -Bytes $Packet -Offset ($offset + 4) -Count 4
+        $dataLength = [int](Read-V9xBigEndian -Bytes $Packet -Offset ($offset + 8) -Count 2)
+        $offset += 10
+        if ($offset + $dataLength -gt $Packet.Length) { throw 'Truncated DNS record data.' }
+        $dataOffset = $offset
+        $data = $null
+        switch ($type) {
+            1 {
+                if ($dataLength -ne 4) { throw 'Invalid DNS A record.' }
+                $data = '{0}.{1}.{2}.{3}' -f $Packet[$offset], $Packet[$offset + 1], $Packet[$offset + 2], $Packet[$offset + 3]
+            }
+            12 { $data = Read-V9xDnsName -Bytes $Packet -Offset ([ref]$dataOffset) }
+            33 {
+                if ($dataLength -lt 7) { throw 'Invalid DNS SRV record.' }
+                $targetOffset = $offset + 6
+                $data = [pscustomobject]@{
+                    Priority = [int](Read-V9xBigEndian -Bytes $Packet -Offset $offset -Count 2)
+                    Weight = [int](Read-V9xBigEndian -Bytes $Packet -Offset ($offset + 2) -Count 2)
+                    Port = [int](Read-V9xBigEndian -Bytes $Packet -Offset ($offset + 4) -Count 2)
+                    Target = Read-V9xDnsName -Bytes $Packet -Offset ([ref]$targetOffset)
+                }
+            }
+            16 {
+                $strings = New-Object System.Collections.Generic.List[string]
+                $at = $offset
+                while ($at -lt $offset + $dataLength) {
+                    $length = [int]$Packet[$at]
+                    if ($at + 1 + $length -gt $offset + $dataLength) { throw 'Invalid DNS TXT record.' }
+                    if ($length -gt 0) { $strings.Add([Text.Encoding]::ASCII.GetString($Packet, $at + 1, $length)) }
+                    $at += 1 + $length
+                }
+                $data = $strings.ToArray()
+            }
+            default {
+                $raw = [byte[]]::new($dataLength)
+                [Array]::Copy($Packet, $offset, $raw, 0, $dataLength)
+                $data = $raw
+            }
+        }
+        $offset += $dataLength
+        $records.Add([pscustomobject]@{
+            Name = $name; Type = $type; Class = ($class -band 0x7fff)
+            CacheFlush = (($class -band 0x8000) -ne 0); Ttl = $ttl; Data = $data
+        })
+    }
+    [pscustomobject]@{
+        Id = [int](Read-V9xBigEndian -Bytes $Packet -Offset 0 -Count 2)
+        IsResponse = (($Packet[2] -band 0x80) -ne 0)
+        Records = $records.ToArray()
+    }
+}
+
+# Folds the records of every reply (in arrival order) into one object per
+# advertised agent. A PTR with TTL 0 is a goodbye and removes the agent.
+# Replies are @{ Source = '<ip>'; Packet = <ConvertFrom-V9xMdnsPacket result> }.
+function ConvertTo-V9xDiscoveredAgents {
+    param([object[]]$Replies)
+    $instances = [ordered]@{}
+    $sources = @{}
+    $srv = @{}
+    $txt = @{}
+    $addresses = @{}
+    foreach ($reply in $Replies) {
+        foreach ($record in $reply.Packet.Records) {
+            $key = $record.Name.ToLowerInvariant()
+            if ($record.Type -eq 12 -and $key -eq $script:V9xMdnsService) {
+                $instance = [string]$record.Data
+                $instanceKey = $instance.ToLowerInvariant()
+                if ($record.Ttl -eq 0) {
+                    $instances.Remove($instanceKey)
+                } else {
+                    $instances[$instanceKey] = $instance
+                    $sources[$instanceKey] = $reply.Source
+                }
+            } elseif ($record.Type -eq 33) {
+                $srv[$key] = $record.Data
+            } elseif ($record.Type -eq 16) {
+                $txt[$key] = $record.Data
+            } elseif ($record.Type -eq 1 -and $record.Ttl -ne 0) {
+                $addresses[$key] = $record.Data
+            }
+        }
+    }
+    $agents = New-Object System.Collections.Generic.List[object]
+    foreach ($instanceKey in $instances.Keys) {
+        $instance = $instances[$instanceKey]
+        $fields = @{}
+        if ($txt.ContainsKey($instanceKey)) {
+            foreach ($entry in $txt[$instanceKey]) {
+                $split = $entry.IndexOf('=')
+                if ($split -gt 0) { $fields[$entry.Substring(0, $split)] = $entry.Substring($split + 1) }
+            }
+        }
+        $service = if ($srv.ContainsKey($instanceKey)) { $srv[$instanceKey] } else { $null }
+        $hostName = if ($null -ne $service) { $service.Target } else { '' }
+        $address = $sources[$instanceKey]
+        if ($hostName -and $addresses.ContainsKey($hostName.ToLowerInvariant())) {
+            $address = $addresses[$hostName.ToLowerInvariant()]
+        }
+        $suffix = '.' + $script:V9xMdnsService
+        $label = if ($instance.ToLowerInvariant().EndsWith($suffix)) {
+            $instance.Substring(0, $instance.Length - $suffix.Length)
+        } else { $instance }
+        $agents.Add([pscustomobject]@{
+            Instance = $label
+            InstallId = if ($fields.ContainsKey('id')) { $fields['id'] } else { '' }
+            Address = $address
+            Port = if ($null -ne $service) { $service.Port } else { 9869 }
+            HostName = $hostName
+            ComputerName = if ($fields.ContainsKey('name')) { $fields['name'] } else { '' }
+            AgentVersion = if ($fields.ContainsKey('ver')) { $fields['ver'] } else { '' }
+            BuildId = if ($fields.ContainsKey('build')) { $fields['build'] } else { '' }
+            WindowsVersion = if ($fields.ContainsKey('os')) { $fields['os'] } else { '' }
+            AllowDosVm = if ($fields.ContainsKey('dos')) { $fields['dos'] -eq '1' } else { $null }
+            RespondedFrom = $sources[$instanceKey]
+        })
+    }
+    return $agents.ToArray()
 }

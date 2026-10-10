@@ -1,4 +1,5 @@
 #include "agent.h"
+#include "platform_win.h"
 #include "v9xremote/crc32.h"
 #include "v9xremote/protocol.h"
 #include "v9xremote/status.h"
@@ -165,6 +166,7 @@ static SOCKET v9x_dl_connect(const char *host, unsigned short port,
         *native_error = WSAGetLastError();
         return INVALID_SOCKET;
     }
+    v9x_platform_no_inherit((HANDLE)handle);
     if (connect(handle, (struct sockaddr *)&address, sizeof(address)) ==
             SOCKET_ERROR) {
         *native_error = WSAGetLastError();
@@ -376,7 +378,7 @@ int v9x_handle_download(V9xConnection *conn, unsigned long request_id,
         unsigned long initial = header_length - body_start;
         body_total = initial;
         running_crc = v9x_crc32_update(running_crc, header + body_start, initial);
-        if (body_total > V9X_MAX_FILE_SIZE ||
+        if (body_total > V9X_MAX_DOWNLOAD_SIZE ||
             !WriteFile(file, header + body_start, initial, &written, 0) ||
             written != initial) {
             native_error = GetLastError();
@@ -387,7 +389,7 @@ int v9x_handle_download(V9xConnection *conn, unsigned long request_id,
     while (!failed) {
         received = recv(handle, (char *)chunk, (int)sizeof(chunk), 0);
         if (received <= 0) break;
-        if (body_total + (unsigned long)received > V9X_MAX_FILE_SIZE) {
+        if (body_total + (unsigned long)received > V9X_MAX_DOWNLOAD_SIZE) {
             native_error = ERROR_FILE_TOO_LARGE;
             failed = 1;
             break;

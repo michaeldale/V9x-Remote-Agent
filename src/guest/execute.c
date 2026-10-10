@@ -1,4 +1,5 @@
 #include "agent.h"
+#include "platform_win.h"
 #include "v9xremote/protocol.h"
 #include "v9xremote/status.h"
 
@@ -105,7 +106,8 @@ static int v9x_build_command_line(const V9xExecSlot *job, char *target,
     unsigned long offset = 0ul;
     target[0] = '\0';
     if (job->mode == V9X_EXEC_MODE_SHELL) {
-        return v9x_append_text(target, capacity, &offset, "COMMAND.COM /C ") &&
+        return v9x_append_text(target, capacity, &offset,
+                               v9x_platform_shell_prefix()) &&
                v9x_append_text(target, capacity, &offset, job->command);
     }
     if (v9x_contains_quote(job->application)) return 0;
@@ -123,13 +125,17 @@ static int v9x_build_command_line(const V9xExecSlot *job, char *target,
    flag to a GUI-subsystem executable deadlocks paint-driven test programs.
    Direct mode therefore reads the target's PE optional header and leaves a
    GUI child's initial window state to the application, matching START. */
-static int v9x_application_is_gui(const char *path)
+#define V9X_APP_OTHER 0   /* not a PE32 image: DOS, Win16, batch, missing */
+#define V9X_APP_CONSOLE 1
+#define V9X_APP_GUI 2
+
+static int v9x_application_kind(const char *path)
 {
     HANDLE file;
     unsigned char header[96];
     DWORD read_count = 0ul;
     unsigned long pe_offset;
-    int is_gui = 0;
+    int kind = V9X_APP_OTHER;
     file = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
                        0, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, 0);
     if (file == INVALID_HANDLE_VALUE) return 0;
@@ -143,11 +149,17 @@ static int v9x_application_is_gui(const char *path)
             header[2] == 0u && header[3] == 0u &&
             v9x_read_u16(header + 20) >= 70u &&
             v9x_read_u16(header + 24) == 0x010bu) {
-            is_gui = v9x_read_u16(header + 92) == 2u;
+            kind = v9x_read_u16(header + 92) == 2u ? V9X_APP_GUI
+                                                    : V9X_APP_CONSOLE;
         }
     }
     CloseHandle(file);
-    return is_gui;
+    return kind;
+}
+
+static int v9x_application_is_gui(const char *path)
+{
+    return v9x_application_kind(path) == V9X_APP_GUI;
 }
 
 /* Win9x has no PROC_THREAD_ATTRIBUTE handle lists, so inheritance is
@@ -468,6 +480,20 @@ unsigned long v9x_execution_prepare(V9xConnection *conn,
         InterlockedExchange(&slot->active, 0l);
         return V9X_STATUS_INVALID_PAYLOAD;
     }
+    /* With allow_dos_vm=0 on Win9x only Win32 GUI-subsystem executables may
+       run: COMMAND.COM, console-subsystem EXEs and DOS programs all make
+       Windows create a virtual machine, hidden or not. On NT CMD.EXE and
+       console EXEs are native Win32; only DOS and Win16 images start NTVDM,
+       so only a non-PE direct-mode target is refused there. */
+    if (!conn->machine->allow_dos_vm &&
+        (v9x_platform_is_nt() ?
+             (slot->mode == V9X_EXEC_MODE_DIRECT &&
+              v9x_application_kind(slot->application) == V9X_APP_OTHER) :
+             (slot->mode == V9X_EXEC_MODE_SHELL ||
+              !v9x_application_is_gui(slot->application)))) {
+        InterlockedExchange(&slot->active, 0l);
+        return V9X_STATUS_UNSUPPORTED_OPERATION;
+    }
     InterlockedExchange(&slot->cancel, 0l);
     slot->thread = CreateThread(0, 65536ul, v9x_execution_worker,
                                 slot, CREATE_SUSPENDED, &thread_id);
@@ -533,6 +559,17 @@ void v9x_execution_disconnect(V9xConnection *conn)
             slot->thread = 0;
         }
     }
+}
+
+/* 1 while any execution slot this connection started is still running. */
+int v9x_execution_owned(const V9xConnection *conn)
+{
+    unsigned long i;
+    for (i = 0ul; i < V9X_EXEC_POOL_SIZE; ++i) {
+        const V9xExecSlot *slot = &conn->machine->exec_pool[i];
+        if (slot->owner == conn && v9x_flag_read(&slot->active) != 0l) return 1;
+    }
+    return 0;
 }
 
 int v9x_execution_any_active(V9xAgentState *machine)

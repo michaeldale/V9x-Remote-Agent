@@ -73,9 +73,59 @@ void v9x_dos_load_config(V9xDos *dos)
                 ++i;
             }
             dos->allowed_client[i] = '\0';
+        } else if (v9x_key_matches(trimmed, "install_id")) {
+            const char *value = v9x_value_of(trimmed);
+            if (v9x_id_valid(value)) {
+                unsigned long i;
+                for (i = 0ul; i < V9X_INSTALL_ID_SIZE; ++i) {
+                    dos->install_id[i] = (char)tolower((unsigned char)value[i]);
+                }
+            }
         }
     }
     fclose(file);
+}
+
+/* DOS has no random source either. The BIOS tick count, clock(), the time of
+   day, the boot counter and the stack address differ between machines and
+   boots; the 0040:006C tick is readable directly under DOS/4GW's flat map of
+   the first megabyte. */
+static void v9x_dos_generate_id(V9xDos *dos)
+{
+    V9xIdPool pool;
+    volatile unsigned long *bios_ticks = (volatile unsigned long *)0x46cul;
+    int round;
+    v9x_id_begin(&pool);
+    v9x_id_mix(&pool, (unsigned long)time(0));
+    v9x_id_mix(&pool, dos->boot_counter);
+    v9x_id_mix(&pool, (unsigned long)&pool);
+    for (round = 0; round < 8; ++round) {
+        v9x_id_mix(&pool, *bios_ticks);
+        v9x_id_mix(&pool, (unsigned long)clock());
+    }
+    v9x_id_finish(&pool, dos->install_id);
+}
+
+/* Called after v9x_dos_load_config: keeps the configured ID, or generates one
+   and appends it to AGENT.INI so it survives the next boot. */
+void v9x_dos_ensure_install_id(V9xDos *dos)
+{
+    FILE *file;
+    int existed;
+    if (v9x_id_valid(dos->install_id)) return;
+    v9x_dos_generate_id(dos);
+    file = fopen(V9X_DOS_CONFIG, "r");
+    existed = file != 0;
+    if (file != 0) fclose(file);
+    file = fopen(V9X_DOS_CONFIG, "a");
+    if (file == 0) {
+        v9x_log_event("install-id-unsaved", dos->install_id);
+        return;
+    }
+    if (!existed) fputs("[agent]\n", file);
+    fprintf(file, "\ninstall_id=%s\n", dos->install_id);
+    fclose(file);
+    v9x_log_event("install-id-created", dos->install_id);
 }
 
 unsigned long v9x_dos_increment_boot_counter(void)

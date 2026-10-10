@@ -8,14 +8,18 @@ cable. Do not expose TCP 9869 to the Internet or an untrusted LAN.
 
 ## Install and configure
 
-Copy the complete `build\install` package to the physical Windows 9x machine and run
-`INSTALL.BAT`. Edit `C:\V9XREMOTE\AGENT.INI` before the reboot:
+Copy the complete `build\install` package to the physical Windows 9x machine
+(or burn `V9XREMOTE.ISO`) and run `SETUP.EXE`. Its Options page sets the port,
+listen address, allowed client and LAN discovery, then it restarts Windows.
+Run `C:\V9XREMOTE\SETUP.EXE` later to change them. `INSTALL.BAT` still works
+without a window; with it, edit `C:\V9XREMOTE\AGENT.INI` before the reboot:
 
 ```ini
 [agent]
 port=9869
 bind_address=0.0.0.0
 allowed_client=192.168.10.20
+discovery=1
 log_level=info
 ```
 
@@ -31,8 +35,15 @@ address prevents the listener from starting and writes an error to
 `C:\V9XREMOTE\AGENT.LOG`. Existing configuration is preserved during agent
 updates.
 
-Use a stable address for both machines, either static configuration or a DHCP
-reservation. Reboot Windows after installation or configuration changes.
+- `discovery=1` advertises the agent over mDNS so the controller can find it
+  with `v9xctl discover` and address it by install ID (`-Id`), which keeps
+  working when DHCP hands the machine a new address. It also announces the
+  agent to everything else on the segment, which is one more reason for an
+  isolated network. `allowed_client` still applies to TCP connections.
+
+Without discovery, use a stable address for both machines, either static
+configuration or a DHCP reservation. Reboot Windows after installation or
+configuration changes.
 
 ## Connect from the controller
 

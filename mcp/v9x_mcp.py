@@ -18,7 +18,9 @@ import argparse
 import base64
 import json
 import os
+import random
 import re
+import select
 import socket
 import struct
 import sys
@@ -30,7 +32,7 @@ MAGIC = b"V9XR"
 HEADER = struct.Struct("<4sHHIIII")
 MAX_PAYLOAD = 65536
 CHUNK_SIZE = 32768
-MAX_FILE = 64 * 1024 * 1024
+MAX_FILE = 256 * 1024 * 1024
 DEFAULT_SCREENSHOT = "C:\\V9XREMOTE\\TEMP\\SCREEN.BMP"
 
 MSG_HELLO = 0x0001
@@ -72,6 +74,8 @@ MSG_SCREENSHOT = 0x0050
 MSG_SCREENSHOT_RESPONSE = 0x8050
 MSG_INPUT = 0x0060
 MSG_INPUT_RESPONSE = 0x8060
+MSG_INVENTORY = 0x0070
+MSG_INVENTORY_RESPONSE = 0x8070
 MSG_ERROR = 0x8FFF
 
 CAP_INFO = 0x0001
@@ -85,6 +89,15 @@ CAP_DRIVER_UPDATE = 0x0200
 CAP_INPUT = 0x0400
 CAP_EXEC_DETACH = 0x0800
 CAP_HTTP_DOWNLOAD = 0x1000
+CAP_INVENTORY = 0x2000
+CAP_INSTALL_ID = 0x4000
+CAP_INPUT_RELATIVE = 0x8000
+
+INFO_FLAG_EXTENDED = 0x0001
+
+MDNS_GROUP = "224.0.0.251"
+MDNS_PORT = 5353
+MDNS_SERVICE = "_v9xremote._tcp.local"
 
 INPUT_OP_MOUSE_MOVE = 1
 INPUT_OP_MOUSE_BUTTON = 2
@@ -92,6 +105,7 @@ INPUT_OP_MOUSE_WHEEL = 3
 INPUT_OP_KEY = 4
 INPUT_OP_TYPE = 5
 INPUT_OP_DELAY = 6
+INPUT_OP_MOUSE_MOVE_RELATIVE = 7
 
 BUTTONS = {"left": 0, "right": 1, "middle": 2}
 
@@ -173,7 +187,7 @@ def parse_string(payload, offset):
     return payload[offset : offset + length].decode("ascii"), offset + length
 
 
-def parse_desktop_block(payload, offset):
+def parse_desktop_block(payload, offset, install_id=False):
     values = {
         "pending_job": "",
         "desktop_ready": False,
@@ -197,6 +211,11 @@ def parse_desktop_block(payload, offset):
         values["listen_address"], offset = parse_string(payload, offset)
     if offset < len(payload):
         values["allowed_client"], offset = parse_string(payload, offset)
+    if install_id:
+        # Only an INFO reply to a request with INFO_FLAG_EXTENDED carries it.
+        values["install_id"] = ""
+        if offset < len(payload):
+            values["install_id"], offset = parse_string(payload, offset)
     if offset != len(payload):
         raise V9xError("response contains trailing data")
     return values
@@ -242,7 +261,7 @@ def parse_info(payload):
         "current_directory",
     ):
         strings[name], offset = parse_string(payload, offset)
-    values = parse_desktop_block(payload, offset)
+    values = parse_desktop_block(payload, offset, install_id=True)
     values.update(strings)
     values.update(
         {
@@ -255,6 +274,271 @@ def parse_info(payload):
         }
     )
     return values
+
+
+def parse_inventory(payload):
+    """INVENTORY_RESPONSE: u16 record count, then per record a type string,
+    a u16 field count and that many (key, value) string pairs. Returned as
+    [{"record": type, "fields": {key: value}}]; a key that repeats within a
+    record (e.g. several net "ip" fields) becomes a list of values."""
+    if len(payload) < 2:
+        raise V9xError("truncated INVENTORY response")
+    (count,) = struct.unpack_from("<H", payload, 0)
+    offset = 2
+    records = []
+    for _ in range(count):
+        record_type, offset = parse_string(payload, offset)
+        if offset + 2 > len(payload):
+            raise V9xError("truncated INVENTORY record")
+        (field_count,) = struct.unpack_from("<H", payload, offset)
+        offset += 2
+        fields = {}
+        for _ in range(field_count):
+            key, offset = parse_string(payload, offset)
+            value, offset = parse_string(payload, offset)
+            if key in fields:
+                if not isinstance(fields[key], list):
+                    fields[key] = [fields[key]]
+                fields[key].append(value)
+            else:
+                fields[key] = value
+        records.append({"record": record_type, "fields": fields})
+    if offset != len(payload):
+        raise V9xError("response contains trailing data")
+    return records
+
+
+# mDNS / DNS-SD discovery (RFC 6762, RFC 6763) --------------------------------
+# DNS is big-endian, unlike the V9XR frames. Mirrors src/common/mdns.c and
+# the PowerShell codec in scripts/V9xProtocol.ps1.
+
+
+def mdns_query(query_id, name=MDNS_SERVICE, qtype=12):
+    out = struct.pack(">HHHHHH", query_id & 0xFFFF, 0, 1, 0, 0, 0)
+    for label in name.rstrip(".").split("."):
+        raw = label.encode("ascii")
+        if not 1 <= len(raw) <= 63:
+            raise V9xError("invalid DNS label %r" % label)
+        out += bytes([len(raw)]) + raw
+    return out + b"\x00" + struct.pack(">HH", qtype, 1)
+
+
+def mdns_read_name(packet, offset):
+    """Decode a (possibly compressed) name; returns (name, offset after it)."""
+    labels = []
+    end = None
+    jumps = 0
+    while True:
+        if offset >= len(packet):
+            raise V9xError("truncated DNS name")
+        length = packet[offset]
+        if length == 0:
+            if end is None:
+                end = offset + 1
+            break
+        if length & 0xC0 == 0xC0:
+            jumps += 1
+            if offset + 1 >= len(packet) or jumps > 16:
+                raise V9xError("invalid DNS compression pointer")
+            if end is None:
+                end = offset + 2
+            offset = ((length & 0x3F) << 8) | packet[offset + 1]
+            continue
+        if length & 0xC0 or offset + 1 + length > len(packet):
+            raise V9xError("invalid DNS label")
+        labels.append(packet[offset + 1 : offset + 1 + length].decode("ascii", "replace"))
+        offset += 1 + length
+    return ".".join(labels), end
+
+
+def parse_mdns_packet(packet):
+    if len(packet) < 12:
+        raise V9xError("truncated DNS header")
+    query_id, flags, questions, answers, authority, additional = struct.unpack_from(
+        ">HHHHHH", packet, 0
+    )
+    offset = 12
+    for _ in range(questions):
+        _, offset = mdns_read_name(packet, offset)
+        offset += 4
+    records = []
+    for _ in range(answers + authority + additional):
+        name, offset = mdns_read_name(packet, offset)
+        if offset + 10 > len(packet):
+            raise V9xError("truncated DNS record")
+        rtype, rclass, ttl, length = struct.unpack_from(">HHIH", packet, offset)
+        offset += 10
+        if offset + length > len(packet):
+            raise V9xError("truncated DNS record data")
+        rdata = packet[offset : offset + length]
+        if rtype == 1:
+            if length != 4:
+                raise V9xError("invalid DNS A record")
+            data = socket.inet_ntoa(rdata)
+        elif rtype == 12:
+            data, _ = mdns_read_name(packet, offset)
+        elif rtype == 33:
+            if length < 7:
+                raise V9xError("invalid DNS SRV record")
+            priority, weight, port = struct.unpack_from(">HHH", packet, offset)
+            target, _ = mdns_read_name(packet, offset + 6)
+            data = {"priority": priority, "weight": weight, "port": port, "target": target}
+        elif rtype == 16:
+            data = []
+            at = 0
+            while at < length:
+                size = rdata[at]
+                if at + 1 + size > length:
+                    raise V9xError("invalid DNS TXT record")
+                if size:
+                    data.append(rdata[at + 1 : at + 1 + size].decode("ascii", "replace"))
+                at += 1 + size
+        else:
+            data = rdata.hex()
+        offset += length
+        records.append(
+            {
+                "name": name,
+                "type": rtype,
+                "class": rclass & 0x7FFF,
+                "cache_flush": bool(rclass & 0x8000),
+                "ttl": ttl,
+                "data": data,
+            }
+        )
+    return {"id": query_id, "is_response": bool(flags & 0x8000), "records": records}
+
+
+def fold_mdns_replies(replies):
+    """(source_ip, parsed packet) pairs in arrival order -> one dict per agent.
+    A service PTR with TTL 0 is a goodbye and removes the agent."""
+    instances = {}
+    sources = {}
+    srv = {}
+    txt = {}
+    addresses = {}
+    for source, packet in replies:
+        for record in packet["records"]:
+            key = record["name"].lower()
+            if record["type"] == 12 and key == MDNS_SERVICE:
+                instance_key = record["data"].lower()
+                if record["ttl"] == 0:
+                    instances.pop(instance_key, None)
+                else:
+                    instances[instance_key] = record["data"]
+                    sources[instance_key] = source
+            elif record["type"] == 33:
+                srv[key] = record["data"]
+            elif record["type"] == 16:
+                txt[key] = record["data"]
+            elif record["type"] == 1 and record["ttl"] != 0:
+                addresses[key] = record["data"]
+    agents = []
+    suffix = "." + MDNS_SERVICE
+    for instance_key, instance in instances.items():
+        fields = {}
+        for entry in txt.get(instance_key, []):
+            name, sep, value = entry.partition("=")
+            if sep and name:
+                fields[name] = value
+        service = srv.get(instance_key)
+        host_name = service["target"] if service else ""
+        address = addresses.get(host_name.lower(), sources[instance_key])
+        label = instance[: -len(suffix)] if instance.lower().endswith(suffix) else instance
+        agents.append(
+            {
+                "instance": label,
+                "install_id": fields.get("id", ""),
+                "address": address,
+                "port": service["port"] if service else 9869,
+                "host_name": host_name,
+                "computer_name": fields.get("name", ""),
+                "agent_version": fields.get("ver", ""),
+                "build_id": fields.get("build", ""),
+                "windows_version": fields.get("os", ""),
+                "allow_dos_vm": (fields["dos"] == "1") if "dos" in fields else None,
+                "responded_from": sources[instance_key],
+            }
+        )
+    return agents
+
+
+def local_ipv4_addresses():
+    """Best-effort list of this host's non-loopback IPv4 addresses (stdlib only)."""
+    found = []
+    try:
+        for entry in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
+            address = entry[4][0]
+            if not address.startswith("127.") and address not in found:
+                found.append(address)
+    except OSError:
+        pass
+    probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        probe.connect((MDNS_GROUP, MDNS_PORT))
+        address = probe.getsockname()[0]
+        if address not in found and not address.startswith(("127.", "0.")):
+            found.append(address)
+    except OSError:
+        pass
+    finally:
+        probe.close()
+    return found
+
+
+def discover_agents(seconds=3.0, target=None, install_id=None):
+    """One-shot mDNS query for _v9xremote._tcp.local from an ephemeral port, so
+    agents answer by unicast. Multicast on every IPv4 interface, or unicast to
+    target ("ip" or "ip:port"). Stops early once install_id has answered."""
+    query = mdns_query(random.randint(1, 0xFFFF))
+    sockets = []
+    replies = []
+    try:
+        if target:
+            host, _, port = target.partition(":")
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sockets.append(sock)
+            sock.sendto(query, (host, int(port) if port else MDNS_PORT))
+        else:
+            for address in local_ipv4_addresses() or ["0.0.0.0"]:
+                sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                try:
+                    sock.bind((address, 0))
+                    if address != "0.0.0.0":
+                        sock.setsockopt(
+                            socket.IPPROTO_IP, socket.IP_MULTICAST_IF, socket.inet_aton(address)
+                        )
+                    sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 255)
+                    sock.sendto(query, (MDNS_GROUP, MDNS_PORT))
+                    sockets.append(sock)
+                except OSError:
+                    sock.close()
+            if not sockets:
+                raise V9xError("no IPv4 interface could send the discovery query")
+        deadline = time.monotonic() + seconds
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            readable, _, _ = select.select(sockets, [], [], min(remaining, 0.2))
+            for sock in readable:
+                try:
+                    data, (source, _port) = sock.recvfrom(9000)
+                    packet = parse_mdns_packet(data)
+                except (OSError, V9xError):
+                    continue
+                if not packet["is_response"]:
+                    continue
+                replies.append((source, packet))
+                if install_id and any(
+                    agent["install_id"].lower() == install_id.lower()
+                    for agent in fold_mdns_replies(replies)
+                ):
+                    deadline = 0
+    finally:
+        for sock in sockets:
+            sock.close()
+    return fold_mdns_replies(replies)
 
 
 def bmp_to_png(data):
@@ -406,9 +690,20 @@ class V9xClient:
     def info(self):
         self.require(CAP_INFO, "information")
         self.next_id()
-        self.send(MSG_INFO)
+        # INSTALL_ID agents take a flags word; older ones require an empty body.
+        if self.hello["capabilities"] & CAP_INSTALL_ID:
+            self.send(MSG_INFO, struct.pack("<I", INFO_FLAG_EXTENDED))
+        else:
+            self.send(MSG_INFO)
         _, _, _, payload = self.expect((MSG_INFO_RESPONSE,))
         return parse_info(payload)
+
+    def inventory(self):
+        self.require(CAP_INVENTORY, "inventory")
+        self.next_id()
+        self.send(MSG_INVENTORY)
+        _, _, _, payload = self.expect((MSG_INVENTORY_RESPONSE,))
+        return parse_inventory(payload)
 
     def execute(
         self,
@@ -533,7 +828,7 @@ class V9xClient:
     def put_bytes(self, data, guest_path):
         self.require(CAP_FILE_WRITE, "file-write")
         if len(data) > MAX_FILE:
-            raise V9xError("file exceeds the 64 MiB protocol limit")
+            raise V9xError("file exceeds the 256 MiB protocol limit")
         crc = zlib.crc32(data) & 0xFFFFFFFF
         self.next_id()
         self.send(
@@ -656,6 +951,10 @@ class V9xClient:
             op = action["op"]
             if op == "move":
                 payload += struct.pack("<Bii", INPUT_OP_MOUSE_MOVE, int(action["x"]), int(action["y"]))
+            elif op == "moverel":
+                payload += struct.pack(
+                    "<Bii", INPUT_OP_MOUSE_MOVE_RELATIVE, int(action["dx"]), int(action["dy"])
+                )
             elif op == "button":
                 payload += struct.pack(
                     "<BBB", INPUT_OP_MOUSE_BUTTON, int(action["button"]),
@@ -709,7 +1008,7 @@ class V9xClient:
         return boot
 
 
-def wait_for_update(host, port, old_boot, wait_seconds):
+def wait_for_update(host, port, old_boot, wait_seconds, resolve=None):
     deadline = time.monotonic() + wait_seconds
     last_error = "no connection attempt succeeded"
     while time.monotonic() < deadline:
@@ -718,6 +1017,8 @@ def wait_for_update(host, port, old_boot, wait_seconds):
             candidate = V9xClient(host, port, timeout=3.0)
         except (OSError, V9xError) as exc:
             last_error = str(exc)
+            if resolve is not None:
+                host, port = resolve(host, port)
             continue
         try:
             hello = candidate.hello
@@ -734,7 +1035,7 @@ def wait_for_update(host, port, old_boot, wait_seconds):
     )
 
 
-def wait_for_reboot(host, port, old_boot, job_id, wait_seconds):
+def wait_for_reboot(host, port, old_boot, job_id, wait_seconds, resolve=None):
     deadline = time.monotonic() + wait_seconds
     last_error = "no connection attempt succeeded"
     while time.monotonic() < deadline:
@@ -743,6 +1044,9 @@ def wait_for_reboot(host, port, old_boot, job_id, wait_seconds):
             candidate = V9xClient(host, port, timeout=3.0)
         except (OSError, V9xError) as exc:
             last_error = str(exc)
+            # With --id the guest may come back on a new address (DHCP).
+            if resolve is not None:
+                host, port = resolve(host, port)
             continue
         try:
             hello = candidate.hello
@@ -787,6 +1091,18 @@ def guest_path_schema(description):
 
 TOOLS = [
     {
+        "name": "v9x_discover",
+        "description": "Find V9x agents on the LAN by mDNS/DNS-SD (agent 0.8.0+ with discovery=1): instance name, address, port, version and install ID of each. Opens no agent connection. Needs a network the host shares with the guests (bridged or physical, not SLiRP NAT).",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "seconds": {"type": "number", "description": "How long to listen for answers (default 3, max 30)."},
+                "query_address": {"type": "string", "description": "Send the query unicast to this ip[:port] instead of multicasting it."},
+            },
+            "additionalProperties": False,
+        },
+    },
+    {
         "name": "v9x_ping",
         "description": "Check that the Windows 9x guest agent is alive; returns uptime and the agent-start counter (not reboot proof by itself).",
         "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
@@ -797,8 +1113,13 @@ TOOLS = [
         "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
     },
     {
+        "name": "v9x_inventory",
+        "description": "Hardware/software inventory (agent 0.7.0+): OS product/build, CPU, memory, drives, display adapter, IPs, BIOS and the PnP device list, as typed records of key/value fields.",
+        "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
+    },
+    {
         "name": "v9x_exec",
-        "description": "Run a Win32 executable directly in the guest with bounded captured stdout/stderr. Use v9x_shell for COMMAND.COM built-ins and batch files.",
+        "description": "Run a Win32 executable directly in the guest with bounded captured stdout/stderr. Use v9x_shell for shell built-ins and batch files.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -815,7 +1136,7 @@ TOOLS = [
     },
     {
         "name": "v9x_shell",
-        "description": "Run a command through COMMAND.COM /C in the guest (DIR, COPY, batch files, VER...).",
+        "description": "Run a command through COMMAND.COM /C in the guest (CMD.EXE /C on Windows 2000): DIR, COPY, batch files, VER...",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -829,7 +1150,7 @@ TOOLS = [
     },
     {
         "name": "v9x_put_file",
-        "description": "Upload a local file into the guest, CRC32-verified and transactional (64 MiB max).",
+        "description": "Upload a local file into the guest, CRC32-verified and transactional (256 MiB max).",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -912,12 +1233,13 @@ TOOLS = [
     },
     {
         "name": "v9x_move",
-        "description": "Move the mouse cursor to absolute screen coordinates in the guest.",
+        "description": "Move the mouse cursor to absolute screen coordinates in the guest, or with relative=true by x,y pixels as real mouse motion (for games that read deltas and recentre the cursor; agent 0.8.1+).",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "x": {"type": "integer"},
                 "y": {"type": "integer"},
+                "relative": {"type": "boolean"},
             },
             "required": ["x", "y"],
             "additionalProperties": False,
@@ -982,7 +1304,7 @@ TOOLS = [
     },
     {
         "name": "v9x_download",
-        "description": "Have the guest fetch an http:// URL straight to a guest path over its own network connection (no host round-trip). HTTP only; https is rejected. Verified and written transactionally (64 MiB max).",
+        "description": "Have the guest fetch an http:// URL straight to a guest path over its own network connection (no host round-trip). HTTP only; https is rejected. Verified and written transactionally (2 GiB max on agent 0.8.1+, 256 MiB before).",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -995,7 +1317,7 @@ TOOLS = [
     },
     {
         "name": "v9x_update",
-        "description": "Upgrade the guest agent WITHOUT a reboot from a local install package folder (must contain V9XAGNT.EXE and V9XSHOT.EXE). Uploads and CRC-verifies the new binaries, hot-swaps them, and waits for the agent to relaunch with a new boot counter.",
+        "description": "Upgrade the guest agent WITHOUT a reboot from a local install package folder (must contain V9XAGNT.EXE and V9XSHOT.EXE). Uploads and CRC-verifies the new binaries, hot-swaps them, and waits for the agent to relaunch with a new boot counter. Agents before 0.6.0 cannot hot-update and are refused before anything is uploaded; upgrade those once with v9xctl update, which stages it with a reboot.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -1044,19 +1366,66 @@ TOOLS = [
 
 
 class ToolHandler:
-    def __init__(self, host, port, timeout):
+    def __init__(self, host, port, timeout, install_id=None, query_address=None,
+                 discover_seconds=3.0, allow_remote=False):
         self.host = host
         self.port = port
         self.timeout = timeout
+        self.install_id = install_id
+        self.query_address = query_address
+        self.discover_seconds = discover_seconds
+        self.allow_remote = allow_remote
+        self.resolved = False
+
+    def resolve(self):
+        """--id: find the agent by install ID and adopt its address. The
+        loopback guard applies to whatever address discovery returns."""
+        matches = [
+            agent
+            for agent in discover_agents(
+                self.discover_seconds, self.query_address, self.install_id
+            )
+            if agent["install_id"].lower() == self.install_id.lower()
+        ]
+        if not matches:
+            raise V9xError(
+                "no agent with install ID %s answered discovery within %g s; it needs "
+                "discovery=1 in AGENT.INI and a LAN shared with this host"
+                % (self.install_id, self.discover_seconds)
+            )
+        address = matches[-1]["address"]
+        if not is_loopback(address) and not self.allow_remote:
+            raise V9xError(
+                "install ID %s resolved to non-loopback %s; pass --allow-remote "
+                "(the guest protocol is unauthenticated)" % (self.install_id, address)
+            )
+        self.host, self.port = address, matches[-1]["port"]
+        self.resolved = True
+        return self.host, self.port
+
+    def reresolve(self, host, port):
+        try:
+            return self.resolve()
+        except (OSError, V9xError):
+            return host, port
 
     def connect(self):
+        if self.install_id and not self.resolved:
+            self.resolve()
         try:
             return V9xClient(self.host, self.port, timeout=self.timeout)
         except OSError as exc:
-            raise V9xError(
-                "cannot reach the guest agent at %s:%d (%s); is the VM running "
-                "and the port forwarded?" % (self.host, self.port, exc)
-            )
+            error = exc
+        if self.install_id:
+            self.resolve()
+            try:
+                return V9xClient(self.host, self.port, timeout=self.timeout)
+            except OSError as exc:
+                error = exc
+        raise V9xError(
+            "cannot reach the guest agent at %s:%d (%s); is the VM running "
+            "and the port forwarded?" % (self.host, self.port, error)
+        )
 
     def call(self, name, args):
         method = getattr(self, name, None)
@@ -1068,6 +1437,13 @@ class ToolHandler:
     def text(value):
         return [{"type": "text", "text": json.dumps(value, indent=1)}]
 
+    def v9x_discover(self, args):
+        seconds = float(args.get("seconds", self.discover_seconds))
+        if not 0 < seconds <= 30:
+            raise V9xError("seconds must be between 0 and 30")
+        target = args.get("query_address") or self.query_address
+        return self.text({"agents": discover_agents(seconds, target)})
+
     def v9x_ping(self, _args):
         with self.connect() as client:
             return self.text(client.ping())
@@ -1075,6 +1451,10 @@ class ToolHandler:
     def v9x_info(self, _args):
         with self.connect() as client:
             return self.text(client.info())
+
+    def v9x_inventory(self, _args):
+        with self.connect() as client:
+            return self.text(client.inventory())
 
     def v9x_exec(self, args):
         with self.connect() as client:
@@ -1180,9 +1560,12 @@ class ToolHandler:
 
     def v9x_move(self, args):
         with self.connect() as client:
-            return self.text(
-                client.send_input([{"op": "move", "x": args["x"], "y": args["y"]}])
-            )
+            if args.get("relative"):
+                client.require(CAP_INPUT_RELATIVE, "relative mouse moves")
+                action = {"op": "moverel", "dx": args["x"], "dy": args["y"]}
+            else:
+                action = {"op": "move", "x": args["x"], "y": args["y"]}
+            return self.text(client.send_input([action]))
 
     def v9x_type(self, args):
         with self.connect() as client:
@@ -1256,10 +1639,27 @@ class ToolHandler:
         with self.connect() as client:
             old_boot = client.hello["boot_counter"]
             old_build = client.hello["build_id"]
+            # Hot update arrived in 0.6.0, but 0.5.x already sets its capability
+            # bit (0x0200) and answers UPDATE with UNSUPPORTED_OPERATION, so
+            # check the version before uploading anything.
+            version = client.info().get("agent_version", "")
+            try:
+                too_old = tuple(int(part) for part in version.split(".")[:3]) < (0, 6, 0)
+            except ValueError:
+                too_old = False
+            if too_old:
+                raise V9xError(
+                    "agent %s predates hot update (0.6.0); upgrade it once with "
+                    "'scripts\\v9xctl.ps1 update -Source <package>', which stages "
+                    "the update and reboots, then this tool works" % version
+                )
             client.put_bytes(agent_data, "C:\\V9XREMOTE\\V9XNEW.EXE")
             client.put_bytes(helper_data, "C:\\V9XREMOTE\\V9XSNEW.EXE")
             client.update_apply(len(agent_data), agent_crc, len(helper_data), helper_crc)
-        hello = wait_for_update(self.host, self.port, old_boot, wait_seconds)
+        hello = wait_for_update(
+            self.host, self.port, old_boot, wait_seconds,
+            self.reresolve if self.install_id else None,
+        )
         return self.text(
             {
                 "updated": True,
@@ -1277,7 +1677,10 @@ class ToolHandler:
         with self.connect() as client:
             old_boot = client.hello["boot_counter"]
             client.power(MSG_REBOOT, MSG_REBOOT_ACCEPTED, job_id)
-        hello = wait_for_reboot(self.host, self.port, old_boot, job_id, wait_seconds)
+        hello = wait_for_reboot(
+            self.host, self.port, old_boot, job_id, wait_seconds,
+            self.reresolve if self.install_id else None,
+        )
         return self.text(
             {
                 "rebooted": True,
@@ -1409,7 +1812,20 @@ def main(argv=None):
         action="store_true",
         help="permit a non-loopback --host (the protocol is unauthenticated; know what you are doing)",
     )
+    parser.add_argument(
+        "--id",
+        help="find the guest by install ID over mDNS instead of --host/--port, and "
+        "again after it reboots onto a new address",
+    )
+    parser.add_argument("--query-address", help="send discovery queries unicast to ip[:port]")
+    parser.add_argument(
+        "--discover-seconds", type=float, default=3.0, help="discovery listen time (default 3)"
+    )
     args = parser.parse_args(argv)
+    if args.id and not re.match(
+        r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$", args.id
+    ):
+        parser.error("--id must be an install ID (8-4-4-4-12 hex)")
     if not is_loopback(args.host) and not args.allow_remote:
         parser.error(
             "refusing non-loopback host '%s' without --allow-remote; the guest "
@@ -1420,7 +1836,17 @@ def main(argv=None):
         "unauthenticated, keep the port loopback-only\n" % (args.host, args.port)
     )
     sys.stderr.flush()
-    McpServer(ToolHandler(args.host, args.port, args.timeout)).run()
+    McpServer(
+        ToolHandler(
+            args.host,
+            args.port,
+            args.timeout,
+            install_id=args.id,
+            query_address=args.query_address,
+            discover_seconds=args.discover_seconds,
+            allow_remote=args.allow_remote,
+        )
+    ).run()
 
 
 if __name__ == "__main__":

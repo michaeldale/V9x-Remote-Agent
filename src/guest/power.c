@@ -1,4 +1,5 @@
 #include "agent.h"
+#include "platform_win.h"
 #include "v9xremote/protocol.h"
 #include "v9xremote/status.h"
 
@@ -100,6 +101,12 @@ int v9x_handle_power_message(V9xConnection *conn, unsigned short type,
         return v9x_power_error(conn, request_id, V9X_STATUS_INVALID_PAYLOAD,
                                ERROR_INVALID_PARAMETER, "invalid resume token");
     }
+    /* No-op on Win9x. On NT, refuse here rather than accept a reboot that
+       ExitWindowsEx would then decline. */
+    if (!v9x_platform_enable_shutdown()) {
+        return v9x_power_error(conn, request_id, V9X_STATUS_ACCESS_DENIED,
+                               GetLastError(), "shutdown privilege unavailable");
+    }
     if (!v9x_persist_job(job, &native_error)) {
         return v9x_power_error(conn, request_id, V9X_STATUS_IO_FAILED,
                                native_error, "resume token persistence failed");
@@ -120,11 +127,19 @@ int v9x_handle_power_message(V9xConnection *conn, unsigned short type,
         v9x_log_event("reboot-accepted", job);
     } else {
         response_type = V9X_MSG_SHUTDOWN_ACCEPTED;
-        flags = EWX_SHUTDOWN | EWX_POWEROFF | EWX_FORCE;
-        v9x_log_event("shutdown-accepted", job);
+        if (v9x_platform_can_power_off()) {
+            flags = EWX_SHUTDOWN | EWX_POWEROFF | EWX_FORCE;
+            v9x_log_event("shutdown-accepted", job);
+        } else {
+            /* NT without soft-off: EWX_POWEROFF would reboot instead. Halt
+               at "It is now safe to turn off your computer". */
+            flags = EWX_SHUTDOWN | EWX_FORCE;
+            v9x_log_event("shutdown-accepted-halt", job);
+        }
     }
     if (!v9x_send_frame(conn, response_type, request_id,
                         conn->power_response, offset)) return 0;
+    v9x_mdns_goodbye();
     Sleep(250ul);
     if (!ExitWindowsEx(flags, 0ul)) {
         v9x_log_line("power-request-failed");
