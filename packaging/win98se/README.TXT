@@ -22,6 +22,12 @@ RunServices, so the agent starts from the Run key when a user logs on: set
 up automatic logon so it starts unattended. Shell commands run through
 CMD.EXE /C there instead of COMMAND.COM /C.
 
+Version 0.10.0 adds V9XVNC.EXE, a VNC server so a person can watch and
+drive this machine with any VNC viewer (TCP port 5900). It is OFF unless
+you tick "Enable VNC remote control" in SETUP.EXE (or run SETUP.EXE /S /vnc);
+it then starts at every logon. An optional VNC password (up to 8 characters)
+keeps casual viewers out; it is weak, and the agent itself has none.
+
 INSTALL
 1. Run SETUP.EXE (AutoPlay starts it from the CD). Choose the settings,
    click Install, and let it restart Windows.

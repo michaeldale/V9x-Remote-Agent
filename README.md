@@ -2,8 +2,9 @@
 
 Remote control for Windows 9x development guests, built for AI-driven
 development and debugging. A small (about 500 KB) runtime-free agent runs
-inside Windows 95/98/Me, and since 0.9.0 Windows 2000 (typically an 86Box
-VM). A PowerShell CLI and an MCP server on the
+inside Windows 95/98/Me or Windows 2000 (typically an 86Box VM, or real
+retro hardware), and a cut-down build runs under DOS. A PowerShell CLI and
+an MCP server on the
 host let a developer, or an AI coding agent working on their behalf, build
 software on a modern machine, push it into the guest, run it, capture output
 and screenshots, and run a verified reboot workflow with reconnect, persisted
@@ -33,10 +34,18 @@ clean reboot without a human touching the emulator.
 - Verified reboot workflow: require disconnect/reconnect, the exact persisted
   resume token, a changed agent-start counter, and desktop readiness. The
   counter alone is not machine-reboot proof.
+- `reset` for Windows 9x machines whose restart hangs in real mode (a
+  resident NDIS2 network stack, for one): flushes the registry and disks,
+  then resets the hardware through port CF9h, with the same proof as reboot
 - Desktop-ready polling and 24-bit BMP screenshot capture
 - Mouse and keyboard injection (move, click, drag, wheel, hotkeys, typed text,
   relative motion for games) so an agent can drive dialogs and installers the
   UI only exposes visually
+- Optional live remote control for a person: `V9XVNC.EXE`, a small VNC (RFB)
+  server, off unless enabled in SETUP.EXE, so any VNC viewer can watch the
+  screen and drive the keyboard and mouse. On Windows 2000 it runs as a
+  service and follows the Winlogon desktop, so the lock and logon screens are
+  visible too ([docs/guest-agent.md](docs/guest-agent.md))
 - Hardware and OS inventory in one call: OS build, CPU, memory, drives,
   active display adapter and mode, IPs, BIOS, and loaded PnP devices
 - Agent upgrades from the host with `v9xctl update`: a hot swap with no
@@ -55,6 +64,24 @@ clean reboot without a human touching the emulator.
   dependencies
 - Optional IPv4 binding, port, and client allowlist for real retro hardware
   on an isolated network ([docs/physical-machine.md](docs/physical-machine.md))
+- Idle connections are dropped after `idle_timeout` seconds (default 300), so
+  a host that vanished without closing its socket no longer holds a slot
+- Self-repair of an `AGENT.INI` saved with LF-only line ends, and a `put`
+  warning when an `.INI`, `.BAT`, `.REG` or similar Windows text file is sent
+  with LF-only line ends
+
+## Supported guests
+
+| Guest | Agent | Notes |
+|---|---|---|
+| Windows 95, 98, 98 SE, Me | `V9XAGNT.EXE` | The primary target. Starts from `RunServices` before anyone logs on. Every verb, including `reset`. |
+| Windows 2000 | `V9XAGNT.EXE` (same binary) | Since 0.9.0. Starts from `HKLM\...\Run` at logon, so pair it with autologon. Install with `SETUP.EXE` as an administrator. `shell` runs `CMD.EXE /C`; reboot and shutdown take `SeShutdownPrivilege`; `inventory` reads the NT registry and Configuration Manager. `reset` is Windows 9x only. |
+| DOS | `V9XAGNT.EXE` (separate DOS/4GW build) | Exec and file transfer only; see below. |
+
+The Windows 9x and Windows 2000 agent is one executable with one audited
+import table: every difference is chosen at run time from `GetVersion()`,
+and the NT-only calls are resolved with `GetProcAddress`. Windows NT 4.0 and
+Windows XP are untested.
 
 ## DOS build
 
@@ -70,11 +97,11 @@ Build with `scripts\build-guest-dos.ps1`; see [docs/dos-agent.md](docs/dos-agent
 | You have | Start here |
 |---|---|
 | Nothing set up yet | [docs/quickstart-86box.md](docs/quickstart-86box.md): 86Box + your own Windows 98 media + the install ISO |
-| A working Win98 VM in 86Box | Three steps below |
+| A working Win98 or Win2000 VM in 86Box | Three steps below |
 | An AI coding agent to hook up | [AGENTS.md](AGENTS.md) and [mcp/README.md](mcp/README.md) |
 | Open Watcom and curiosity | The Build section below |
 
-### I already have a Windows 98 VM
+### I already have a Windows 98 or Windows 2000 VM
 
 1. Give the VM an NE2000 PnP NIC on SLiRP and forward TCP 9869, by adding to
    the profile's `86box.cfg` (while 86Box is closed):
@@ -94,7 +121,8 @@ Build with `scripts\build-guest-dos.ps1`; see [docs/dos-agent.md](docs/dos-agent
    `.\scripts\make-install-media.ps1`), attach it as a CD image in 86Box,
    then in the guest run `D:\SETUP.EXE` (AutoPlay starts it) and let it
    restart Windows. `D:\INSTALL.BAT` does the same without a window
-   (Windows 9x only; on Windows 2000 use `SETUP.EXE` as an administrator).
+   (Windows 9x only; on Windows 2000 use `SETUP.EXE` as an administrator,
+   and turn on autologon, because there the agent starts at logon).
 
 3. From the host:
 
@@ -124,6 +152,11 @@ version, port, and IP address:
 
 ![Agent tray icon: green while active, and its tooltip showing version, port and IP](docs/images/tray-icon.png)
 
+Right-click the icon for **Settings...** (or double-click it) to change the
+same options as setup: LAN discovery, DOS programs, port, listen address,
+allowed client and VNC. Saving restarts the agent so they apply at once, with
+no reboot. **Restart agent** on the same menu just restarts it.
+
 *All three were captured by the agent itself (`v9xctl screenshot`), with
 `v9xctl input` clicking through the wizard.*
 
@@ -150,6 +183,7 @@ version, port, and IP address:
 .\scripts\v9xctl.ps1 get -Source C:\V9XREMOTE\AGENT.LOG -Destination .\agent.log
 .\scripts\v9xctl.ps1 push-tree -Source .\package -Destination C:\V9XREMOTE\JOBS\demo
 .\scripts\v9xctl.ps1 reboot -JobId demo-reboot -WaitSeconds 180 -Json
+.\scripts\v9xctl.ps1 reset -JobId demo-reset -WaitSeconds 180 -Json
 .\scripts\v9xctl.ps1 wait-desktop -WaitSeconds 120
 .\scripts\v9xctl.ps1 screenshot -Destination .\desktop.bmp -Json
 .\scripts\v9xctl.ps1 input -Sequence "move 80,486; click left; type notepad; key ENTER"
@@ -176,7 +210,10 @@ agent itself runs and answers before anyone logs on, but `screenshot` and
 `wait-desktop` need Explorer, so an unattended run stalls at its first
 `wait-desktop` while `ping` keeps succeeding. `set-autologon.ps1` reports and
 fixes that; `capture-emulator-window.ps1` lets you see a screen the in-guest
-capture path cannot reach.
+capture path cannot reach. `set-autologon.ps1` handles the Windows 9x rules
+only. A Windows 2000 guest needs autologon for a different reason (the agent
+itself does not start until someone logs on); set it with the usual
+`Winlogon` `AutoAdminLogon`, `DefaultUserName` and `DefaultPassword` values.
 
 ## Build
 
@@ -220,15 +257,30 @@ isolated development network. Details in [SECURITY.md](SECURITY.md).
 - [docs/protocol.md](docs/protocol.md): the wire protocol
 - [docs/physical-machine.md](docs/physical-machine.md): real retro hardware
 - [docs/dos-agent.md](docs/dos-agent.md): the DOS build
+- [docs/remote-help.md](docs/remote-help.md): self-update and opt-in remote
+  help (lending a machine to the developer over the Internet)
 - [docs/design.md](docs/design.md): the original staged design document
 - [CHANGELOG.md](CHANGELOG.md)
 
 Working notes, newest first:
 
+- [docs/decisions/2026-10-20-remote-help-relay.md](docs/decisions/2026-10-20-remote-help-relay.md):
+  remote help as an opaque byte relay through the update server, with every
+  command chunk Ed25519-signed on the developer's PC; why not server-side
+  verbs or a plain machine secret
+- [docs/decisions/2026-10-15-vnc-remote-control.md](docs/decisions/2026-10-15-vnc-remote-control.md):
+  live remote control through `V9XVNC.EXE`, a separate RFB (VNC) server
+  helper, instead of an off-the-shelf server or a v9x-protocol stream; the
+  phased plan and the phase 1 test results
+- [docs/issues/2026-10-12-install-id-changes-every-boot.md](docs/issues/2026-10-12-install-id-changes-every-boot.md):
+  an LF-only `AGENT.INI` made Windows 9x append a new `install_id` on every
+  start; the 0.10.0 repair and the cleanup for an affected machine.
+- [docs/decisions/2026-10-12-reset-without-real-mode.md](docs/decisions/2026-10-12-reset-without-real-mode.md):
+  the `reset` verb: ring-3 port access to CF9h, the volume-lock flush, and why
+  it uses CF9h's full reset with no fallback.
 - [docs/decisions/2026-10-01-mdns-discovery-and-install-id.md](docs/decisions/2026-10-01-mdns-discovery-and-install-id.md):
   SETUP.EXE, LAN discovery over standard mDNS/DNS-SD, and the install ID that
   identifies a machine across address changes
-
 - [docs/decisions/2026-09-25-no-dos-vm-guests.md](docs/decisions/2026-09-25-no-dos-vm-guests.md):
   `allow_dos_vm=0` and the native hot swap, for guests whose display driver
   corrupts the screen when a DOS VM starts
@@ -244,7 +296,8 @@ Working notes, newest first:
 ## Windows licensing
 
 This project contains and distributes no Microsoft software. You must supply
-your own Windows 95/98/Me installation media and license for the guest.
+your own Windows 95/98/Me or Windows 2000 installation media and license for
+the guest.
 
 ## License
 

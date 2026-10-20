@@ -206,9 +206,10 @@ responsive while execution workers are active.
 ## Files
 
 Protocol v1 file paths are non-empty length-prefixed ASCII strings. Individual
-files are limited to 268,435,456 bytes (256 MiB; 64 MiB before agent 0.6.4)
-and data chunks to 32,768 bytes. A guest `DOWNLOAD` is held to 2 GiB instead
-(agent 0.8.1+), since it streams straight to the guest disk.
+files are limited to 2,147,483,647 bytes (2 GiB - 1; 256 MiB before agent
+0.11.0, 64 MiB before 0.6.4) and data chunks to 32,768 bytes. A guest
+`DOWNLOAD` has the same 2 GiB limit (agent 0.8.1+). The ceiling keeps every
+size inside a signed 32-bit file length.
 
 - `FILE_STAT_REQUEST` (`0x0020`) carries a path. Its 16-byte response contains
   existence and directory bytes, reserved u16, size, attributes, and native
@@ -256,6 +257,17 @@ native-error field and leaves any existing destination untouched.
 ASCII resume token of at most 63 bytes. Before acknowledging, the guest flushes
 the token to `C:\V9XREMOTE\PENDING.DAT`. The corresponding accepted response
 (`0x8040` or `0x8041`) contains the current boot counter and echoed token.
+
+`RESET_REQUEST` (`0x0043`, capability `V9X_CAP_HARD_RESET` `0x00010000`, agent
+0.10.0+) takes the same token and answers `RESET_ACCEPTED` (`0x8043`) with the
+same payload, then resets the machine without Windows' restart: it sends
+`WM_ENDSESSION` to other processes' top-level windows, flushes the registry,
+takes a level-1 volume lock on each fixed drive (which commits the disk cache
+and leaves the FAT clean), stops writing `AGENT.LOG`, waits 3 s for the
+drive's write cache, and starts a full reset by writing `0Ah`, then `0Eh` to
+port `CF9h`. If the machine is still running 8 s later the guest releases
+the locks, logs `reset-failed` and carries on. Windows 9x only: NT agents clear the capability bit and answer
+`UNSUPPORTED_OPERATION`. The host proves the reset exactly as a reboot.
 
 The boot counter advances whenever the agent starts and is not reboot proof by
 itself. For reboot, the host requires disconnect/reconnect to a fresh HELLO

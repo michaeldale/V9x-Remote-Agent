@@ -47,11 +47,21 @@ $privateName = -join ([char[]](109, 105, 99, 104, 97, 101, 108))
 $privateWorkspace = -join ([char[]](67, 58, 92, 101, 118, 101, 114, 121, 116, 104, 105, 110, 103))
 $privateProfileRoot = -join ([char[]](67, 58, 92, 85, 115, 101, 114, 115, 92))
 $privatePatterns = @($privateWorkspace, $privateProfileRoot, $privateName)
+# The update and remote-help server's host name is public (the agent has to
+# know it) and happens to contain the name, so that exact host is removed
+# from each line before matching; the name anywhere else still blocks.
+$publicServerHost = -join ([char[]](109, 105, 99, 104, 97, 101, 108, 100, 97, 108, 101, 46, 99, 111, 109, 46, 97, 117))
 $textFiles = Get-ChildItem -LiteralPath $MirrorDir -Recurse -File |
     Where-Object { $_.FullName -notmatch '\\\.git\\' -and $_.Extension -notin @('.png', '.bmp', '.iso', '.exe', '.zip') }
 foreach ($file in $textFiles) {
     $matches2 = Select-String -LiteralPath $file.FullName -Pattern $privatePatterns -SimpleMatch -AllMatches -ErrorAction SilentlyContinue
     foreach ($hit in $matches2) {
+        $scrubbed = $hit.Line -ireplace [regex]::Escape($publicServerHost), ''
+        $stillPrivate = $false
+        foreach ($pattern in $privatePatterns) {
+            if ($scrubbed.IndexOf($pattern, [StringComparison]::OrdinalIgnoreCase) -ge 0) { $stillPrivate = $true }
+        }
+        if (-not $stillPrivate) { continue }
         $violations += "{0}:{1}: {2}" -f $file.FullName.Substring($MirrorDir.Length + 1), $hit.LineNumber, $hit.Line.Trim()
     }
 }

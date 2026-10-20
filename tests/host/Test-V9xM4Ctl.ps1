@@ -18,11 +18,12 @@ $server = Start-Job -ArgumentList $port, $protocolScript, $resumeToken -ScriptBl
     . $ProtocolScript
 
     function Send-Hello($Stream, [uint32]$RequestId, [uint32]$BootCounter,
-                        [string]$PendingJob, [bool]$DesktopReady) {
+                        [string]$PendingJob, [bool]$DesktopReady,
+                        [uint32]$Capabilities = 1023) {
         $payload = [Collections.Generic.List[byte]]::new()
         $payload.AddRange([BitConverter]::GetBytes([uint16]0x0100))
         $payload.AddRange([BitConverter]::GetBytes([uint16]0))
-        $payload.AddRange([BitConverter]::GetBytes([uint32]1023))
+        $payload.AddRange([BitConverter]::GetBytes($Capabilities))
         $payload.AddRange([BitConverter]::GetBytes([uint32]65536))
         $payload.AddRange([BitConverter]::GetBytes($BootCounter))
         $payload.AddRange([BitConverter]::GetBytes([uint16]9869))
@@ -142,6 +143,44 @@ $server = Start-Job -ArgumentList $port, $protocolScript, $resumeToken -ScriptBl
             $stream.Write($frame, 0, $frame.Length)
             Start-Sleep -Milliseconds 500
         } finally { $client.Dispose() }
+
+        # reset against an agent without V9X_CAP_HARD_RESET: refused before
+        # anything is sent.
+        $client = $listener.AcceptTcpClient()
+        try {
+            $stream = $client.GetStream()
+            $hello = Read-V9xFrame -Stream $stream
+            Send-Hello $stream $hello.RequestId 21 $ResumeToken $true
+            Start-Sleep -Milliseconds 750
+            if ($stream.DataAvailable) { throw 'reset sent a request without the capability.' }
+        } finally { $client.Dispose() }
+
+        # reset with the capability: RESET_REQUEST, then the same proof as reboot.
+        $client = $listener.AcceptTcpClient()
+        try {
+            $stream = $client.GetStream()
+            $hello = Read-V9xFrame -Stream $stream
+            Send-Hello $stream $hello.RequestId 21 $ResumeToken $true (1023 -bor 0x10000)
+            $power = Read-V9xFrame -Stream $stream
+            if ($power.Type -ne 0x0043) { throw 'Expected RESET_REQUEST.' }
+            $tokenOffset = 0
+            $token = Read-V9xString -Bytes $power.Payload -Offset ([ref]$tokenOffset)
+            if ($token -ne "$ResumeToken-reset") { throw 'Reset token mismatch.' }
+            $accepted = [Collections.Generic.List[byte]]::new()
+            $accepted.AddRange([BitConverter]::GetBytes([uint32]21))
+            Add-V9xString -Bytes $accepted -Value $token
+            $frame = New-V9xFrameBytes -Type 0x8043 -RequestId $power.RequestId -Payload $accepted.ToArray()
+            $stream.Write($frame, 0, $frame.Length)
+            Start-Sleep -Milliseconds 250
+        } finally { $client.Dispose() }
+
+        $client = $listener.AcceptTcpClient()
+        try {
+            $stream = $client.GetStream()
+            $hello = Read-V9xFrame -Stream $stream
+            Send-Hello $stream $hello.RequestId 22 "$ResumeToken-reset" $true (1023 -bor 0x10000)
+            Start-Sleep -Milliseconds 500
+        } finally { $client.Dispose() }
         'SERVER_PASS'
     } finally {
         $listener.Stop()
@@ -188,6 +227,23 @@ try {
         $screenBytes[1] -ne [byte][char]'M') {
         throw 'Screenshot download bytes mismatch.'
     }
+    $savedPreference = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $refused = @(& powershell.exe -NoProfile -ExecutionPolicy Bypass -File $clientScript `
+            reset -JobId "$resumeToken-reset" -WaitSeconds 10 -Host 127.0.0.1 -Port $port -Json 2>&1)
+    } finally {
+        $ErrorActionPreference = $savedPreference
+    }
+    if ($LASTEXITCODE -ne 23) {
+        throw "reset without the capability exited $LASTEXITCODE, expected 23: $($refused -join ' ')"
+    }
+    $reset = Invoke-FixtureClient @('reset','-JobId',"$resumeToken-reset",'-WaitSeconds','10')
+    if (-not $reset.Success -or $reset.Action -ne 'Reset' -or -not $reset.Reconnected -or
+        $reset.PreviousBootCounter -ne 21 -or $reset.BootCounter -ne 22 -or
+        $reset.PendingJob -ne "$resumeToken-reset") {
+        throw 'Reset/reconnect result did not prove boot and job identity.'
+    }
     if (-not (Wait-Job -Job $server -Timeout 5)) { throw 'M4 fixture did not finish.' }
     $serverOutput = @(Receive-Job -Job $server -ErrorAction Stop)
     if ($serverOutput -notcontains 'SERVER_PASS') { throw 'M4 fixture did not report success.' }
@@ -201,4 +257,4 @@ try {
     if (Test-Path -LiteralPath $testRoot) { Remove-Item -LiteralPath $testRoot -Recurse -Force }
 }
 
-Write-Output 'PASS: M4 reboot proof, desktop readiness, and screenshot transfer fixtures'
+Write-Output 'PASS: M4 reboot and reset proof, desktop readiness, and screenshot transfer fixtures'

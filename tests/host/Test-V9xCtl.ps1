@@ -41,6 +41,11 @@ if ($unknown.ExitCode -ne 10 -or $unknown.Text -notmatch "unknown verb 'pnig'") 
     throw 'v9xctl did not reject an unknown verb with usage text and exit 10.'
 }
 
+$vnc = Invoke-V9xCtlUsage -Arguments @('vnc')
+if ($vnc.ExitCode -ne 10 -or $vnc.Text -notmatch 'vnc requires status, start or stop') {
+    throw 'v9xctl vnc without a subcommand did not exit 10 naming status, start or stop.'
+}
+
 $portProbe = [Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback, 0)
 $portProbe.Start()
 $port = ([Net.IPEndPoint]$portProbe.LocalEndpoint).Port

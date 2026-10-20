@@ -261,7 +261,10 @@ static int v9x_wait_request(V9xConnection *conn)
     struct timeval wait;
     DWORD idle = 0ul;
     DWORD limit = conn->machine->idle_timeout_ms;
-    if (limit == 0ul) return 1;
+    /* A relay session has its own idle limit on the server (an hour); the
+       developer may well think for longer than idle_timeout between
+       commands. */
+    if (limit == 0ul || conn->is_relay) return 1;
     for (;;) {
         FD_ZERO(&readable);
         FD_SET(conn->socket, &readable);
@@ -300,6 +303,10 @@ int v9x_serve_client(V9xConnection *conn)
         InterlockedIncrement(&conn->machine->activity);
         v9x_format_cmd(cmd_detail, &header);
         v9x_log_event("cmd", cmd_detail);
+        if (header.type != V9X_MSG_HELLO_REQUEST &&
+            header.type != V9X_MSG_PING_REQUEST) {
+            v9x_note_command(conn, header.type);
+        }
 
         if (!handshaken) {
             if (header.type != V9X_MSG_HELLO_REQUEST || header.payload_length < 6ul) {
@@ -376,7 +383,8 @@ int v9x_serve_client(V9xConnection *conn)
                                          header.request_id, conn->payload,
                                          header.payload_length)) return 0;
         } else if (header.type == V9X_MSG_REBOOT_REQUEST ||
-                   header.type == V9X_MSG_SHUTDOWN_REQUEST) {
+                   header.type == V9X_MSG_SHUTDOWN_REQUEST ||
+                   header.type == V9X_MSG_RESET_REQUEST) {
             if (!v9x_handle_power_message(conn, header.type,
                                           header.request_id, conn->payload,
                                           header.payload_length)) return 0;

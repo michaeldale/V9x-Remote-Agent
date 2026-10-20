@@ -62,12 +62,18 @@ $sources = @(
     "src\common\frame.c",
     "src\common\installid.c",
     "src\common\mdns.c",
+    "src\common\ed25519.c",
+    "src\common\sha256.c",
+    "src\common\sha512.c",
+    "src\common\relay.c",
+    "src\common\update_proto.c",
     "src\guest\agent.c",
     "src\guest\discovery.c",
     "src\guest\download.c",
     "src\guest\entry.c",
     "src\guest\execute.c",
     "src\guest\files.c",
+    "src\guest\http.c",
     "src\guest\input.c",
     "src\guest\installid.c",
     "src\guest\inventory.c",
@@ -75,6 +81,8 @@ $sources = @(
     "src\guest\platform.c",
     "src\guest\power.c",
     "src\guest\protocol.c",
+    "src\guest\remote.c",
+    "src\guest\reset.c",
     "src\guest\screenshot.c",
     "src\guest\tray.c",
     "src\guest\update.c"
@@ -172,7 +180,9 @@ foreach ($requiredImport in @('Accept', 'Bind', 'CreateFileA', 'CreateMutexA',
                                'QueryPerformanceCounter',
                                'QueryPerformanceFrequency',
                                'sendto', 'recvfrom', 'setsockopt', 'select',
-                               'WritePrivateProfileStringA')) {
+                               'WritePrivateProfileStringA',
+                               'DeviceIoControl', 'RegFlushKey', 'EnumWindows',
+                               'SendMessageTimeoutA')) {
     if ($dumpText -notmatch "(?im)\s$([regex]::Escape($requiredImport))\s*$") {
         throw "Guest output is missing expected import $requiredImport."
     }
@@ -217,6 +227,59 @@ foreach ($requiredImport in @('BitBlt', 'CreateCompatibleBitmap',
     }
 }
 
+# V9XVNC.EXE: the RFB (VNC) server. Long-lived, but a separate process from
+# the agent so a display driver that hangs GDI takes down only this helper.
+$vncExecutable = Join-Path $outputDir 'V9XVNC.EXE'
+$vncMapFile = Join-Path $outputDir 'V9XVNC.MAP'
+$vncLinkFile = Join-Path $outputDir 'V9XVNC.LNK'
+$vncObjects = @()
+foreach ($vncSource in @('vnc', 'vncz', 'vncdes', 'vncsvc')) {
+    $object = Join-Path $outputDir "src_guest_$vncSource.obj"
+    & $compiler '-bt=nt' '-zq' '-wx' '-zl' '-s' '-os' "-fo=$object" `
+        (Join-Path $repoRoot "src\guest\$vncSource.c")
+    if ($LASTEXITCODE -ne 0) { throw "Open Watcom failed to compile src\guest\$vncSource.c." }
+    $vncObjects += $object
+}
+$vncLinkLines = @(
+    'format windows nt',
+    'runtime windows=4.0',
+    'option quiet',
+    'option nodefaultlibs',
+    "option start='_V9xVncEntry@0'",
+    'option stack=65536',
+    "option map='$vncMapFile'",
+    "name '$vncExecutable'"
+)
+$vncLinkLines += $vncObjects | ForEach-Object { "file '$_'" }
+foreach ($library in @('kernel32', 'user32', 'gdi32', 'wsock32')) {
+    $vncLinkLines += "library '$(Join-Path $watcomRoot "lib386\nt\$library.lib")'"
+}
+Set-Content -LiteralPath $vncLinkFile -Encoding Ascii -Value $vncLinkLines
+& $linker "@$vncLinkFile"
+if ($LASTEXITCODE -ne 0) { throw 'Open Watcom failed to link V9XVNC.EXE.' }
+$vncDumpText = (@(& $dumper -e $vncExecutable 2>&1)) -join "`n"
+if ($LASTEXITCODE -ne 0) { throw 'wdump could not inspect V9XVNC.EXE.' }
+$vncDlls = @([regex]::Matches($vncDumpText, 'DLL name = <([^>]+)>') |
+    ForEach-Object { $_.Groups[1].Value.ToUpperInvariant() } | Sort-Object -Unique)
+$unexpected = @($vncDlls | Where-Object {
+    $_ -notin @('KERNEL32.DLL', 'USER32.DLL', 'GDI32.DLL', 'WSOCK32.DLL')
+})
+if ($unexpected.Count -ne 0) { throw "V9XVNC.EXE imports unexpected DLLs: $($unexpected -join ', ')" }
+if ($vncDumpText -notmatch '(?im)subsystem major version number\s+=\s+0004H') {
+    throw 'V9XVNC.EXE does not target Windows subsystem version 4.0.'
+}
+if ($vncDumpText -match '(?i)GetCommandLineW|GetModuleFileNameW|__CHK|MSVCR|UCRT') {
+    throw 'V9XVNC.EXE contains a forbidden runtime or Unicode startup import.'
+}
+foreach ($requiredImport in @('BitBlt', 'CreateDIBSection', 'GdiFlush',
+                               'DrawIconEx', 'SetCursorPos', 'keybd_event',
+                               'mouse_event', 'VkKeyScanA', 'select', 'Accept',
+                               'CreateEventA', 'OpenEventA')) {
+    if ($vncDumpText -notmatch "(?im)\s$([regex]::Escape($requiredImport))\s*$") {
+        throw "V9XVNC.EXE is missing expected import $requiredImport."
+    }
+}
+
 # SETUP.EXE: the install wizard. Short-lived and interactive, so unlike the
 # agent it may use GDI32 (only for the stock dialog font). It reuses the
 # agent's install-ID objects.
@@ -227,6 +290,24 @@ $setupLinkFile = Join-Path $outputDir 'SETUP.LNK'
 & $compiler '-bt=nt' '-zq' '-wx' '-zl' '-s' '-os' "-dV9X_BUILD_ID=`"$BuildId`"" `
     "-fo=$setupObject" (Join-Path $repoRoot 'src\setup\setup.c')
 if ($LASTEXITCODE -ne 0) { throw 'Open Watcom failed to compile src\setup\setup.c.' }
+# SETUP.EXE /update (selfupdate.c) verifies and unpacks a signed release:
+# the zip and release-file modules only it needs, plus objects the agent
+# already built (HTTP client, SHA-256, Ed25519, update protocol, CRC-32).
+$setupExtraObjects = @()
+foreach ($relativeSource in @('src\setup\selfupdate.c', 'src\common\inflate.c',
+                               'src\common\zipread.c', 'src\common\update_release.c')) {
+    $objectName = ($relativeSource -replace '[\\/]', '_') -replace '\.c$', '.obj'
+    $object = Join-Path $outputDir $objectName
+    & $compiler '-bt=nt' '-zq' '-wx' '-zl' '-s' '-os' "-dV9X_BUILD_ID=`"$BuildId`"" `
+        "-fo=$object" (Join-Path $repoRoot $relativeSource)
+    if ($LASTEXITCODE -ne 0) { throw "Open Watcom failed to compile $relativeSource." }
+    $setupExtraObjects += $object
+}
+foreach ($shared in @('src_guest_http.obj', 'src_common_sha256.obj', 'src_common_sha512.obj',
+                       'src_common_ed25519.obj', 'src_common_update_proto.obj',
+                       'src_common_crc32.obj')) {
+    $setupExtraObjects += (Join-Path $outputDir $shared)
+}
 $setupLinkLines = @(
     'format windows nt',
     'runtime windows=4.0',
@@ -241,7 +322,8 @@ $setupLinkLines = @(
     "file '$(Join-Path $outputDir 'src_guest_platform.obj')'",
     "file '$(Join-Path $outputDir 'src_common_installid.obj')'"
 )
-foreach ($library in @('kernel32', 'user32', 'gdi32', 'advapi32')) {
+$setupLinkLines += $setupExtraObjects | ForEach-Object { "file '$_'" }
+foreach ($library in @('kernel32', 'user32', 'gdi32', 'advapi32', 'wsock32')) {
     $setupLinkLines += "library '$(Join-Path $watcomRoot "lib386\nt\$library.lib")'"
 }
 Set-Content -LiteralPath $setupLinkFile -Encoding Ascii -Value $setupLinkLines
@@ -252,7 +334,7 @@ if ($LASTEXITCODE -ne 0) { throw 'wdump could not inspect SETUP.EXE.' }
 $setupDlls = @([regex]::Matches($setupDumpText, 'DLL name = <([^>]+)>') |
     ForEach-Object { $_.Groups[1].Value.ToUpperInvariant() } | Sort-Object -Unique)
 $unexpected = @($setupDlls | Where-Object {
-    $_ -notin @('KERNEL32.DLL', 'USER32.DLL', 'GDI32.DLL', 'ADVAPI32.DLL')
+    $_ -notin @('KERNEL32.DLL', 'USER32.DLL', 'GDI32.DLL', 'ADVAPI32.DLL', 'WSOCK32.DLL')
 })
 if ($unexpected.Count -ne 0) { throw "SETUP.EXE imports unexpected DLLs: $($unexpected -join ', ')" }
 if ($setupDumpText -notmatch '(?im)subsystem major version number\s+=\s+0004H') {
@@ -273,6 +355,7 @@ foreach ($requiredImport in @('CreateWindowExA', 'IsDialogMessageA', 'CopyFileA'
 Copy-Item -LiteralPath $executable -Destination (Join-Path $packageDir 'V9XAGNT.EXE') -Force
 Copy-Item -LiteralPath $helperExecutable -Destination (Join-Path $packageDir 'V9XSHOT.EXE') -Force
 Copy-Item -LiteralPath $setupExecutable -Destination (Join-Path $packageDir 'SETUP.EXE') -Force
+Copy-Item -LiteralPath $vncExecutable -Destination (Join-Path $packageDir 'V9XVNC.EXE') -Force
 foreach ($name in @('INSTALL.BAT', 'UNINSTALL.BAT', 'UPDATE.BAT', 'INSTALL.REG',
                      'REMOVE.REG', 'UPDATE.REG', 'AGENT.INI', 'README.TXT',
                      'AUTORUN.INF')) {
@@ -294,6 +377,7 @@ Set-Content -LiteralPath (Join-Path $packageDir 'SHA256.TXT') -Encoding Ascii -V
 [pscustomobject]@{
     Executable = $executable
     ScreenshotHelper = $helperExecutable
+    VncServer = $vncExecutable
     Setup = $setupExecutable
     Package = $packageDir
     BuildId = $BuildId

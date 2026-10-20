@@ -43,3 +43,8 @@ unsigned long v9x_crc32_end(unsigned long crc)
 {
     return crc ^ 0xfffffffful;
 }
+
+unsigned long v9x_crc32(const unsigned char *data, unsigned long length)
+{
+    return v9x_crc32_end(v9x_crc32_update(v9x_crc32_begin(), data, length));
+}

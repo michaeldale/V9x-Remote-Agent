@@ -13,6 +13,14 @@
 #define V9X_DISCOVERY_UNAVAILABLE 2l
 #define V9X_MAX_CONNECTIONS 4
 #define V9X_LIST_RESPONSE_MAX 16384ul
+#define V9X_CHAT_LOG_SIZE 8192ul
+#define V9X_CHAT_QUEUE 4
+#define V9X_CHAT_LINE 512
+#define V9X_REMOTE_OFF 0l
+#define V9X_REMOTE_CONNECTING 1l
+#define V9X_REMOTE_ONLINE 2l
+#define V9X_REMOTE_UNREACHABLE 3l
+#define V9X_REMOTE_STOPPED 4l
 /* Singleton mutex; the hot-update swapper also waits on it (see update.c). */
 #define V9X_AGENT_MUTEX_NAME "V9xRemoteAgent.Singleton"
 
@@ -104,6 +112,38 @@ typedef struct V9xAgentState {
     HWND tray_window;
     HICON tray_icon;
     HICON tray_icon_busy;
+    /* Remote help (remote.c, docsemote-help.md). `remote_on` is AGENT.INI
+       [remote] mode=on; `remote_paused` is the tray's Pause, deliberately
+       never saved so a restart is back to On; `remote_status` is one of
+       V9X_REMOTE_*; `remote_session` is 1 while a relay session is open.
+       Setting `remote_wake` makes the worker check in now. */
+    int remote_on;
+    volatile LONG remote_paused;
+    volatile LONG remote_status;
+    volatile LONG remote_session;
+    HANDLE remote_wake;
+    char remote_machine[16];
+    /* The last request other than HELLO and PING, from any client or the
+       relay: what the tray, the check-in and SETUP's /remote page show so
+       an owner can tell the machine is in use. */
+    volatile LONG last_command_set;
+    DWORD last_command_tick;
+    unsigned short last_command_type;
+    char last_command_source[16];
+    /* Chat with the developer. `chat_log` is the conversation the tray's
+       chat window shows; `chat_incoming` is set when the worker appended a
+       message from the developer; `chat_outgoing` holds the owner's lines
+       until the next check-in delivers them. All under `chat_lock`. */
+    CRITICAL_SECTION chat_lock;
+    char chat_log[V9X_CHAT_LOG_SIZE];
+    unsigned long chat_log_length;
+    volatile LONG chat_incoming;
+    char chat_outgoing[V9X_CHAT_QUEUE][V9X_CHAT_LINE];
+    int chat_outgoing_count;
+    /* AGENT.INI [update] check_on_startup, and the newer version a quiet
+       check found (empty when none). */
+    int update_check_on_startup;
+    char update_available[24];
 } V9xAgentState;
 
 /* Per-connection context: one static slot per concurrent client. Owns the
@@ -119,6 +159,9 @@ typedef struct V9xConnection {
     struct V9xAgentState *machine;
     HANDLE thread;
     V9xExecSlot *pending_exec;
+    /* 1 for the loopback connection a remote-help relay session runs on. */
+    int is_relay;
+    char peer[16];
     V9xWriteState write_state;
     unsigned char payload[V9X_MAX_PAYLOAD];
     unsigned char header_bytes[V9X_HEADER_SIZE];
@@ -135,8 +178,19 @@ unsigned long v9x_capabilities(const V9xAgentState *machine);
 int v9x_hotswap_run(void);
 void v9x_hotswap_cleanup(void);
 int v9x_tray_start(V9xAgentState *state);
+int v9x_spawn(const char *command, HANDLE *process_out, DWORD *native_error);
+int v9x_agent_relaunch(DWORD *native_error);
 int v9x_mdns_start(V9xAgentState *state);
 void v9x_mdns_goodbye(void);
+int v9x_start_connection(V9xAgentState *state, SOCKET client, int is_relay);
+void v9x_remote_load_config(V9xAgentState *state);
+int v9x_remote_start(V9xAgentState *state);
+int v9x_update_check_start(V9xAgentState *state);
+void v9x_note_command(V9xConnection *conn, unsigned short type);
+long v9x_last_command_age(V9xAgentState *state);
+void v9x_chat_send(V9xAgentState *state, const char *text);
+void v9x_chat_append(V9xAgentState *state, const char *who, const char *text);
+void v9x_tray_chat_service(V9xAgentState *state);
 int v9x_primary_address(const V9xAgentState *state, unsigned long *address);
 int v9x_serve_client(V9xConnection *conn);
 int v9x_send_frame(V9xConnection *conn, unsigned short type,
@@ -164,6 +218,7 @@ int v9x_handle_power_message(V9xConnection *conn, unsigned short type,
                              const unsigned char *payload,
                              unsigned long length);
 void v9x_load_pending_job(V9xAgentState *state);
+void v9x_reset_machine(void);
 int v9x_capture_screenshot(V9xConnection *conn, unsigned long request_id,
                            const unsigned char *payload,
                            unsigned long length);
@@ -179,5 +234,6 @@ void v9x_screen_info(DWORD *width, DWORD *height, DWORD *bits_per_pixel);
 void v9x_log_line(const char *event_name);
 void v9x_log_event(const char *event_name, const char *detail);
 void v9x_log_set_boot(DWORD boot_counter);
+void v9x_log_freeze(int frozen);
 
 #endif

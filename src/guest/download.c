@@ -1,16 +1,17 @@
 #include "agent.h"
 #include "platform_win.h"
+#include "http.h"
 #include "v9xremote/crc32.h"
 #include "v9xremote/protocol.h"
 #include "v9xremote/status.h"
 
 #define V9X_DL_MAX_URL 1024ul
-#define V9X_DL_MAX_HOST 256ul
-#define V9X_DL_MAX_PATH 1024ul
 #define V9X_DL_MAX_DEST 230ul
 #define V9X_DL_HEADER_MAX 8192ul
 #define V9X_DL_RECV_CHUNK 2048ul
 #define V9X_DL_PROGRESS_STEP 65536ul
+/* A server silent for this long ends the download. */
+#define V9X_DL_TIMEOUT_MS 60000ul
 
 static unsigned long v9x_dl_num(char *target, unsigned long offset,
                                 unsigned long value)
@@ -65,182 +66,34 @@ static int v9x_dl_error(V9xConnection *conn, DWORD request_id, DWORD status,
                           conn->file_response, offset);
 }
 
-static int v9x_dl_ci_equal(const char *text, const char *lower, unsigned long n)
-{
-    unsigned long index;
-    for (index = 0ul; index < n; ++index) {
-        unsigned char ch = (unsigned char)text[index];
-        if (ch >= 'A' && ch <= 'Z') ch = (unsigned char)(ch + ('a' - 'A'));
-        if (ch != (unsigned char)lower[index]) return 0;
-    }
-    return 1;
-}
-
-static int v9x_dl_append(char *target, unsigned long *offset,
-                         unsigned long capacity, const char *text)
-{
-    while (*text != '\0') {
-        if (*offset + 1ul >= capacity) return 0;
-        target[(*offset)++] = *text++;
-    }
-    target[*offset] = '\0';
-    return 1;
-}
-
-/* Split an http:// URL into host, port, and path. Returns 0 on anything that is
-   not a plain http URL (https and other schemes are rejected by the caller with
-   a clearer message). */
-static int v9x_dl_parse_url(const char *url, char *host, unsigned short *port,
-                            char *path, int *is_https)
-{
-    unsigned long index = 0ul;
-    unsigned long host_length = 0ul;
-    unsigned long path_length = 0ul;
-    unsigned long port_value = 0ul;
-    int have_port = 0;
-    *is_https = 0;
-    if (v9x_dl_ci_equal(url, "https://", 8ul)) {
-        *is_https = 1;
-        return 0;
-    }
-    if (!v9x_dl_ci_equal(url, "http://", 7ul)) return 0;
-    index = 7ul;
-    while (url[index] != '\0' && url[index] != '/' && url[index] != ':') {
-        if (host_length + 1ul >= V9X_DL_MAX_HOST) return 0;
-        host[host_length++] = url[index++];
-    }
-    if (host_length == 0ul) return 0;
-    host[host_length] = '\0';
-    if (url[index] == ':') {
-        ++index;
-        while (url[index] >= '0' && url[index] <= '9') {
-            port_value = port_value * 10ul + (unsigned long)(url[index] - '0');
-            if (port_value > 65535ul) return 0;
-            ++index;
-            have_port = 1;
-        }
-        if (!have_port) return 0;
-    }
-    *port = (unsigned short)(have_port ? port_value : 80ul);
-    if (url[index] == '\0') {
-        path[0] = '/';
-        path[1] = '\0';
-        return 1;
-    }
-    if (url[index] != '/') return 0;
-    while (url[index] != '\0') {
-        if (path_length + 1ul >= V9X_DL_MAX_PATH) return 0;
-        path[path_length++] = url[index++];
-    }
-    path[path_length] = '\0';
-    return 1;
-}
-
-static SOCKET v9x_dl_connect(const char *host, unsigned short port,
-                             DWORD *native_error)
-{
-    struct sockaddr_in address;
-    struct hostent *resolved;
-    unsigned long numeric;
-    SOCKET handle;
-    unsigned long index;
-    address.sin_family = AF_INET;
-    address.sin_port = htons(port);
-    numeric = inet_addr(host);
-    if (numeric != INADDR_NONE) {
-        address.sin_addr.s_addr = numeric;
-    } else {
-        resolved = gethostbyname(host);
-        if (resolved == 0 || resolved->h_addr_list == 0 ||
-            resolved->h_addr_list[0] == 0 || resolved->h_length != 4) {
-            *native_error = WSAGetLastError();
-            return INVALID_SOCKET;
-        }
-        for (index = 0ul; index < 4ul; ++index) {
-            ((unsigned char *)&address.sin_addr)[index] =
-                (unsigned char)resolved->h_addr_list[0][index];
-        }
-    }
-    handle = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-    if (handle == INVALID_SOCKET) {
-        *native_error = WSAGetLastError();
-        return INVALID_SOCKET;
-    }
-    v9x_platform_no_inherit((HANDLE)handle);
-    if (connect(handle, (struct sockaddr *)&address, sizeof(address)) ==
-            SOCKET_ERROR) {
-        *native_error = WSAGetLastError();
-        closesocket(handle);
-        return INVALID_SOCKET;
-    }
-    return handle;
-}
-
 static int v9x_dl_send_request(SOCKET handle, const char *host,
                                const char *path)
 {
-    char request[V9X_DL_MAX_PATH + 512ul];
+    char request[V9X_HTTP_MAX_PATH + 512ul];
     unsigned long offset = 0ul;
-    int sent;
-    unsigned long total = 0ul;
-    if (!v9x_dl_append(request, &offset, sizeof(request), "GET ") ||
-        !v9x_dl_append(request, &offset, sizeof(request), path) ||
-        !v9x_dl_append(request, &offset, sizeof(request), " HTTP/1.0\r\nHost: ") ||
-        !v9x_dl_append(request, &offset, sizeof(request), host) ||
-        !v9x_dl_append(request, &offset, sizeof(request),
-                       "\r\nUser-Agent: v9x-agent\r\nConnection: close\r\n\r\n")) {
-        return 0;
-    }
-    while (total < offset) {
-        sent = send(handle, request + total, (int)(offset - total), 0);
-        if (sent <= 0) return 0;
-        total += (unsigned long)sent;
-    }
-    return 1;
-}
-
-/* Scan a byte range for the CRLF CRLF header terminator. Returns the index just
-   past it (start of body) or 0 if not present. */
-static unsigned long v9x_dl_find_body(const unsigned char *buffer,
-                                      unsigned long length)
-{
-    unsigned long index;
-    if (length < 4ul) return 0ul;
-    for (index = 0ul; index + 4ul <= length; ++index) {
-        if (buffer[index] == '\r' && buffer[index + 1ul] == '\n' &&
-            buffer[index + 2ul] == '\r' && buffer[index + 3ul] == '\n') {
-            return index + 4ul;
+    const char *parts[5];
+    unsigned long part;
+    parts[0] = "GET ";
+    parts[1] = path;
+    parts[2] = " HTTP/1.0\r\nHost: ";
+    parts[3] = host;
+    parts[4] = "\r\nUser-Agent: v9x-agent\r\nConnection: close\r\n\r\n";
+    for (part = 0ul; part < 5ul; ++part) {
+        const char *text = parts[part];
+        while (*text != '\0') {
+            if (offset + 1ul >= sizeof(request)) return 0;
+            request[offset++] = *text++;
         }
     }
-    return 0ul;
-}
-
-/* Parse "HTTP/1.x <code> ..." and return the numeric status, or 0 if the status
-   line is malformed. */
-static unsigned long v9x_dl_status_code(const unsigned char *header,
-                                        unsigned long length)
-{
-    unsigned long index = 0ul;
-    unsigned long code = 0ul;
-    int digits = 0;
-    while (index < length && header[index] != ' ' && header[index] != '\r') {
-        ++index;
-    }
-    while (index < length && header[index] == ' ') ++index;
-    while (index < length && header[index] >= '0' && header[index] <= '9') {
-        code = code * 10ul + (unsigned long)(header[index] - '0');
-        ++index;
-        ++digits;
-    }
-    return digits == 3 ? code : 0ul;
+    return v9x_http_send_all(handle, request, offset, V9X_DL_TIMEOUT_MS);
 }
 
 int v9x_handle_download(V9xConnection *conn, unsigned long request_id,
                         const unsigned char *payload, unsigned long length)
 {
     char url[V9X_DL_MAX_URL + 1ul];
-    char host[V9X_DL_MAX_HOST];
-    char path[V9X_DL_MAX_PATH];
+    char host[V9X_HTTP_MAX_HOST];
+    char path[V9X_HTTP_MAX_PATH];
     char dest[260];
     char temp[260];
     unsigned char header[V9X_DL_HEADER_MAX];
@@ -303,7 +156,7 @@ int v9x_handle_download(V9xConnection *conn, unsigned long request_id,
     }
     dest[dest_length] = '\0';
 
-    if (!v9x_dl_parse_url(url, host, &port, path, &is_https)) {
+    if (!v9x_http_parse_url(url, host, &port, path, &is_https)) {
         return v9x_dl_error(conn, request_id,
                             is_https ? V9X_STATUS_UNSUPPORTED_OPERATION :
                                        V9X_STATUS_INVALID_PAYLOAD,
@@ -328,7 +181,7 @@ int v9x_handle_download(V9xConnection *conn, unsigned long request_id,
     temp[offset++] = 'P'; temp[offset++] = 'A'; temp[offset++] = 'R';
     temp[offset++] = 'T'; temp[offset] = '\0';
 
-    handle = v9x_dl_connect(host, port, &native_error);
+    handle = v9x_http_connect(host, port, V9X_DL_TIMEOUT_MS, &native_error);
     if (handle == INVALID_SOCKET) {
         return v9x_dl_error(conn, request_id, V9X_STATUS_IO_FAILED,
                             native_error, "download connect failed");
@@ -342,11 +195,12 @@ int v9x_handle_download(V9xConnection *conn, unsigned long request_id,
     /* Accumulate the response header until the CRLF CRLF terminator. */
     body_start = 0ul;
     while (header_length < sizeof(header)) {
-        received = recv(handle, (char *)(header + header_length),
-                        (int)(sizeof(header) - header_length), 0);
+        received = v9x_http_recv(handle, header + header_length,
+                                 sizeof(header) - header_length,
+                                 V9X_DL_TIMEOUT_MS);
         if (received <= 0) break;
         header_length += (unsigned long)received;
-        body_start = v9x_dl_find_body(header, header_length);
+        body_start = v9x_http_find_body(header, header_length);
         if (body_start != 0ul) break;
     }
     if (body_start == 0ul) {
@@ -354,7 +208,7 @@ int v9x_handle_download(V9xConnection *conn, unsigned long request_id,
         return v9x_dl_error(conn, request_id, V9X_STATUS_IO_FAILED,
                             ERROR_INVALID_DATA, "download response header invalid");
     }
-    http_status = v9x_dl_status_code(header, header_length);
+    http_status = v9x_http_status_code(header, header_length);
     if (http_status != 200ul) {
         closesocket(handle);
         return v9x_dl_error(conn, request_id, V9X_STATUS_IO_FAILED, http_status,
@@ -387,8 +241,14 @@ int v9x_handle_download(V9xConnection *conn, unsigned long request_id,
     }
 
     while (!failed) {
-        received = recv(handle, (char *)chunk, (int)sizeof(chunk), 0);
-        if (received <= 0) break;
+        received = v9x_http_recv(handle, chunk, sizeof(chunk),
+                                 V9X_DL_TIMEOUT_MS);
+        if (received < 0) {
+            native_error = WSAETIMEDOUT;
+            failed = 1;
+            break;
+        }
+        if (received == 0) break;
         if (body_total + (unsigned long)received > V9X_MAX_DOWNLOAD_SIZE) {
             native_error = ERROR_FILE_TOO_LARGE;
             failed = 1;

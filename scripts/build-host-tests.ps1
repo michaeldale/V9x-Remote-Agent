@@ -38,6 +38,55 @@ try {
         if ($announce -ne $fixture) {
             throw 'tests\host\mdns-announce.hex no longer matches the C mDNS encoder; regenerate it with test_protocol.exe dump-mdns.'
         }
+        # Update and remote-help modules (not named test_update.exe: Windows'
+        # installer detection wants elevation for any exe called *update*):
+        # Ed25519/SHA-256/SHA-512, inflate
+        # and zip reading, the update-server text protocol, the signed
+        # release file and the relay chunk framing.
+        & $compilerDriver '-bt=nt' '-zq' '-wx' '-s' '-fe=test_crypt.exe' `
+            (Join-Path $repoRoot 'tests\host\test_update_main.c') `
+            (Join-Path $repoRoot 'tests\host\test_crypto.c') `
+            (Join-Path $repoRoot 'tests\host\test_inflate.c') `
+            (Join-Path $repoRoot 'tests\host\test_update_proto.c') `
+            (Join-Path $repoRoot 'tests\host\test_update_release.c') `
+            (Join-Path $repoRoot 'tests\host\test_relay.c') `
+            (Join-Path $repoRoot 'src\common\ed25519.c') `
+            (Join-Path $repoRoot 'src\common\sha256.c') `
+            (Join-Path $repoRoot 'src\common\sha512.c') `
+            (Join-Path $repoRoot 'src\common\inflate.c') `
+            (Join-Path $repoRoot 'src\common\zipread.c') `
+            (Join-Path $repoRoot 'src\common\crc32.c') `
+            (Join-Path $repoRoot 'src\common\update_proto.c') `
+            (Join-Path $repoRoot 'src\common\update_release.c') `
+            (Join-Path $repoRoot 'src\common\relay.c')
+        if ($LASTEXITCODE -ne 0) { throw 'Open Watcom failed to build the update/relay host tests.' }
+        & (Join-Path $outputDir 'test_crypt.exe')
+        if ($LASTEXITCODE -ne 0) { throw "Update/relay host tests failed with exit code $LASTEXITCODE." }
+        # The operator's signing tool (releases and remote-help relay
+        # batches), built from the same modules the agent verifies with.
+        $toolsDir = Join-Path $repoRoot 'build\tools'
+        New-Item -ItemType Directory -Force -Path $toolsDir | Out-Null
+        & $compilerDriver '-bt=nt' '-zq' '-wx' '-s' "-fe=$(Join-Path $toolsDir 'v9xsign.exe')" `
+            (Join-Path $repoRoot 'tools\v9xsign.c') `
+            (Join-Path $repoRoot 'src\common\ed25519.c') `
+            (Join-Path $repoRoot 'src\common\sha256.c') `
+            (Join-Path $repoRoot 'src\common\sha512.c') `
+            (Join-Path $repoRoot 'src\common\relay.c')
+        if ($LASTEXITCODE -ne 0) { throw 'Open Watcom failed to build tools\v9xsign.c.' }
+        # V9XVNC.EXE's DES (VNC authentication) and ZRLE deflate encoder.
+        & $compilerDriver '-bt=nt' '-zq' '-wx' '-s' '-fe=test_vnc.exe' `
+            (Join-Path $repoRoot 'tests\host\test_vnc.c') `
+            (Join-Path $repoRoot 'src\guest\vncdes.c') `
+            (Join-Path $repoRoot 'src\guest\vncz.c')
+        if ($LASTEXITCODE -ne 0) { throw 'Open Watcom failed to build the VNC host tests.' }
+        & (Join-Path $outputDir 'test_vnc.exe')
+        if ($LASTEXITCODE -ne 0) { throw "VNC DES tests failed with exit code $LASTEXITCODE." }
+        $cases = Join-Path $outputDir 'vnc-deflate.bin'
+        & (Join-Path $outputDir 'test_vnc.exe') 'deflate' $cases | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw 'test_vnc.exe could not write the deflate cases.' }
+        # zlib is the reference: every case must inflate back exactly.
+        & python (Join-Path $repoRoot 'tests\host\Test-VncDeflate.py') $cases
+        if ($LASTEXITCODE -ne 0) { throw 'The ZRLE deflate output did not inflate with zlib.' }
     } finally {
         Pop-Location
     }

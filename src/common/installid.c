@@ -96,3 +96,69 @@ int v9x_id_valid(const char *text)
     }
     return text[V9X_INSTALL_ID_LENGTH] == '\0';
 }
+
+/* 1 when line (not terminated) is "key=..." with optional blanks around key. */
+static int v9x_ini_is_key(const char *line, unsigned long length, const char *key)
+{
+    unsigned long index = 0ul;
+    while (index < length && (line[index] == ' ' || line[index] == '\t')) ++index;
+    while (*key != '\0') {
+        char ch;
+        if (index >= length) return 0;
+        ch = line[index];
+        if (ch >= 'A' && ch <= 'Z') ch = (char)(ch - 'A' + 'a');
+        if (ch != *key) return 0;
+        ++index;
+        ++key;
+    }
+    while (index < length && (line[index] == ' ' || line[index] == '\t')) ++index;
+    return index < length && line[index] == '=';
+}
+
+int v9x_ini_repair(const char *text, unsigned long length, char *out,
+                   unsigned long capacity, const char *unique_key,
+                   unsigned long *out_length)
+{
+    unsigned long at = 0ul;
+    unsigned long used = 0ul;
+    int seen = 0;
+    int blank = 0;
+    while (at < length) {
+        unsigned long start = at;
+        unsigned long end;
+        unsigned long need;
+        unsigned long index;
+        while (at < length && text[at] != '\r' && text[at] != '\n') ++at;
+        end = at;
+        if (at < length) {
+            if (text[at] == '\r' && at + 1ul < length && text[at + 1ul] == '\n') {
+                at += 2ul;
+            } else {
+                ++at;
+            }
+        }
+        if (end == start) {
+            if (used != 0ul) blank = 1;
+            continue;
+        }
+        if (text[start] == '[') {
+            seen = 0;
+        } else if (unique_key != 0 &&
+                   v9x_ini_is_key(text + start, end - start, unique_key)) {
+            if (seen) continue;
+            seen = 1;
+        }
+        need = (end - start) + 2ul + (blank ? 2ul : 0ul);
+        if (need > capacity - used) return 0;
+        if (blank) {
+            out[used++] = '\r';
+            out[used++] = '\n';
+            blank = 0;
+        }
+        for (index = start; index < end; ++index) out[used++] = text[index];
+        out[used++] = '\r';
+        out[used++] = '\n';
+    }
+    *out_length = used;
+    return 1;
+}

@@ -65,7 +65,10 @@ jobs:
             }
           }
           $notes += $lines[$start..($end - 1)]
-          $notes | Set-Content build\release\NOTES.md -Encoding UTF8
+          # UTF-8 without a BOM: Set-Content -Encoding UTF8 on 5.1 writes one,
+          # and it ends up as the first character of the release body.
+          [IO.File]::WriteAllLines((Join-Path $PWD 'build\release\NOTES.md'), [string[]]$notes,
+            (New-Object Text.UTF8Encoding($false)))
 
       - name: Create GitHub release
         shell: powershell
@@ -73,7 +76,11 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           $zip = Get-ChildItem build\release\v9xremote-*.zip | Select-Object -First 1
-          $assets = @($zip.FullName, 'build\release\V9XREMOTE.ISO', 'build\release\SHA256SUMS')
+          # The self-update package. Its SIGNED.TXT is added afterwards from
+          # the developer's PC (scripts\sign-release.ps1): the signing key
+          # never comes near CI.
+          $update = Get-ChildItem build\release\v9x-remote-agent-*-win32.zip | Select-Object -First 1
+          $assets = @($zip.FullName, 'build\release\V9XREMOTE.ISO', $update.FullName, 'build\release\SHA256SUMS')
           # Re-running this job must not fail just because the release exists,
           # which is what a rerun after any later-step failure would hit. Only
           # the assets are replaced; an existing title and body are left alone

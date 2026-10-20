@@ -93,6 +93,11 @@ int v9x_handle_power_message(V9xConnection *conn, unsigned short type,
     unsigned long offset = 4ul;
     unsigned short response_type;
     UINT flags;
+    if (type == V9X_MSG_RESET_REQUEST && v9x_platform_is_nt()) {
+        return v9x_power_error(conn, request_id,
+                               V9X_STATUS_UNSUPPORTED_OPERATION, 0ul,
+                               "reset needs Windows 9x");
+    }
     if (v9x_execution_any_active(machine)) {
         return v9x_power_error(conn, request_id, V9X_STATUS_BUSY, 0ul,
                                "execution active");
@@ -121,6 +126,16 @@ int v9x_handle_power_message(V9xConnection *conn, unsigned short type,
     v9x_write_u32(conn->power_response, machine->boot_counter);
     if (!v9x_append_string(conn->power_response, sizeof(conn->power_response),
                            &offset, job)) return 0;
+    if (type == V9X_MSG_RESET_REQUEST) {
+        v9x_log_event("reset-accepted", job);
+        if (!v9x_send_frame(conn, V9X_MSG_RESET_ACCEPTED, request_id,
+                            conn->power_response, offset)) return 0;
+        v9x_mdns_goodbye();
+        Sleep(250ul);
+        /* Returns only when no reset method worked; the agent carries on. */
+        v9x_reset_machine();
+        return 1;
+    }
     if (type == V9X_MSG_REBOOT_REQUEST) {
         response_type = V9X_MSG_REBOOT_ACCEPTED;
         flags = EWX_REBOOT | EWX_FORCE;

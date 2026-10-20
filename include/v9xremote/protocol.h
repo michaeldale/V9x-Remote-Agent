@@ -47,6 +47,8 @@
 #define V9X_MSG_SHUTDOWN_ACCEPTED 0x8041u
 #define V9X_MSG_UPDATE_REQUEST   0x0042u
 #define V9X_MSG_UPDATE_ACCEPTED  0x8042u
+#define V9X_MSG_RESET_REQUEST    0x0043u
+#define V9X_MSG_RESET_ACCEPTED   0x8043u
 #define V9X_MSG_SCREENSHOT_REQUEST  0x0050u
 #define V9X_MSG_SCREENSHOT_RESPONSE 0x8050u
 #define V9X_MSG_INPUT_REQUEST       0x0060u
@@ -76,6 +78,9 @@
 /* INPUT accepts V9X_INPUT_OP_MOUSE_MOVE_RELATIVE (agent 0.8.1+). Older agents
    reject the whole request as malformed, so hosts check this bit first. */
 #define V9X_CAP_INPUT_RELATIVE 0x00008000ul
+/* RESET_REQUEST (agent 0.10.0+): flush, then a hardware reset without
+   Windows' real-mode restart path. Win9x only; withheld on NT. */
+#define V9X_CAP_HARD_RESET     0x00010000ul
 #define V9X_INFO_FLAG_EXTENDED 0x00000001ul
 #define V9X_CAPABILITIES (V9X_CAP_INFO | V9X_CAP_PING | \
                           V9X_CAP_EXEC_DIRECT | V9X_CAP_EXEC_SHELL | \
@@ -84,12 +89,14 @@
                           V9X_CAP_SCREENSHOT_BMP | V9X_CAP_DRIVER_UPDATE | \
                           V9X_CAP_INPUT_INJECT | V9X_CAP_EXEC_DETACH | \
                           V9X_CAP_HTTP_DOWNLOAD | V9X_CAP_INVENTORY | \
-                          V9X_CAP_INSTALL_ID | V9X_CAP_INPUT_RELATIVE)
+                          V9X_CAP_INSTALL_ID | V9X_CAP_INPUT_RELATIVE | \
+                          V9X_CAP_HARD_RESET)
 
-#define V9X_MAX_FILE_SIZE 268435456ul
-/* DOWNLOAD streams straight to the guest disk, so it is not held to the
- * PUT/GET limit; 2 GiB keeps every size well inside the u32 wire fields. */
-#define V9X_MAX_DOWNLOAD_SIZE 2147483647ul
+/* PUT/GET (0.11.0+, 256 MiB before) and DOWNLOAD all stream 32 KiB chunks
+ * straight to disk. 2 GiB - 1 keeps every size inside the u32 wire fields
+ * and a signed 32-bit file length (DOS filelength, FAT16's own limit). */
+#define V9X_MAX_FILE_SIZE 2147483647ul
+#define V9X_MAX_DOWNLOAD_SIZE V9X_MAX_FILE_SIZE
 #define V9X_FILE_CHUNK_SIZE 32768ul
 
 #define V9X_EXEC_MODE_DIRECT 0u

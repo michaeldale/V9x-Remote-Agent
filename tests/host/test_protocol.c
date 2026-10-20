@@ -61,6 +61,42 @@ static int test_install_id(void)
     return 0;
 }
 
+static int ini_repaired(const char *input, const char *expected)
+{
+    char out[512];
+    unsigned long length = 0ul;
+    unsigned long size = (unsigned long)strlen(input);
+    if (!v9x_ini_repair(input, size, out, size * 2ul + 2ul, "install_id", &length)) {
+        return 0;
+    }
+    return length == strlen(expected) && memcmp(out, expected, length) == 0;
+}
+
+static int test_ini_repair(void)
+{
+    static const char clean[] =
+        "[agent]\r\nport=9869\r\n; comment\r\n\r\ninstall_id=aa\r\n";
+    char out[64];
+    unsigned long length = 0ul;
+    /* What a Windows 98 SE agent left on the netbook: LF-only lines from the
+       host, then CR-wrapped install_id lines appended by the profile writer. */
+    if (!ini_repaired("[agent]\nport=9869\nallow_dos_vm=0\n"
+                      "\rinstall_id=first\r\rinstall_id=second\r\rinstall_id=third\r",
+                      "[agent]\r\nport=9869\r\nallow_dos_vm=0\r\n\r\n"
+                      "install_id=first\r\n")) return 50;
+    if (!ini_repaired(clean, clean)) return 51;
+    if (!ini_repaired("[agent]\nport=1", "[agent]\r\nport=1\r\n")) return 52;
+    if (!ini_repaired("[a]\r\n Install_ID = x\r\nINSTALL_ID=y\r\n[b]\r\ninstall_id=z\r\n",
+                      "[a]\r\n Install_ID = x\r\n[b]\r\ninstall_id=z\r\n")) return 53;
+    if (!ini_repaired("[a]\r\ninstall_idx=1\r\ninstall_idx=2\r\n",
+                      "[a]\r\ninstall_idx=1\r\ninstall_idx=2\r\n")) return 54;
+    if (!ini_repaired("\n\n[a]\n\n\n\nk=v\n\n\n", "[a]\r\n\r\nk=v\r\n")) return 55;
+    if (!ini_repaired("", "")) return 56;
+    if (!ini_repaired("x", "x\r\n")) return 57;
+    if (v9x_ini_repair("[agent]\nport=9869\n", 18ul, out, 10ul, 0, &length)) return 58;
+    return 0;
+}
+
 static int test_mdns(void)
 {
     static const unsigned char query[] = {
@@ -163,6 +199,8 @@ int main(int argc, char **argv)
     if ((V9X_CAPABILITIES & V9X_CAP_INVENTORY) == 0ul) return 11;
     if ((V9X_MSG_INVENTORY_REQUEST | 0x8000u) != V9X_MSG_INVENTORY_RESPONSE) return 12;
     result = test_install_id();
+    if (result != 0) return result;
+    result = test_ini_repair();
     if (result != 0) return result;
     return test_mdns();
 }

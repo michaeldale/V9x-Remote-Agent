@@ -16,6 +16,7 @@ controls the guest. This server therefore refuses non-loopback hosts unless
 
 import argparse
 import base64
+import io
 import json
 import os
 import random
@@ -27,12 +28,17 @@ import sys
 import time
 import zlib
 
+try:
+    from v9x_relay import RelayConfig, RelayError, RelaySession
+except ImportError:  # imported as a package (tests)
+    from .v9x_relay import RelayConfig, RelayError, RelaySession
+
 PROTOCOL_VERSION = 0x0100
 MAGIC = b"V9XR"
 HEADER = struct.Struct("<4sHHIIII")
 MAX_PAYLOAD = 65536
 CHUNK_SIZE = 32768
-MAX_FILE = 256 * 1024 * 1024
+MAX_FILE = 2147483647  # 2 GiB - 1 (agent 0.11.0+; 256 MiB before)
 DEFAULT_SCREENSHOT = "C:\\V9XREMOTE\\TEMP\\SCREEN.BMP"
 
 MSG_HELLO = 0x0001
@@ -70,6 +76,8 @@ MSG_SHUTDOWN = 0x0041
 MSG_SHUTDOWN_ACCEPTED = 0x8041
 MSG_UPDATE = 0x0042
 MSG_UPDATE_ACCEPTED = 0x8042
+MSG_RESET = 0x0043
+MSG_RESET_ACCEPTED = 0x8043
 MSG_SCREENSHOT = 0x0050
 MSG_SCREENSHOT_RESPONSE = 0x8050
 MSG_INPUT = 0x0060
@@ -92,6 +100,7 @@ CAP_HTTP_DOWNLOAD = 0x1000
 CAP_INVENTORY = 0x2000
 CAP_INSTALL_ID = 0x4000
 CAP_INPUT_RELATIVE = 0x8000
+CAP_HARD_RESET = 0x10000
 
 INFO_FLAG_EXTENDED = 0x0001
 
@@ -162,6 +171,64 @@ class V9xGuestError(V9xError):
         self.status = status
         self.native_error = native_error
         self.detail = detail
+
+
+WINDOWS_TEXT_SUFFIXES = (".ini", ".bat", ".cmd", ".reg", ".cfg", ".inf")
+
+
+VNC_EXE = "C:\\V9XREMOTE\\V9XVNC.EXE"
+
+
+def parse_vnc_ini(text):
+    """(enabled, port) from the [vnc] section of an AGENT.INI. VNC is off
+    unless enabled=1, which SETUP.EXE's VNC option writes."""
+    enabled = False
+    port = 5900
+    section = ""
+    for raw in text.splitlines():
+        line = raw.strip()
+        if line.startswith("[") and line.endswith("]"):
+            section = line[1:-1].strip().lower()
+            continue
+        if section != "vnc" or "=" not in line or line.startswith(";"):
+            continue
+        key, value = (part.strip() for part in line.split("=", 1))
+        if key.lower() == "enabled":
+            enabled = value == "1"
+        elif key.lower() == "port" and value.isdigit():
+            port = int(value)
+    return enabled, port
+
+
+def vnc_password_set(text):
+    """Whether the [vnc] section sets a VNC password (its value is never
+    reported)."""
+    section = ""
+    for raw in text.splitlines():
+        line = raw.strip()
+        if line.startswith("[") and line.endswith("]"):
+            section = line[1:-1].strip().lower()
+        elif section == "vnc" and "=" in line and not line.startswith(";"):
+            key, value = (part.strip() for part in line.split("=", 1))
+            if key.lower() == "password":
+                return value != ""
+    return False
+
+
+def bare_lf_warning(guest_path, data):
+    """put is byte-exact; flag a Windows text file sent with LF-only lines,
+    which COMMAND.COM misparses and the Win9x profile writer corrupts (an
+    LF-only AGENT.INI collected a new install_id on every start)."""
+    if not guest_path.lower().endswith(WINDOWS_TEXT_SUFFIXES):
+        return None
+    if len(data) > 1048576 or b"\0" in data:
+        return None
+    if data.count(b"\n") == data.count(b"\r\n"):
+        return None
+    return (
+        "%s was sent with LF-only line ends; Windows 9x expects CRLF. "
+        "Convert the source and put it again." % guest_path
+    )
 
 
 def encode_string(value):
@@ -591,10 +658,14 @@ def bmp_to_png(data):
 class V9xClient:
     """One connection to the guest agent: connect, HELLO, operate, close."""
 
-    def __init__(self, host, port, timeout=15.0, label="v9x-mcp"):
+    def __init__(self, host, port, timeout=15.0, label="v9x-mcp", transport=None):
         self.timeout = timeout
         self.request_id = int(time.time() * 1000) % 0x7FFFFFF0 + 1
-        self.sock = socket.create_connection((host, port), timeout=timeout)
+        # transport: a socket-like RelaySession for a remote-help machine.
+        if transport is not None:
+            self.sock = transport
+        else:
+            self.sock = socket.create_connection((host, port), timeout=timeout)
         self.sock.settimeout(timeout)
         payload = struct.pack("<HH", PROTOCOL_VERSION, PROTOCOL_VERSION)
         payload += encode_string(label)
@@ -825,57 +896,100 @@ class V9xClient:
             raise V9xError("invalid FILE_MKDIR_RESPONSE payload")
         return {"path": guest_path, "created": bool(struct.unpack("<I", payload)[0])}
 
-    def put_bytes(self, data, guest_path):
+    def put_stream(self, handle, size, guest_path):
+        """Upload size bytes from a seekable binary file object. It is read
+        twice (CRC32, then the chunks) and never held in memory whole."""
         self.require(CAP_FILE_WRITE, "file-write")
-        if len(data) > MAX_FILE:
-            raise V9xError("file exceeds the 256 MiB protocol limit")
-        crc = zlib.crc32(data) & 0xFFFFFFFF
+        if size > MAX_FILE:
+            raise V9xError("file exceeds the 2 GiB protocol limit")
+        start = handle.tell()
+        crc = 0
+        remaining = size
+        while remaining:
+            piece = handle.read(min(remaining, 1048576))
+            if not piece:
+                raise V9xError("local file is shorter than its size")
+            crc = zlib.crc32(piece, crc)
+            remaining -= len(piece)
+        crc &= 0xFFFFFFFF
+        handle.seek(start)
         self.next_id()
         self.send(
             MSG_FILE_OPEN_WRITE,
-            struct.pack("<II", len(data), crc) + encode_string(guest_path),
+            struct.pack("<II", size, crc) + encode_string(guest_path),
         )
         _, _, _, ready = self.expect((MSG_FILE_WRITE_READY,))
-        if ready != struct.pack("<II", len(data), crc):
+        if ready != struct.pack("<II", size, crc):
             raise V9xError("FILE_WRITE_READY did not echo size and CRC32")
+        # Over the LAN every chunk waits for its ACK. A relay session costs
+        # a round trip through the update server per wait, so there up to
+        # pipeline_window chunks are in flight; the agent handles them in
+        # order and acknowledges each.
+        window = max(1, int(getattr(self.sock, "pipeline_window", 1)))
         offset = 0
-        while offset < len(data):
-            piece = data[offset : offset + CHUNK_SIZE]
-            self.send(MSG_FILE_WRITE_CHUNK, struct.pack("<I", offset) + piece)
+        acked = 0
+        in_flight = []
+        while acked < size:
+            # Refill in bursts (half a window at a time), so each round trip
+            # carries many chunks rather than one per ACK.
+            refill = len(in_flight) <= window // 2
+            while refill and offset < size and len(in_flight) < window:
+                piece = handle.read(min(CHUNK_SIZE, size - offset))
+                if not piece:
+                    raise V9xError("local file changed during the upload")
+                self.send(MSG_FILE_WRITE_CHUNK, struct.pack("<I", offset) + piece)
+                offset += len(piece)
+                in_flight.append(offset)
             _, _, _, ack = self.expect((MSG_FILE_WRITE_ACK,))
-            offset += len(piece)
-            if ack != struct.pack("<I", offset):
+            acked = in_flight.pop(0)
+            if ack != struct.pack("<I", acked):
                 raise V9xError("upload acknowledgement offset mismatch")
         self.send(MSG_FILE_COMMIT)
         _, _, _, done = self.expect((MSG_FILE_WRITE_COMPLETE,))
-        if done != struct.pack("<II", len(data), crc):
+        if done != struct.pack("<II", size, crc):
             raise V9xError("commit did not confirm size and CRC32")
-        return {"guest_path": guest_path, "size": len(data), "crc32": "%08X" % crc}
+        return {"guest_path": guest_path, "size": size, "crc32": "%08X" % crc}
 
-    def get_bytes(self, guest_path):
+    def put_bytes(self, data, guest_path):
+        return self.put_stream(io.BytesIO(data), len(data), guest_path)
+
+    def put_file(self, local_path, guest_path):
+        with open(local_path, "rb") as handle:
+            size = os.fstat(handle.fileno()).st_size
+            return self.put_stream(handle, size, guest_path)
+
+    def get_stream(self, guest_path, handle):
+        """Download into a binary file object chunk by chunk; returns
+        (size, crc32) once both match what the guest reports."""
         self.require(CAP_FILE_READ, "file")
         self.next_id()
         self.send(MSG_FILE_OPEN_READ, encode_string(guest_path))
-        received = bytearray()
+        received = 0
+        running_crc = 0
         while True:
             _, msg_type, _, payload = self.expect(
                 (MSG_FILE_READ_CHUNK, MSG_FILE_READ_COMPLETE)
             )
             if msg_type == MSG_FILE_READ_CHUNK:
-                if len(payload) < 4 or struct.unpack_from("<I", payload, 0)[0] != len(
-                    received
-                ):
+                if len(payload) < 4 or struct.unpack_from("<I", payload, 0)[0] != received:
                     raise V9xError("download chunk offset mismatch")
-                received.extend(payload[4:])
+                piece = payload[4:]
+                handle.write(piece)
+                running_crc = zlib.crc32(piece, running_crc)
+                received += len(piece)
             else:
                 break
         if len(payload) != 8:
             raise V9xError("invalid FILE_READ_COMPLETE payload")
         size, crc = struct.unpack("<II", payload)
-        data = bytes(received)
-        if size != len(data) or crc != (zlib.crc32(data) & 0xFFFFFFFF):
+        if size != received or crc != (running_crc & 0xFFFFFFFF):
             raise V9xError("downloaded size or CRC32 does not match the guest")
-        return data
+        return size, crc
+
+    def get_bytes(self, guest_path):
+        buffer = io.BytesIO()
+        self.get_stream(guest_path, buffer)
+        return buffer.getvalue()
 
     def download(self, url, guest_path):
         self.require(CAP_HTTP_DOWNLOAD, "http-download")
@@ -1008,13 +1122,16 @@ class V9xClient:
         return boot
 
 
-def wait_for_update(host, port, old_boot, wait_seconds, resolve=None):
+def wait_for_update(host, port, old_boot, wait_seconds, resolve=None, connect=None):
     deadline = time.monotonic() + wait_seconds
     last_error = "no connection attempt succeeded"
     while time.monotonic() < deadline:
         time.sleep(0.5)
         try:
-            candidate = V9xClient(host, port, timeout=3.0)
+            if connect is not None:
+                candidate = connect(deadline - time.monotonic())
+            else:
+                candidate = V9xClient(host, port, timeout=3.0)
         except (OSError, V9xError) as exc:
             last_error = str(exc)
             if resolve is not None:
@@ -1035,13 +1152,17 @@ def wait_for_update(host, port, old_boot, wait_seconds, resolve=None):
     )
 
 
-def wait_for_reboot(host, port, old_boot, job_id, wait_seconds, resolve=None):
+def wait_for_reboot(host, port, old_boot, job_id, wait_seconds, resolve=None, connect=None):
     deadline = time.monotonic() + wait_seconds
     last_error = "no connection attempt succeeded"
     while time.monotonic() < deadline:
         time.sleep(0.5)
         try:
-            candidate = V9xClient(host, port, timeout=3.0)
+            # connect: a relay machine comes back by checking in again.
+            if connect is not None:
+                candidate = connect(deadline - time.monotonic())
+            else:
+                candidate = V9xClient(host, port, timeout=3.0)
         except (OSError, V9xError) as exc:
             last_error = str(exc)
             # With --id the guest may come back on a new address (DHCP).
@@ -1150,7 +1271,7 @@ TOOLS = [
     },
     {
         "name": "v9x_put_file",
-        "description": "Upload a local file into the guest, CRC32-verified and transactional (256 MiB max).",
+        "description": "Upload a local file into the guest, CRC32-verified and transactional (2 GiB max on agent 0.11.0+, 256 MiB before).",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -1317,7 +1438,7 @@ TOOLS = [
     },
     {
         "name": "v9x_update",
-        "description": "Upgrade the guest agent WITHOUT a reboot from a local install package folder (must contain V9XAGNT.EXE and V9XSHOT.EXE). Uploads and CRC-verifies the new binaries, hot-swaps them, and waits for the agent to relaunch with a new boot counter. Agents before 0.6.0 cannot hot-update and are refused before anything is uploaded; upgrade those once with v9xctl update, which stages it with a reboot.",
+        "description": "Upgrade the guest agent WITHOUT a reboot from a local install package folder (must contain V9XAGNT.EXE and V9XSHOT.EXE). Uploads and CRC-verifies the new binaries, hot-swaps them, and waits for the agent to relaunch with a new boot counter. Agents before 0.6.0 cannot hot-update and are refused before anything is uploaded; upgrade those once with v9xctl update, which stages it with a reboot. A V9XVNC.EXE in the package replaces the guest's VNC server too (stopped first, restarted only if it was running).",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -1329,8 +1450,31 @@ TOOLS = [
         },
     },
     {
+        "name": "v9x_vnc",
+        "description": "Status, start or stop V9XVNC.EXE, the guest's VNC (RFB) server, so a PERSON can watch and drive the guest with any VNC viewer (port 5900 in the guest). It only runs where the machine's owner enabled it with SETUP.EXE's VNC option ([vnc] enabled=1); start on a disabled guest is refused. For your own GUI work keep using v9x_screenshot and the input tools.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "action": {"type": "string", "enum": ["status", "start", "stop"], "description": "What to do (default status)"},
+            },
+            "additionalProperties": False,
+        },
+    },
+    {
         "name": "v9x_reboot_with_proof",
         "description": "Reboot and verify disconnect/reconnect with a changed agent-start counter and echoed resume token. The counter alone is not reboot proof. Call v9x_wait_desktop afterwards to complete confirmation before GUI work.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "job_id": {"type": "string", "description": "Resume token, 1 to 63 ASCII chars (default: generated)"},
+                "wait_seconds": {"type": "integer", "description": "How long to wait for the proof (default 180)"},
+            },
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "v9x_reset_with_proof",
+        "description": "Windows 9x only (agent 0.10.0+). For a guest whose Windows restart hangs (e.g. a real-mode NDIS2 driver resident under Windows): the agent notifies programs, flushes the registry and every fixed drive, then hard-resets through port CF9h without Windows' return to real mode. Same proof as v9x_reboot_with_proof; prefer that tool wherever a normal reboot works.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -1362,12 +1506,52 @@ TOOLS = [
             "additionalProperties": False,
         },
     },
+    {
+        "name": "v9x_relay_machines",
+        "description": "List the machines whose owners lent them for remote help (agent 0.12.0+ with Remote help On): machine id (M-XXXXXX), owner name, GitHub user, computer, OS, agent version, online, paused, busy (a command in the last minute) and last command age. Drive one by passing relay=\"M-XXXXXX\" to any other v9x tool. Needs the operator key in ~/.v9x/operator.key.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "include_retired": {"type": "boolean", "description": "Also list retired machines."},
+            },
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "v9x_chat",
+        "description": "Chat with a remote-help machine's owner. With 'message' it is sent (it pops up in the agent's chat window at the next check-in); without, the conversation so far is returned (the owner's replies included).",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "machine": {"type": "string", "description": "Machine id, e.g. M-4F7K2Q."},
+                "message": {"type": "string", "description": "Text to send. Omit to read."},
+                "after": {"type": "integer", "description": "When reading, only messages with a larger id."},
+            },
+            "required": ["machine"],
+            "additionalProperties": False,
+        },
+    },
 ]
+
+# Every agent tool can run against a remote-help machine through the relay.
+RELAY_PROPERTY = {
+    "type": "string",
+    "description": "Remote-help machine id (M-XXXXXX, see v9x_relay_machines) to run this "
+    "against through the update server instead of the local agent. Opening a session "
+    "takes up to a minute when the machine is idle, a few seconds after recent use.",
+}
+for _tool in TOOLS:
+    if _tool["name"] not in ("v9x_discover", "v9x_relay_machines", "v9x_chat"):
+        _tool["inputSchema"].setdefault("properties", {})["relay"] = RELAY_PROPERTY
 
 
 class ToolHandler:
     def __init__(self, host, port, timeout, install_id=None, query_address=None,
-                 discover_seconds=3.0, allow_remote=False):
+                 discover_seconds=3.0, allow_remote=False, relay=None, relay_server=None):
+        self.default_relay = relay
+        self.relay = relay
+        self.relay_server = relay_server
+        self.relay_config = None
         self.host = host
         self.port = port
         self.timeout = timeout
@@ -1409,7 +1593,37 @@ class ToolHandler:
         except (OSError, V9xError):
             return host, port
 
+    def relay_settings(self):
+        if self.relay_config is None:
+            self.relay_config = RelayConfig(server=self.relay_server)
+        return self.relay_config
+
+    def connect_relay(self, open_wait=150.0):
+        """A V9xClient whose socket is a relay session to self.relay."""
+        if not re.match(r"^M-[0-9A-HJKMNP-TV-Z]{6}$", (self.relay or "").upper()):
+            raise V9xError("relay must be a machine id such as M-4F7K2Q")
+        timeout = max(self.timeout, 60.0)
+        try:
+            session = RelaySession(self.relay_settings(), self.relay,
+                                   open_wait=max(5.0, open_wait), timeout=timeout)
+        except RelayError as exc:
+            raise V9xError(str(exc))
+        try:
+            return V9xClient(None, None, timeout=timeout, label="v9x-mcp-relay",
+                             transport=session)
+        except Exception:
+            session.close()
+            raise
+
+    def reconnector(self):
+        """For the reboot/update waits: how to reach the agent again."""
+        if self.relay:
+            return lambda remaining: self.connect_relay(open_wait=remaining)
+        return None
+
     def connect(self):
+        if self.relay:
+            return self.connect_relay()
         if self.install_id and not self.resolved:
             self.resolve()
         try:
@@ -1431,7 +1645,27 @@ class ToolHandler:
         method = getattr(self, name, None)
         if method is None:
             raise V9xError("unknown tool: %s" % name)
+        args = dict(args or {})
+        self.relay = args.pop("relay", None) or self.default_relay
         return method(args)
+
+    def v9x_relay_machines(self, args):
+        try:
+            machines = self.relay_settings().machines(bool(args.get("include_retired")))
+        except RelayError as exc:
+            raise V9xError(str(exc))
+        return self.text({"machines": machines})
+
+    def v9x_chat(self, args):
+        machine = str(args.get("machine", "")).upper()
+        try:
+            if args.get("message"):
+                self.relay_settings().chat_send(machine, str(args["message"]))
+                return self.text({"sent": True, "machine": machine})
+            return self.text({"machine": machine,
+                              "messages": self.relay_settings().chat_read(machine, args.get("after", 0))})
+        except RelayError as exc:
+            raise V9xError(str(exc))
 
     @staticmethod
     def text(value):
@@ -1482,26 +1716,35 @@ class ToolHandler:
             )
 
     def v9x_put_file(self, args):
-        with open(args["local_path"], "rb") as handle:
-            data = handle.read()
         with self.connect() as client:
-            return self.text(client.put_bytes(data, args["guest_path"]))
+            result = client.put_file(args["local_path"], args["guest_path"])
+        warning = None
+        if result["size"] <= 1048576:
+            with open(args["local_path"], "rb") as handle:
+                warning = bare_lf_warning(args["guest_path"], handle.read())
+        if warning:
+            result["warning"] = warning
+        return self.text(result)
 
     def v9x_get_file(self, args):
-        with self.connect() as client:
-            data = client.get_bytes(args["guest_path"])
         local_path = os.path.abspath(args["local_path"])
         parent = os.path.dirname(local_path)
         if parent:
             os.makedirs(parent, exist_ok=True)
-        with open(local_path, "wb") as handle:
-            handle.write(data)
+        temporary = "%s.v9x.part.%08x" % (local_path, random.getrandbits(32))
+        try:
+            with self.connect() as client, open(temporary, "xb") as handle:
+                size, crc = client.get_stream(args["guest_path"], handle)
+            os.replace(temporary, local_path)
+        finally:
+            if os.path.exists(temporary):
+                os.remove(temporary)
         return self.text(
             {
                 "guest_path": args["guest_path"],
                 "local_path": local_path,
-                "size": len(data),
-                "crc32": "%08X" % (zlib.crc32(data) & 0xFFFFFFFF),
+                "size": size,
+                "crc32": "%08X" % crc,
             }
         )
 
@@ -1522,12 +1765,10 @@ class ToolHandler:
                     base = guest_dir + "\\" + relative.replace("/", "\\")
                     client.mkdir(base)
                 for name in sorted(files):
-                    with open(os.path.join(root, name), "rb") as handle:
-                        data = handle.read()
                     destination = base + "\\" + name
-                    client.put_bytes(data, destination)
+                    result = client.put_file(os.path.join(root, name), destination)
                     uploaded.append(destination)
-                    total += len(data)
+                    total += result["size"]
         return self.text(
             {"guest_dir": guest_dir, "files": len(uploaded), "bytes": total}
         )
@@ -1653,12 +1894,32 @@ class ToolHandler:
                     "'scripts\\v9xctl.ps1 update -Source <package>', which stages "
                     "the update and reboots, then this tool works" % version
                 )
+            vnc_updated = vnc_restarted = False
+            vnc_path = os.path.join(package_dir, "V9XVNC.EXE")
+            if os.path.isfile(vnc_path):
+                with open(vnc_path, "rb") as handle:
+                    vnc_data = handle.read()
+                try:
+                    vnc_restarted = self._vnc_replace(client, vnc_data)
+                    vnc_updated = True
+                except V9xError:
+                    pass  # the agent update goes ahead; v9xctl warns likewise
+            # The tray's Settings... runs the installed SETUP.EXE; replace it
+            # too, or it keeps the old version's options page.
+            setup_updated = False
+            setup_path = os.path.join(package_dir, "SETUP.EXE")
+            if os.path.isfile(setup_path):
+                try:
+                    client.put_file(setup_path, "C:\\V9XREMOTE\\SETUP.EXE")
+                    setup_updated = True
+                except V9xError:
+                    pass  # open in the guest; the agent update goes ahead
             client.put_bytes(agent_data, "C:\\V9XREMOTE\\V9XNEW.EXE")
             client.put_bytes(helper_data, "C:\\V9XREMOTE\\V9XSNEW.EXE")
             client.update_apply(len(agent_data), agent_crc, len(helper_data), helper_crc)
         hello = wait_for_update(
             self.host, self.port, old_boot, wait_seconds,
-            self.reresolve if self.install_id else None,
+            self.reresolve if self.install_id else None, connect=self.reconnector(),
         )
         return self.text(
             {
@@ -1668,8 +1929,85 @@ class ToolHandler:
                 "build_id": hello["build_id"],
                 "boot_counter": hello["boot_counter"],
                 "agent_bytes": len(agent_data),
+                "vnc_updated": vnc_updated,
+                "vnc_restarted": vnc_restarted,
+                "setup_updated": setup_updated,
             }
         )
+
+    def _vnc_probe(self, client):
+        """True when a V9XVNC.EXE runs, False when not, None when it is not
+        installed. Exit 3 ("already running") comes from builds before -status."""
+        result = client.execute(0, application=VNC_EXE, arguments="-status",
+                                timeout_ms=15000)
+        if result["result"] != "ok":
+            return None
+        return result["exit_code"] in (0, 3)
+
+    def _vnc_wait(self, client, running, seconds=10.0):
+        deadline = time.time() + seconds
+        while time.time() < deadline:
+            time.sleep(0.5)
+            if self._vnc_probe(client) == running:
+                return True
+        return False
+
+    def _vnc_status(self, client):
+        enabled, port, password_set = False, 5900, False
+        try:
+            ini = client.get_bytes("C:\\V9XREMOTE\\AGENT.INI").decode("ascii", "replace")
+            enabled, port = parse_vnc_ini(ini)
+            password_set = vnc_password_set(ini)
+        except V9xError:
+            pass
+        running = self._vnc_probe(client)
+        return {"installed": running is not None, "enabled": enabled,
+                "running": bool(running), "vnc_port": port,
+                "password_set": password_set}
+
+    def v9x_vnc(self, args):
+        action = args.get("action", "status")
+        if action not in ("status", "start", "stop"):
+            raise V9xError("action must be status, start or stop")
+        with self.connect() as client:
+            status = self._vnc_status(client)
+            status["was_running"] = status["running"]
+            if action != "status" and not status["installed"]:
+                raise V9xError("%s is not installed on this guest; install agent "
+                               "package 0.11.0 or later with SETUP.EXE" % VNC_EXE)
+            if action == "start" and not status["running"]:
+                if not status["enabled"]:
+                    raise V9xError(
+                        "VNC remote control is disabled on this guest ([vnc] "
+                        "enabled=0 in AGENT.INI); its owner turns it on with the "
+                        "VNC option in SETUP.EXE (or SETUP.EXE /S /vnc)")
+                client.execute(0, application=VNC_EXE, detach=True)
+                if not self._vnc_wait(client, True):
+                    raise V9xError("V9XVNC.EXE did not start; see "
+                                   "C:\\V9XREMOTE\\VNC.LOG on the guest")
+                status["running"] = True
+            elif action == "stop" and status["running"]:
+                client.execute(0, application=VNC_EXE, arguments="-stop",
+                               timeout_ms=15000)
+                if not self._vnc_wait(client, False):
+                    raise V9xError("V9XVNC.EXE did not stop within 10 s")
+                status["running"] = False
+        status["action"] = action
+        return self.text(status)
+
+    def _vnc_replace(self, client, data):
+        """Replace a package's V9XVNC.EXE beside the agent's hot swap: stop it
+        if it runs, upload, restart only if it was running."""
+        was_running = self._vnc_probe(client)
+        if was_running:
+            client.execute(0, application=VNC_EXE, arguments="-stop", timeout_ms=15000)
+            self._vnc_wait(client, False)
+        client.put_bytes(data, VNC_EXE)
+        restarted = False
+        if was_running:
+            client.execute(0, application=VNC_EXE, detach=True)
+            restarted = self._vnc_wait(client, True)
+        return restarted
 
     def v9x_reboot_with_proof(self, args):
         job_id = args.get("job_id") or ("mcp-%d" % (int(time.time()) % 100000000))
@@ -1679,11 +2017,33 @@ class ToolHandler:
             client.power(MSG_REBOOT, MSG_REBOOT_ACCEPTED, job_id)
         hello = wait_for_reboot(
             self.host, self.port, old_boot, job_id, wait_seconds,
-            self.reresolve if self.install_id else None,
+            self.reresolve if self.install_id else None, connect=self.reconnector(),
         )
         return self.text(
             {
                 "rebooted": True,
+                "job_id": job_id,
+                "previous_boot_counter": old_boot,
+                "boot_counter": hello["boot_counter"],
+                "pending_job": hello["pending_job"],
+                "desktop_ready": hello["desktop_ready"],
+            }
+        )
+
+    def v9x_reset_with_proof(self, args):
+        job_id = args.get("job_id") or ("mcp-%d" % (int(time.time()) % 100000000))
+        wait_seconds = int(args.get("wait_seconds", 180))
+        with self.connect() as client:
+            client.require(CAP_HARD_RESET, "reset (agent 0.10.0+ on Windows 9x)")
+            old_boot = client.hello["boot_counter"]
+            client.power(MSG_RESET, MSG_RESET_ACCEPTED, job_id)
+        hello = wait_for_reboot(
+            self.host, self.port, old_boot, job_id, wait_seconds,
+            self.reresolve if self.install_id else None, connect=self.reconnector(),
+        )
+        return self.text(
+            {
+                "reset": True,
                 "job_id": job_id,
                 "previous_boot_counter": old_boot,
                 "boot_counter": hello["boot_counter"],
@@ -1821,6 +2181,16 @@ def main(argv=None):
     parser.add_argument(
         "--discover-seconds", type=float, default=3.0, help="discovery listen time (default 3)"
     )
+    parser.add_argument(
+        "--relay",
+        help="default remote-help machine (M-XXXXXX) for every tool; a tool's own "
+        "relay argument overrides it",
+    )
+    parser.add_argument(
+        "--relay-server",
+        help="update server for remote help (default V9X_RELAY_SERVER or "
+        "https://michaeldale.com.au)",
+    )
     args = parser.parse_args(argv)
     if args.id and not re.match(
         r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$", args.id
@@ -1845,6 +2215,8 @@ def main(argv=None):
             query_address=args.query_address,
             discover_seconds=args.discover_seconds,
             allow_remote=args.allow_remote,
+            relay=args.relay,
+            relay_server=args.relay_server,
         )
     ).run()
 

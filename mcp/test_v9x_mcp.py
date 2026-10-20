@@ -39,6 +39,38 @@ class StringCodecTests(unittest.TestCase):
             v9x_mcp.parse_string(b"\x05\x00abc", 0)
 
 
+class BareLfWarningTests(unittest.TestCase):
+    def test_lf_only_ini_warns(self):
+        warning = v9x_mcp.bare_lf_warning(
+            "C:\\V9XREMOTE\\AGENT.INI", b"[agent]\nport=9869\n"
+        )
+        self.assertIn("LF-only", warning)
+
+    def test_crlf_and_other_files_pass(self):
+        self.assertIsNone(
+            v9x_mcp.bare_lf_warning("C:\\AUTOEXEC.BAT", b"@ECHO OFF\r\nPATH C:\\\r\n")
+        )
+        self.assertIsNone(v9x_mcp.bare_lf_warning("C:\\NOTES.TXT", b"a\nb\n"))
+        self.assertIsNone(v9x_mcp.bare_lf_warning("C:\\X.INF", b"a\n\0b"))
+
+
+class VncIniTests(unittest.TestCase):
+    def test_enabled_and_port(self):
+        text = ("[agent]\r\nport=9869\r\nenabled=1\r\n[vnc]\r\n; comment\r\n"
+                "enabled=1\r\nport=5901\r\n")
+        self.assertEqual(v9x_mcp.parse_vnc_ini(text), (True, 5901))
+
+    def test_off_by_default(self):
+        self.assertEqual(v9x_mcp.parse_vnc_ini("[agent]\r\nport=9869\r\n"), (False, 5900))
+        self.assertEqual(v9x_mcp.parse_vnc_ini("[vnc]\r\nenabled=0\r\n"), (False, 5900))
+        self.assertEqual(v9x_mcp.parse_vnc_ini("[VNC]\nenabled = 1\n"), (True, 5900))
+
+    def test_password_set(self):
+        self.assertTrue(v9x_mcp.vnc_password_set("[vnc]\r\npassword=abc\r\n"))
+        self.assertFalse(v9x_mcp.vnc_password_set("[vnc]\r\npassword=\r\n"))
+        self.assertFalse(v9x_mcp.vnc_password_set("[agent]\r\npassword=abc\r\n"))
+
+
 class FrameTests(unittest.TestCase):
     def test_header_layout_matches_protocol(self):
         header = v9x_mcp.HEADER.pack(
@@ -201,13 +233,38 @@ class JsonRpcTests(unittest.TestCase):
         self.assertIn("v9x_exec", names)
         self.assertIn("v9x_screenshot", names)
         self.assertIn("v9x_reboot_with_proof", names)
+        self.assertIn("v9x_reset_with_proof", names)
         self.assertIn("v9x_click", names)
         self.assertIn("v9x_key", names)
         self.assertIn("v9x_download", names)
         self.assertIn("v9x_update", names)
         self.assertIn("v9x_inventory", names)
         self.assertIn("v9x_discover", names)
-        self.assertEqual(len(tools), 24)
+        self.assertIn("v9x_vnc", names)
+        self.assertIn("v9x_relay_machines", names)
+        self.assertIn("v9x_chat", names)
+        self.assertEqual(len(tools), 28)
+        # Every tool that talks to an agent can go through the relay.
+        for tool in tools:
+            if tool["name"] in ("v9x_discover", "v9x_relay_machines", "v9x_chat"):
+                self.assertNotIn("relay", tool["inputSchema"]["properties"])
+            else:
+                self.assertIn("relay", tool["inputSchema"]["properties"], tool["name"])
+
+    def test_relay_argument_must_be_machine_id(self):
+        responses = self.run_server(
+            [
+                {
+                    "jsonrpc": "2.0",
+                    "id": 11,
+                    "method": "tools/call",
+                    "params": {"name": "v9x_ping", "arguments": {"relay": "not-a-machine"}},
+                }
+            ]
+        )
+        result = responses[0]["result"]
+        self.assertTrue(result["isError"])
+        self.assertIn("machine id", result["content"][0]["text"])
 
     def test_unknown_method_errors(self):
         responses = self.run_server(

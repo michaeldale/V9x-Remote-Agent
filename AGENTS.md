@@ -37,10 +37,19 @@ Nothing requires clicking inside the emulator.
 | `download` | `-Url`, `-Destination` | Guest fetches an `http://` URL to a guest path (http only, CRC32-verified) |
 | `update` | `-Source`, `-WaitSeconds` | Upgrade the agent from an install-package folder: hot, no reboot; agents before 0.6.0 get the staged route with one reboot (`Mode = Staged`, v9xctl 0.9.1+) |
 | `reboot` | `-JobId`, `-WaitSeconds` | Reboot with proof (see below) |
+| `reset` | `-JobId`, `-WaitSeconds` | Win9x guest whose restart hangs: flush, hardware reset (CF9h), same proof as `reboot` (agent 0.10.0+) |
 | `shutdown` | `-JobId` | Controlled shutdown |
 | `wait-desktop` | `-WaitSeconds` | Block until Explorer's desktop is ready |
 | `screenshot` | `-OutFile` (alias of `-Destination`), `-Path` | Guest screen capture; saved as PNG/JPEG/GIF/TIFF/BMP by the output file extension |
 | `input` | `-Sequence` | Inject mouse/keyboard: move, click, drag, wheel, key/hotkey, type, delay |
+| `vnc` | `status`, `start` or `stop` | The guest's VNC server for a person (only where SETUP.EXE enabled it; agent package 0.11.0+) |
+
+Any verb but `discover` and `vnc` also takes `-Relay M-XXXXXX` to drive a
+remote-help machine (an owner's real hardware, lent over the Internet)
+through the update server instead of `-Host`/`-Port`; MCP tools take
+`relay`. Those machines belong to other people: chat first (`v9x_chat`), stay
+within what was agreed, and expect the owner to pause you. See
+[docs/remote-help.md](docs/remote-help.md).
 
 ## Host scripts beyond v9xctl
 
@@ -49,6 +58,12 @@ Nothing requires clicking inside the emulator.
 | `scripts\set-autologon.ps1` | Report/enable/disable Windows 9x autologon; `-Dismiss` clears a logon dialog that is up right now |
 | `scripts\capture-emulator-window.ps1` | Grab the emulator's own window from the host, for states `screenshot` cannot reach (logon dialog, BIOS, shutdown hang) |
 | `scripts\run-driver-cycle.ps1` | Upload, preflight and optionally apply a driver package |
+
+`C:\V9XREMOTE\V9XVNC.EXE` in the guest is a VNC server for a person to watch
+and drive the guest live. It is off unless the machine's owner enabled it in
+SETUP.EXE; `vnc start` on such a guest exits 23, and enabling it is their
+call, not yours. See [docs/guest-agent.md](docs/guest-agent.md). As an
+agent, keep using `screenshot` and `input`.
 
 ## Exit-code contract
 
@@ -106,7 +121,13 @@ A fully annotated version with sample outputs is in
   the agent's own files (`AGENT.LOG`, `BOOT.DAT`, `PENDING.DAT`, config).
 - Prefer uppercase 8.3 file names; paths are ASCII only (the protocol rejects
   non-ASCII). No spaces in guest paths avoids COMMAND.COM quoting pain.
-- Limits: 256 MiB per file for put and get, 2 GiB for a guest `download` (agent 0.8.1+), 1 MiB captured stdout and stderr each
+- Text files for the guest (`.INI`, `.BAT`, `.REG`, `.CFG`, `.INF`) must be
+  CRLF before `put`: it is byte-exact, and a file written with an editor or
+  tool that emits LF goes over as LF (the Write tool does). `put` warns when it
+  sees one; convert the local file to CRLF and put it again. An LF-only
+  `AGENT.INI` made agents before 0.10.0 append a new `install_id` on every
+  start.
+- Limits: 2 GiB per file for put and get (agent 0.11.0+, 256 MiB before), 2 GiB for a guest `download` (agent 0.8.1+), 1 MiB captured stdout and stderr each
   (excess is truncated and flagged), 16 KiB directory listings,
   1 hour maximum execution timeout.
 - The guest serves up to four connections and four concurrent executions;
@@ -123,6 +144,13 @@ A fully annotated version with sample outputs is in
   `info`, execute a trace dumper directly, and download trace files first.
 - Call `wait-desktop` after every reboot and before any GUI `exec` or
   `screenshot`; services start before the shell does.
+- **`reset` is for a guest whose Windows restart hangs, not a faster
+  `reboot`.** If `reboot` (or Start > Shut Down > Restart) stops at a flashing
+  cursor or a fatal exception 0C because a real-mode driver is still resident,
+  use `reset`: it flushes the registry and disks and resets the hardware
+  without returning to real mode, with the same proof as `reboot`. Everywhere
+  else use `reboot`. Windows 9x only (exit 23 elsewhere). See
+  [docs/guest-agent.md](docs/guest-agent.md).
 - GUI programs: direct `exec` of a GUI-subsystem EXE leaves window state to
   the program (the JSON reports `GuiWindow: true`). Console programs and
   `shell` commands run hidden by default; pass `-ShowWindow` to show them.
@@ -167,7 +195,8 @@ A fully annotated version with sample outputs is in
 ## Hard rules
 
 - Never bridge the guest NIC or expose TCP 9869 beyond localhost; the
-  protocol is unauthenticated by design and equals full guest control.
+  protocol is unauthenticated by design and equals full guest control. The
+  same goes for the VNC port (5900) while `V9XVNC.EXE` runs.
 - Never disable the `allowed_client` allowlist on a physical machine
   deployment.
 - Upgrade an agent of any age with `update` alone. Do not run

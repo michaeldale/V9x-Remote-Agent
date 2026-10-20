@@ -6,7 +6,8 @@ param(
 # Builds the complete release artifact set into build\release:
 #   v9xremote-<version>.zip   host scripts, MCP server, docs, guest package
 #   V9XREMOTE.ISO             first-install CD image of the guest package
-#   SHA256SUMS                digests of both artifacts
+#   v9x-remote-agent-<version>-win32.zip   self-update package (flat guest files)
+#   SHA256SUMS                digests of the three artifacts
 
 $ErrorActionPreference = 'Stop'
 $repoRoot = Split-Path -Parent $PSScriptRoot
@@ -69,8 +70,17 @@ if (Test-Path -LiteralPath $zipPath) { Remove-Item -LiteralPath $zipPath -Force 
 Compress-Archive -Path $stageDir -DestinationPath $zipPath
 Copy-Item -LiteralPath $isoPath -Destination (Join-Path $releaseRoot 'V9XREMOTE.ISO') -Force
 
+# The self-update package (SETUP.EXE /update, docs\remote-help.md): the
+# guest package's files flat at the root, named <app>-<version>-<family>.zip
+# as the update server's GitHub import expects. scripts\sign-release.ps1
+# signs the copy CI publishes.
+$updateName = "v9x-remote-agent-$version-win32.zip"
+$updatePath = Join-Path $releaseRoot $updateName
+if (Test-Path -LiteralPath $updatePath) { Remove-Item -LiteralPath $updatePath -Force -Confirm:$false }
+Compress-Archive -Path (Join-Path $repoRoot 'build\install\*') -DestinationPath $updatePath
+
 $sums = @()
-foreach ($artifact in @("$stageName.zip", 'V9XREMOTE.ISO')) {
+foreach ($artifact in @("$stageName.zip", 'V9XREMOTE.ISO', $updateName)) {
     $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path $releaseRoot $artifact)).Hash.ToLowerInvariant()
     $sums += "{0} *{1}" -f $hash, $artifact
 }
@@ -80,5 +90,6 @@ Set-Content -LiteralPath (Join-Path $releaseRoot 'SHA256SUMS') -Encoding Ascii -
     Version = $version
     Zip = $zipPath
     Iso = (Join-Path $releaseRoot 'V9XREMOTE.ISO')
+    Update = $updatePath
     Sums = (Join-Path $releaseRoot 'SHA256SUMS')
 }

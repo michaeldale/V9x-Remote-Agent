@@ -1,7 +1,7 @@
 <#
 .SYNOPSIS
 Drive a Windows 9x guest running the V9x Remote Agent: run programs, move
-files, take screenshots, inject input, reboot with proof.
+files, take screenshots, inject input, reboot or reset with proof.
 
 .DESCRIPTION
 One bounded operation per invocation. The first argument is the verb; the
@@ -15,7 +15,10 @@ deterministic and listed in AGENTS.md (20 means the agent was unreachable).
 
 .PARAMETER Action
 The verb: discover, ping, info, inventory, exec, shell, stat, list, mkdir, put, get, push-tree,
-download, update, reboot, shutdown, wait-desktop, screenshot, input, help.
+download, update, reboot, reset, shutdown, wait-desktop, screenshot, input, vnc, help.
+
+.PARAMETER VncCommand
+For the vnc verb, the second word: status, start or stop.
 
 .PARAMETER EndpointHost
 Address of the agent (alias -Host). 127.0.0.1 for an emulator with a port
@@ -71,6 +74,11 @@ Capture the guest screen to a PNG.
 .\scripts\v9xctl.ps1 reboot -JobId myjob-reboot-1 -WaitSeconds 180 -Json
 Reboot and wait for the agent to come back with proof.
 
+.EXAMPLE
+.\scripts\v9xctl.ps1 reset -Host 192.168.10.98 -JobId myjob-reset-1 -WaitSeconds 240 -Json
+Flush and hard-reset a Windows 9x machine whose Windows restart hangs, then
+wait for the same proof as reboot.
+
 .LINK
 AGENTS.md
 docs/host-cli.md
@@ -81,11 +89,14 @@ param(
     [ArgumentCompleter({
         param($commandName, $parameterName, $wordToComplete)
         @('discover', 'ping', 'info', 'inventory', 'exec', 'shell', 'stat', 'list', 'mkdir',
-          'put', 'get', 'push-tree', 'download', 'update', 'reboot', 'shutdown',
-          'wait-desktop', 'screenshot', 'input', 'help') |
+          'put', 'get', 'push-tree', 'download', 'update', 'reboot', 'reset', 'shutdown',
+          'wait-desktop', 'screenshot', 'input', 'vnc', 'help') |
             Where-Object { $_ -like "$wordToComplete*" }
     })]
     [string]$Action,
+    [Parameter(Position = 1)]
+    [ValidateSet('', 'status', 'start', 'stop')]
+    [string]$VncCommand = '',
     [Alias('Host')]
     [string]$EndpointHost = '127.0.0.1',
     [ValidateRange(1, 65535)]
@@ -121,6 +132,11 @@ param(
     [string]$QueryAddress,
     [ValidateRange(1, 30)]
     [int]$DiscoverSeconds = 3,
+    # Remote help: drive an opted-in machine (M-XXXXXX) through the update
+    # server instead of -Host/-Port (docs\remote-help.md).
+    [ValidatePattern('^$|^[Mm]-[0-9A-HJKMNP-TV-Za-hjkmnp-tv-z]{6}$')]
+    [string]$Relay,
+    [string]$RelayServer,
     [switch]$Json
 )
 
@@ -217,14 +233,23 @@ function ConvertTo-V9xInputActions {
 
 function Connect-V9xSession {
     param([string]$HostName, [int]$TcpPort, [int]$TimeoutSeconds)
-    $sessionClient = [Net.Sockets.TcpClient]::new()
+    if ($Relay) {
+        # The relay stream is its own client; disposing it ends the session.
+        $sessionClient = New-V9xRelayStream -Machine $Relay -Server $RelayServer `
+            -OpenWaitSeconds ([Math]::Max($TimeoutSeconds, 150))
+        $sessionStream = $sessionClient
+    } else {
+        $sessionClient = [Net.Sockets.TcpClient]::new()
+    }
     try {
-        $connect = $sessionClient.BeginConnect($HostName, $TcpPort, $null, $null)
-        if (-not $connect.AsyncWaitHandle.WaitOne($TimeoutSeconds * 1000)) {
-            throw [TimeoutException]::new("Connection to ${HostName}:$TcpPort timed out.")
+        if (-not $Relay) {
+            $connect = $sessionClient.BeginConnect($HostName, $TcpPort, $null, $null)
+            if (-not $connect.AsyncWaitHandle.WaitOne($TimeoutSeconds * 1000)) {
+                throw [TimeoutException]::new("Connection to ${HostName}:$TcpPort timed out.")
+            }
+            $sessionClient.EndConnect($connect)
+            $sessionStream = $sessionClient.GetStream()
         }
-        $sessionClient.EndConnect($connect)
-        $sessionStream = $sessionClient.GetStream()
         $sessionStream.ReadTimeout = $TimeoutSeconds * 1000
         $sessionStream.WriteTimeout = $TimeoutSeconds * 1000
         [uint32]$sessionRequestId = [uint32](Get-Random -Minimum 1 -Maximum ([int]::MaxValue))
@@ -381,12 +406,23 @@ function Invoke-V9xMkdirInternal {
     return [bool][BitConverter]::ToUInt32($frame.Payload, 0)
 }
 
+function Test-V9xBareLf {
+    param([string]$LiteralPath)
+    if ((Get-Item -LiteralPath $LiteralPath).Length -gt 1048576) { return $false }
+    $bytes = [IO.File]::ReadAllBytes($LiteralPath)
+    if ([Array]::IndexOf($bytes, [byte]0) -ge 0) { return $false }
+    for ($index = 0; $index -lt $bytes.Length; ++$index) {
+        if ($bytes[$index] -eq 10 -and ($index -eq 0 -or $bytes[$index - 1] -ne 13)) { return $true }
+    }
+    return $false
+}
+
 function Invoke-V9xPutInternal {
     param([IO.Stream]$Stream, [ref]$RequestId, [string]$LocalPath,
           [string]$GuestPath)
     $file = Get-Item -LiteralPath $LocalPath -ErrorAction Stop
     if ($file.PSIsContainer) { throw "Local source is a directory: $LocalPath" }
-    if ($file.Length -gt 268435456) { throw "Local source exceeds the 256 MiB protocol limit: $LocalPath" }
+    if ($file.Length -gt 2147483647) { throw "Local source exceeds the 2 GiB protocol limit: $LocalPath" }
     [uint32]$size = $file.Length
     [uint32]$crc = Get-V9xFileCrc32 -LiteralPath $file.FullName
     [uint32]$id = $RequestId.Value
@@ -403,20 +439,40 @@ function Invoke-V9xPutInternal {
 
     $input = [IO.File]::OpenRead($file.FullName)
     try {
-        $buffer = [byte[]]::new(32768)
+        # One reused WRITE_CHUNK frame: the file is read straight into its
+        # payload and only the request ID, length and offset are patched, so
+        # nothing is allocated or copied per chunk (that cost ~20% of put).
+        # The [byte[]] cast matters: the function's return is unrolled to
+        # object[], and .NET calls would then each fill a temporary copy.
+        [byte[]]$frameBytes = New-V9xFrameBytes -Type 0x0024 -RequestId 1 -Payload ([byte[]]::new(32772))
         [uint32]$offset = 0
-        while (($count = $input.Read($buffer, 0, $buffer.Length)) -ne 0) {
-            ++$id
-            $chunk = [byte[]]::new($count + 4)
-            [Array]::Copy([BitConverter]::GetBytes($offset), 0, $chunk, 0, 4)
-            [Array]::Copy($buffer, 0, $chunk, 4, $count)
-            $bytes = New-V9xFrameBytes -Type 0x0024 -RequestId $id -Payload $chunk
-            $Stream.Write($bytes, 0, $bytes.Length)
-            $frame = Read-V9xOperationFrame -Stream $Stream -RequestId $id `
+        # Over the LAN each chunk waits for its ACK. Through the relay every
+        # wait is a round trip via the update server, so up to a window of
+        # chunks is in flight, refilled half a window at a time.
+        $window = 1
+        if ($Stream.GetType().Name -eq 'V9xRelayStream') { $window = $Stream.PipelineWindow }
+        $inFlight = [Collections.Generic.Queue[object]]::new()
+        $endOfFile = $false
+        while (-not $endOfFile -or $inFlight.Count -gt 0) {
+            if ($inFlight.Count -le [int][Math]::Floor($window / 2)) {
+                while (-not $endOfFile -and $inFlight.Count -lt $window) {
+                    $count = $input.Read($frameBytes, 28, 32768)
+                    if ($count -eq 0) { $endOfFile = $true; break }
+                    ++$id
+                    [Array]::Copy([BitConverter]::GetBytes($id), 0, $frameBytes, 8, 4)
+                    [Array]::Copy([BitConverter]::GetBytes([uint32]($count + 4)), 0, $frameBytes, 16, 4)
+                    [Array]::Copy([BitConverter]::GetBytes($offset), 0, $frameBytes, 24, 4)
+                    $Stream.Write($frameBytes, 0, 28 + $count)
+                    $offset = [uint32]($offset + $count)
+                    $inFlight.Enqueue(@($id, $offset))
+                }
+            }
+            if ($inFlight.Count -eq 0) { break }
+            $expected = $inFlight.Dequeue()
+            $frame = Read-V9xOperationFrame -Stream $Stream -RequestId $expected[0] `
                 -ExpectedTypes 0x8024 -GuestErrorExitCode 40
-            $offset = [uint32]($offset + $count)
             if ($frame.Payload.Length -ne 4 -or
-                [BitConverter]::ToUInt32($frame.Payload, 0) -ne $offset) {
+                [BitConverter]::ToUInt32($frame.Payload, 0) -ne $expected[1]) {
                 throw 'Guest upload acknowledgement has the wrong offset.'
             }
         }
@@ -609,6 +665,11 @@ $script:V9xVerbs = [ordered]@{
         Usage = 'reboot [-JobId <token>] [-WaitSeconds <n>]'
         Example = 'reboot -JobId myjob-reboot-1 -WaitSeconds 180 -Json'
     }
+    'reset' = @{
+        Purpose = 'Flush, then hard-reset (CF9h) without Windows'' restart path; for guests whose reboot hangs (Win9x)'
+        Usage = 'reset [-JobId <token>] [-WaitSeconds <n>]'
+        Example = 'reset -Host 192.168.10.98 -JobId myjob-reset-1 -WaitSeconds 240 -Json'
+    }
     'shutdown' = @{
         Purpose = 'Controlled shutdown'
         Usage = 'shutdown [-JobId <token>]'
@@ -630,6 +691,12 @@ $script:V9xVerbs = [ordered]@{
         Usage = 'input -Sequence "<verb args>; <verb args>; ..."'
         Example = 'input -Sequence "move 100,200; click left; type Hello; key ENTER"'
         Required = @{ Sequence = '-Sequence' }
+    }
+    'vnc' = @{
+        Purpose = 'Status, start or stop V9XVNC.EXE, the VNC server (only where SETUP.EXE enabled it)'
+        Usage = 'vnc status|start|stop'
+        Example = 'vnc start -Json'
+        Required = @{ VncCommand = 'status, start or stop' }
     }
 }
 
@@ -759,6 +826,127 @@ if ($Id) {
     }
 }
 
+# Run another verb of this script against the same target and parse its JSON.
+# Hashtable splatting: an array splatted into a script passes '-Host' as a
+# positional value, not as a parameter name.
+function Invoke-V9xSelf {
+    param([hashtable]$Arguments)
+    $target = @{ EndpointHost = $EndpointHost; Port = $Port
+                 ConnectTimeoutSeconds = $ConnectTimeoutSeconds; Json = $true }
+    foreach ($key in $Arguments.Keys) { $target[$key] = $Arguments[$key] }
+    $output = @(& $PSCommandPath @target)
+    $code = $LASTEXITCODE
+    $parsed = $null
+    try { $parsed = ($output -join "`n") | ConvertFrom-Json } catch { }
+    [pscustomobject]@{ ExitCode = $code; Result = $parsed }
+}
+
+$script:V9xVncExe = 'C:\V9XREMOTE\V9XVNC.EXE'
+
+# Whether V9XVNC.EXE is installed, enabled ([vnc] enabled=1 in AGENT.INI) and
+# running (its -status switch). Throws with V9xExitCode 20 when the agent is
+# unreachable.
+function Get-V9xVncStatus {
+    $iniCopy = [IO.Path]::GetTempFileName()
+    try {
+        $enabled = $false
+        $passwordSet = $false
+        $vncPort = 5900
+        $get = Invoke-V9xSelf @{ Action = 'get'; Source = 'C:\V9XREMOTE\AGENT.INI'; Destination = $iniCopy }
+        if ($get.ExitCode -eq 20) {
+            $exception = [InvalidOperationException]::new("Agent at ${EndpointHost}:$Port is unreachable.")
+            $exception.Data['V9xExitCode'] = 20
+            throw $exception
+        }
+        if ($get.ExitCode -eq 0) {
+            $section = ''
+            foreach ($line in Get-Content -LiteralPath $iniCopy) {
+                $trimmed = $line.Trim()
+                if ($trimmed -match '^\[(.+)\]$') { $section = $Matches[1].ToLowerInvariant(); continue }
+                if ($section -ne 'vnc' -or $trimmed -notmatch '^([A-Za-z_]+)\s*=\s*(.*)$') { continue }
+                # Copy out of $Matches first: the port test's own -match
+                # replaces it, which made a "port=" line a null dereference.
+                $key = $Matches[1]
+                $value = $Matches[2].Trim()
+                if ($key -eq 'enabled') { $enabled = $value -eq '1' }
+                if ($key -eq 'password') { $passwordSet = $value -ne '' }
+                if ($key -eq 'port' -and $value -match '^\d+$') { $vncPort = [int]$value }
+            }
+        }
+    } finally {
+        Remove-Item -LiteralPath $iniCopy -Force -ErrorAction SilentlyContinue
+    }
+    $probe = Invoke-V9xSelf @{ Action = 'exec'; Application = $script:V9xVncExe
+                               Arguments = '-status'; TimeoutSeconds = 15
+                               ExpectedExitCode = [uint32[]]@(0, 1, 3) }
+    $installed = $null -ne $probe.Result -and $probe.Result.ResultCategory -eq 0
+    [pscustomobject]@{
+        Installed = $installed
+        Enabled = $enabled
+        # 3 is "already running" from a build that predates -status.
+        Running = $installed -and $probe.Result.ExitCode -in @(0, 3)
+        Port = $vncPort
+        PasswordSet = $passwordSet
+    }
+}
+
+function Wait-V9xVncRunning {
+    param([bool]$Running, [int]$Seconds)
+    $deadline = [DateTime]::UtcNow.AddSeconds($Seconds)
+    do {
+        Start-Sleep -Milliseconds 500
+        $probe = Invoke-V9xSelf @{ Action = 'exec'; Application = $script:V9xVncExe
+                                   Arguments = '-status'; TimeoutSeconds = 15
+                                   ExpectedExitCode = [uint32[]]@(0, 1, 3) }
+        if ($null -ne $probe.Result -and ($probe.Result.ExitCode -in @(0, 3)) -eq $Running) { return $true }
+    } while ([DateTime]::UtcNow -lt $deadline)
+    return $false
+}
+
+if ($Action -eq 'vnc') {
+    try {
+        $status = Get-V9xVncStatus
+        $wasRunning = $status.Running
+        if ($VncCommand -ne 'status' -and -not $status.Installed) {
+            [Console]::Error.WriteLine("$($script:V9xVncExe) is not installed on this guest; install agent package 0.11.0 or later with SETUP.EXE.")
+            exit 23
+        }
+        if ($VncCommand -eq 'start' -and -not $status.Running) {
+            if (-not $status.Enabled) {
+                [Console]::Error.WriteLine('VNC remote control is disabled on this guest ([vnc] enabled=0 in AGENT.INI). Its owner turns it on with the VNC option in SETUP.EXE (or SETUP.EXE /S /vnc).')
+                exit 23
+            }
+            $launch = Invoke-V9xSelf @{ Action = 'exec'; Application = $script:V9xVncExe; Detach = $true }
+            if ($launch.ExitCode -ne 0 -or -not (Wait-V9xVncRunning -Running $true -Seconds 10)) {
+                [Console]::Error.WriteLine("V9XVNC.EXE did not start; see C:\V9XREMOTE\VNC.LOG on the guest.")
+                exit 30
+            }
+            $status.Running = $true
+        } elseif ($VncCommand -eq 'stop' -and $status.Running) {
+            [void](Invoke-V9xSelf @{ Action = 'exec'; Application = $script:V9xVncExe
+                                     Arguments = '-stop'; TimeoutSeconds = 15
+                                     ExpectedExitCode = [uint32[]]@(0, 1) })
+            if (-not (Wait-V9xVncRunning -Running $false -Seconds 10)) {
+                [Console]::Error.WriteLine('V9XVNC.EXE did not stop within 10 s.')
+                exit 32
+            }
+            $status.Running = $false
+        }
+    } catch {
+        [Console]::Error.WriteLine("vnc $VncCommand failed: $($_.Exception.Message)")
+        if ($_.Exception.Data.Contains('V9xExitCode')) { exit [int]$_.Exception.Data['V9xExitCode'] }
+        exit 22
+    }
+    $result = [pscustomobject]@{
+        Success = $true; Command = $VncCommand
+        Installed = $status.Installed; Enabled = $status.Enabled
+        Running = $status.Running; WasRunning = $wasRunning
+        VncPort = $status.Port; PasswordSet = $status.PasswordSet; Endpoint = "${EndpointHost}:$Port"
+    }
+    if ($Json) { $result | ConvertTo-Json -Depth 4 -Compress } else { $result | Format-List }
+    exit 0
+}
+
 $legacyUpdate = $false
 if ($Action -eq 'update') {
     # Hot update arrived in 0.6.0, but the capability bit it is checked by
@@ -778,6 +966,52 @@ if ($Action -eq 'update') {
         try { $agentVersion = [version]$agentInfo.AgentVersion } catch { }
         $legacyUpdate = ([uint32]$agentInfo.Capabilities -band [uint32]0x00000200) -eq 0 -or
             ($null -ne $agentVersion -and $agentVersion -lt [version]'0.6.0')
+    }
+}
+
+# The VNC server is its own process, untouched by the agent's hot swap, so it
+# is replaced on the side: stopped if it runs (a running image cannot be
+# overwritten), uploaded, and started again only if it was running. Whether it
+# is enabled stays the machine owner's choice in AGENT.INI.
+$vncUpdated = $false
+$vncRestarted = $false
+$vncPackageExe = if ($Action -eq 'update' -and (Test-Path -LiteralPath $Source -PathType Container)) {
+    Join-Path (Get-Item -LiteralPath $Source).FullName 'V9XVNC.EXE'
+} else { '' }
+if ($Action -eq 'update' -and -not $legacyUpdate -and $vncPackageExe -and
+    (Test-Path -LiteralPath $vncPackageExe -PathType Leaf)) {
+    try {
+        $vncBefore = Get-V9xVncStatus
+        if ($vncBefore.Running) {
+            [void](Invoke-V9xSelf @{ Action = 'exec'; Application = $script:V9xVncExe
+                                     Arguments = '-stop'; TimeoutSeconds = 15
+                                     ExpectedExitCode = [uint32[]]@(0, 1) })
+            [void](Wait-V9xVncRunning -Running $false -Seconds 10)
+        }
+        $vncPut = Invoke-V9xSelf @{ Action = 'put'; Source = $vncPackageExe; Destination = $script:V9xVncExe }
+        $vncUpdated = $vncPut.ExitCode -eq 0
+        if (-not $vncUpdated) { [Console]::Error.WriteLine('WARNING: V9XVNC.EXE could not be replaced; the agent update continues.') }
+        if ($vncBefore.Running) {
+            [void](Invoke-V9xSelf @{ Action = 'exec'; Application = $script:V9xVncExe; Detach = $true })
+            $vncRestarted = Wait-V9xVncRunning -Running $true -Seconds 10
+        }
+    } catch {
+        [Console]::Error.WriteLine("WARNING: V9XVNC.EXE was not updated: $($_.Exception.Message)")
+    }
+}
+
+# The tray's Settings... runs the installed SETUP.EXE, so it is replaced too,
+# or it keeps showing (and writing) the old version's options page.
+$setupUpdated = $false
+$setupPackageExe = if ($vncPackageExe) { Join-Path (Split-Path -Parent $vncPackageExe) 'SETUP.EXE' } else { '' }
+if ($Action -eq 'update' -and -not $legacyUpdate -and $setupPackageExe -and
+    (Test-Path -LiteralPath $setupPackageExe -PathType Leaf)) {
+    try {
+        $setupPut = Invoke-V9xSelf @{ Action = 'put'; Source = $setupPackageExe; Destination = 'C:\V9XREMOTE\SETUP.EXE' }
+        $setupUpdated = $setupPut.ExitCode -eq 0
+        if (-not $setupUpdated) { [Console]::Error.WriteLine('WARNING: SETUP.EXE could not be replaced (is it open?); the agent update continues.') }
+    } catch {
+        [Console]::Error.WriteLine("WARNING: SETUP.EXE was not updated: $($_.Exception.Message)")
     }
 }
 
@@ -917,10 +1151,14 @@ try {
         exit 0
     }
 
-    if ($Action -in @('reboot', 'shutdown')) {
+    if ($Action -in @('reboot', 'reset', 'shutdown')) {
         if (($hello.Capabilities -band [uint32]0x00000080) -eq 0) {
             $exitCategory = 23
             throw "Agent build '$($hello.BuildId)' does not advertise power-control support."
+        }
+        if ($Action -eq 'reset' -and ($hello.Capabilities -band [uint32]0x00010000) -eq 0) {
+            $exitCategory = 23
+            throw "Agent build '$($hello.BuildId)' does not advertise reset support (agent 0.10.0+ on Windows 9x)."
         }
         if ([string]::IsNullOrWhiteSpace($JobId)) {
             $JobId = ('m4-{0}-{1:x4}' -f (Get-Date -Format 'yyyyMMdd-HHmmss'),
@@ -930,8 +1168,9 @@ try {
             $exitCategory = 10
             throw 'JobId must be at most 63 ASCII bytes.'
         }
-        $powerType = if ($Action -eq 'reboot') { [uint16]0x0040 } else { [uint16]0x0041 }
-        $powerResponse = if ($Action -eq 'reboot') { [uint16]0x8040 } else { [uint16]0x8041 }
+        $powerType = switch ($Action) {
+            'reboot' { [uint16]0x0040 } 'reset' { [uint16]0x0043 } default { [uint16]0x0041 } }
+        $powerResponse = [uint16]($powerType -bor 0x8000)
         $bytes = New-V9xFrameBytes -Type $powerType -RequestId $requestId `
             -Payload (New-V9xPathPayload -Path $JobId)
         $stream.Write($bytes, 0, $bytes.Length)
@@ -984,7 +1223,8 @@ try {
             $client = $resumed.Client
             $result = [pscustomobject]@{
                 Success = $true; RequestId = $requestId; AgentBuild = $resumed.Hello.BuildId
-                Action = 'Reboot'; JobId = $JobId; PreviousBootCounter = $oldBootCounter
+                Action = $(if ($Action -eq 'reset') { 'Reset' } else { 'Reboot' })
+                JobId = $JobId; PreviousBootCounter = $oldBootCounter
                 BootCounter = $resumed.Hello.BootCounter; PendingJob = $resumed.Hello.PendingJob
                 DesktopReady = $resumed.Hello.DesktopReady
                 ScreenWidth = $resumed.Hello.ScreenWidth; ScreenHeight = $resumed.Hello.ScreenHeight
@@ -1259,6 +1499,8 @@ try {
             PreviousBuild = $oldBuild; PreviousBootCounter = $oldBootCounter
             AgentBuild = $resumed.Hello.BuildId; BootCounter = $resumed.Hello.BootCounter
             AgentBytes = $accepted.AgentSize; Reconnected = $true
+            VncUpdated = $vncUpdated; VncRestarted = $vncRestarted
+            SetupUpdated = $setupUpdated
             Endpoint = "${EndpointHost}:$Port"
         }
         if ($Json) { $result | ConvertTo-Json -Depth 4 -Compress } else { $result | Format-List }
@@ -1313,6 +1555,16 @@ try {
                 AgentBuild = $hello.BuildId; Source = $transfer.Source
                 Destination = $transfer.Destination; Bytes = $transfer.Size
                 Crc32 = ('{0:X8}' -f $transfer.Crc32)
+            }
+            # put is byte-exact. A Windows text file with LF-only lines is
+            # stored as sent, and Windows 9x then misbehaves: COMMAND.COM
+            # misparses batch files, and the profile writer appends keys an
+            # LF-only INI cannot read back (the duplicate install_id bug).
+            if ($Destination -match '\.(ini|bat|cmd|reg|cfg|inf)$' -and
+                (Test-V9xBareLf -LiteralPath $transfer.Source)) {
+                $warning = "$Destination was sent with LF-only line ends; Windows 9x expects CRLF. Convert the source and put it again."
+                $result | Add-Member -NotePropertyName Warning -NotePropertyValue $warning
+                [Console]::Error.WriteLine("WARNING: $warning")
             }
         } elseif ($Action -eq 'get') {
             $transfer = Invoke-V9xGetInternal -Stream $stream -RequestId ([ref]$requestId) `

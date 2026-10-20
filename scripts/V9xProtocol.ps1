@@ -465,8 +465,53 @@ function ConvertFrom-V9xScreenshotPayload {
     }
 }
 
+$script:V9xCrcNative = $null
+
+# A PowerShell loop manages about 2.5 MiB/s, which made a 300 MiB put spend
+# two minutes hashing. Large buffers go through a compiled loop instead,
+# compiled on first use because Add-Type starts csc (about a second);
+# small transfers never pay for it. Falls back to the script loop if
+# compilation is unavailable.
+function Initialize-V9xCrcNative {
+    if ($null -ne $script:V9xCrcNative) { return $script:V9xCrcNative }
+    $script:V9xCrcNative = $false
+    try {
+        if (-not ('V9xCrc32Native' -as [type])) {
+            Add-Type -Language CSharp -TypeDefinition @'
+public static class V9xCrc32Native
+{
+    private static readonly uint[] Table = Build();
+    private static uint[] Build()
+    {
+        uint[] table = new uint[256];
+        for (uint i = 0; i < 256; ++i)
+        {
+            uint entry = i;
+            for (int bit = 0; bit < 8; ++bit)
+                entry = (entry & 1) != 0 ? (entry >> 1) ^ 0xEDB88320u : entry >> 1;
+            table[i] = entry;
+        }
+        return table;
+    }
+    public static uint Update(uint crc, byte[] bytes, int offset, int count)
+    {
+        for (int i = 0; i < count; ++i)
+            crc = (crc >> 8) ^ Table[(crc ^ bytes[offset + i]) & 0xFF];
+        return crc;
+    }
+}
+'@
+        }
+        $script:V9xCrcNative = $true
+    } catch { }
+    return $script:V9xCrcNative
+}
+
 function Update-V9xCrc32 {
     param([uint32]$Crc, [byte[]]$Bytes, [int]$Offset = 0, [int]$Count = $Bytes.Length)
+    if ($Count -ge 4096 -and (Initialize-V9xCrcNative)) {
+        return [V9xCrc32Native]::Update($Crc, $Bytes, $Offset, $Count)
+    }
     if ($null -eq $script:V9xCrcTable) {
         $script:V9xCrcTable = [uint32[]]::new(256)
         for ($tableIndex = 0; $tableIndex -lt 256; ++$tableIndex) {
@@ -707,4 +752,35 @@ function ConvertTo-V9xDiscoveredAgents {
         })
     }
     return $agents.ToArray()
+}
+
+# Remote help (docs\remote-help.md): a Stream that tunnels the protocol to an
+# opted-in machine through the update server. Server, operator key, signer
+# and signing key default as in mcp\v9x_relay.py.
+function New-V9xRelayStream {
+    param([string]$Machine, [string]$Server, [int]$OpenWaitSeconds = 150)
+    if (-not ('V9xRelayStream' -as [type])) {
+        Add-Type -Path (Join-Path $PSScriptRoot 'V9xRelayStream.cs') `
+            -ReferencedAssemblies 'System.Web.Extensions'
+    }
+    $home9x = Join-Path $env:USERPROFILE '.v9x'
+    if (-not $Server) { $Server = $env:V9X_RELAY_SERVER }
+    if (-not $Server) { $Server = 'https://michaeldale.com.au' }
+    $operatorKey = $env:V9X_OPERATOR_KEY
+    if (-not $operatorKey -and (Test-Path -LiteralPath (Join-Path $home9x 'operator.key'))) {
+        $operatorKey = (Get-Content -LiteralPath (Join-Path $home9x 'operator.key') -Raw).Trim()
+    }
+    if (-not $operatorKey) {
+        throw "No operator key: put the key from the plugin's Machines page in $home9x\operator.key or V9X_OPERATOR_KEY."
+    }
+    $signer = $env:V9XSIGN
+    if (-not $signer) { $signer = Join-Path (Split-Path -Parent $PSScriptRoot) 'build\tools\v9xsign.exe' }
+    if (-not (Test-Path -LiteralPath $signer)) {
+        throw "v9xsign.exe not found at $signer; run scripts\build-host-tests.ps1 or set V9XSIGN."
+    }
+    $signingKey = Join-Path $home9x 'relay-signing.key'
+    if (-not (Test-Path -LiteralPath $signingKey)) {
+        throw "No relay signing key at $signingKey (v9xsign keygen)."
+    }
+    return [V9xRelayStream]::new($Server, $operatorKey, $signer, $signingKey, $Machine, $OpenWaitSeconds)
 }

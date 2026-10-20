@@ -40,6 +40,16 @@ returns, so a LAN guest still needs `--allow-remote`.
 `--query-address ip[:port]` sends the query unicast, and `--discover-seconds`
 (default 3) sets how long to listen.
 
+Remote help (agent 0.12.0+, [../docs/remote-help.md](../docs/remote-help.md)):
+every tool that talks to an agent takes `relay: "M-XXXXXX"` and then drives
+that lent machine through the update server; `--relay M-XXXXXX` makes one
+machine the default, and `--relay-server` (or `V9X_RELAY_SERVER`) picks the
+server (default `https://michaeldale.com.au`). `v9x_relay_machines` lists the
+lent machines and `v9x_chat` talks to their owners. Commands are signed by
+`build\tools\v9xsign.exe` with `%USERPROFILE%\.v9x\relay-signing.key`; the
+operator key comes from `%USERPROFILE%\.v9x\operator.key` or
+`V9X_OPERATOR_KEY`. `v9x_relay.py` beside the server is the transport.
+
 ## Tools
 
 | Tool | Purpose |
@@ -64,8 +74,12 @@ returns, so a LAN guest still needs `--allow-remote`.
 | `v9x_scroll` | Scroll the mouse wheel |
 | `v9x_input` | Raw ordered action batch for drags and precise sequences |
 | `v9x_reboot_with_proof` | Reboot and verify reconnect + changed agent-start counter + echoed resume token |
+| `v9x_reset_with_proof` | Windows 9x guests whose restart hangs: flush, hard reset through CF9h, same proof as reboot (agent 0.10.0+) |
 | `v9x_shutdown` | Clean shutdown |
 | `v9x_wait_desktop` | Block until the Windows desktop is ready |
+| `v9x_vnc` | Status, start or stop the guest's VNC server for a person to use (only where SETUP.EXE enabled it) |
+| `v9x_relay_machines` | Remote-help machines lent by their owners: id, owner, OS, online, paused, busy |
+| `v9x_chat` | Send a chat message to a remote-help machine's owner, or read the conversation |
 
 Every tool opens a fresh connection, so a crashed VM never wedges the server;
 errors come back as tool results with `isError` set.

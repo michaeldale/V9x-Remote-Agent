@@ -48,6 +48,15 @@ Finding agents by discovery (agent 0.8.0+ with `discovery=1`):
   back on a new DHCP address is still followed.
 - `-QueryAddress <ip[:port]>` sends the query unicast to one address instead
   of multicasting, for routed subnets or a forwarded UDP port.
+- `-Relay M-XXXXXX` works with every verb except `discover` and `vnc`: it
+  drives a remote-help machine through the update server instead of
+  `-Host`/`-Port` (agent 0.12.0+ with Remote help On; see
+  [remote-help.md](remote-help.md)). It needs the operator key in
+  `%USERPROFILE%\.v9x\operator.key` (or `V9X_OPERATOR_KEY`), the signing key
+  in `%USERPROFILE%\.v9x\relay-signing.key` and `build\tools\v9xsign.exe`.
+  `-RelayServer` (or `V9X_RELAY_SERVER`) points at another copy of the
+  server, e.g. `http://localhost/bluetraitblog` for testing. The first verb
+  after an idle spell waits up to a minute for the machine to check in.
 
 `update -Source <package dir>` hot-swaps agents from 0.6.0 on. For an older
 agent (INFO `AgentVersion` below 0.6.0; the capability bit cannot tell) it
@@ -116,9 +125,10 @@ File examples:
     -Destination C:\V9XREMOTE\JOBS\demo
 ```
 
-Uploads and gets are limited to 256 MiB per file (64 MiB on agents
-before 0.6.4, which reject larger transfers with exit 40); a guest `download`
-is limited to 2 GiB on agent 0.8.1+. `put` commits only after
+Uploads and gets are limited to 2 GiB per file on agent 0.11.0+
+(256 MiB on older agents and 64 MiB before 0.6.4, which reject larger
+transfers with exit 40); a guest `download` is limited to 2 GiB on agent
+0.8.1+. `put` commits only after
 the guest verifies size and CRC32. `get` writes a uniquely named local `.part`
 and replaces the requested destination only after matching the guest's final
 size and CRC32.
@@ -127,6 +137,7 @@ Boot and capture examples:
 
 ```powershell
 .\scripts\v9xctl.ps1 reboot -JobId driver-abc123 -WaitSeconds 180 -Json
+.\scripts\v9xctl.ps1 reset -JobId driver-abc124 -WaitSeconds 240 -Json
 .\scripts\v9xctl.ps1 shutdown -JobId maintenance-01 -Json
 .\scripts\v9xctl.ps1 wait-desktop -WaitSeconds 120 -Json
 .\scripts\v9xctl.ps1 screenshot -Destination .\desktop.bmp -Json
@@ -136,7 +147,10 @@ Boot and capture examples:
 
 `BootCounter` increments on every agent start and is not reboot proof alone.
 `reboot` succeeds only after disconnect/reconnect when a new HELLO has both a
-changed counter and the requested persisted job token. `wait-desktop` must
+changed counter and the requested persisted job token. `reset` (agent 0.10.0+,
+Windows 9x) is proven the same way; use it only on a guest whose Windows restart
+hangs, see [guest-agent.md](guest-agent.md). It exits 23 against an agent that
+does not advertise it. `wait-desktop` must
 then confirm Explorer readiness before post-reboot work; it polls INFO until the Explorer
 desktop (`Progman` or `Shell_TrayWnd`) appears. `screenshot` writes on the guest
 and then transactionally downloads and verifies the BMP.
@@ -169,6 +183,31 @@ order as one atomic batch (at most 256 steps):
 
 The result reports the actions performed and the final cursor position. Input
 needs a ready desktop; run `wait-desktop` first after a reboot.
+
+The guest's VNC server (for a person with a VNC viewer):
+
+```powershell
+.\scripts\v9xctl.ps1 vnc status -Json
+.\scripts\v9xctl.ps1 vnc start
+.\scripts\v9xctl.ps1 vnc stop
+```
+
+`vnc` is built from existing verbs, with no protocol change:
+
+- it reads `[vnc]` from `C:\V9XREMOTE\AGENT.INI` with `get`;
+- it asks `V9XVNC.EXE -status` with `exec`;
+- `start` launches the server detached, and `stop` runs `V9XVNC.EXE -stop`.
+
+Both `start` and `stop` then wait up to 10 s for the change. The result
+reports `Installed`, `Enabled`, `Running`, `WasRunning`, `VncPort` and
+`PasswordSet` (whether a VNC password is set; the password itself is never
+shown). Exit
+codes:
+
+- 23: the server is not installed, or `start` was asked of a guest whose
+  owner has not enabled it (SETUP.EXE's VNC option);
+- 30: it did not start;
+- 32: it did not stop.
 
 `run-driver-cycle.ps1` uploads and preflights a driver package. It does not
 modify the driver unless both `-Apply` and `-ConfirmAlreadyAssociated` are

@@ -2,6 +2,299 @@
 
 All notable changes to the V9x Remote Agent. Dates are in YYYY-MM-DD.
 
+## 0.12.0 (2026-10-20)
+
+### Added
+- **Remote help** (docs\remote-help.md): the owner of a real Windows 9x or
+  2000 machine can lend it to the developer over the Internet, and the
+  developer drives it with every existing verb and MCP tool.
+  - **Off by default.** The tray's new "Remote help..." item opens
+    `SETUP.EXE /remote`, which explains what lending allows, takes a name,
+    GitHub user and email, and sets `[remote] mode=on`. The agent then
+    registers its install ID with the update server, which issues a
+    machine id (`M-XXXXXX`), and checks in every 60 s (2 s while a session
+    or chat is active). "Pause remote help" on the tray blocks commands
+    until the agent restarts; chat keeps working.
+  - **Signed relay.** A session is a byte tunnel from the developer's PC to
+    the agent's own handlers, through the server over plain HTTP. Every
+    chunk towards the agent is Ed25519-signed on the developer's PC by the
+    new `build\tools\v9xsign.exe` and checked by the agent against
+    `include\v9xremote\remote_key.h`, bound to an agent-chosen nonce and a
+    sequence number, so neither the server nor anyone on the path can run
+    anything; a bad chunk ends the session (`relay-bad-chunk`).
+  - **Host side.** `v9x_mcp.py` takes `relay="M-XXXXXX"` on every agent tool
+    (or `--relay`), and adds `v9x_relay_machines` and `v9x_chat`;
+    `v9xctl.ps1` takes `-Relay M-XXXXXX` on every verb. Uploads keep 1 MiB
+    of chunks in flight through the relay. Reboot and update proofs
+    reconnect through a new session.
+  - **Chat.** Two-way: a message from the developer pops up in the agent's
+    chat window (tray: "Chat with developer..."), and the owner's replies
+    reach the developer's dashboard and MCP.
+  - **In use.** The agent remembers when the last command (anything but
+    HELLO and PING) arrived and from where (a LAN address or `relay`). The
+    tray tooltip reads "In use: last command N s ago from ..." for a minute
+    afterwards; the age also goes to the server and to `C:\V9XREMOTE\STATUS.INI`,
+    which the `/remote` page shows.
+  - **Server.** The `v9x_update_checker` plugin (separate repository) gains
+    the agent and developer endpoints, a Machines tab (online machines,
+    owners, state, last command, chat) and MCP tools `remote_list_machines`,
+    `remote_get_machine`, `remote_chat_send`, `remote_chat_read` and
+    `remote_set_machine`, none of which can command a machine.
+- **Self-update.** Tray "Check for updates..." runs `SETUP.EXE /update`: it
+  asks the update server, verifies the release's Ed25519-signed SIGNED.TXT
+  against `include\v9xremote\release_key.h` and the downloaded zip's size
+  and SHA-256 against that, shows the release notes, and on the owner's
+  yes stages the new version through the normal upgrade path (it takes over
+  at the next restart). `[update] check_on_startup=1` (a tickbox on the
+  `/remote` page) checks quietly after start and turns the tray item into
+  "Install update x.y.z...". The crypto, inflate and zip reader are ported
+  from the Velocity9x updater, with its host tests.
+- `make-release.ps1` also builds `v9x-remote-agent-<version>-win32.zip`, the
+  self-update package, and the release workflow publishes it;
+  `scripts\sign-release.ps1` signs it afterwards on the developer's PC.
+
+### Changed
+- The DOWNLOAD verb's HTTP client moved to `src\guest\http.c`, shared with
+  remote help and SETUP.EXE; a silent server now times out after 60 s
+  instead of hanging the request.
+- SETUP.EXE imports WSOCK32 (for `/update`).
+- `publish-github.ps1` strips the update server's exact host name before its
+  private-name check.
+
+## 0.11.0 (released as part of 0.12.0)
+
+### Added
+- `V9XVNC.EXE`: live remote control over standard VNC (RFB 3.3/3.7/3.8), so
+  any VNC viewer can watch the screen and drive the keyboard and mouse.
+  - **Off by default.** It serves only when `AGENT.INI` has `[vnc]
+    enabled=1` (exit 9 otherwise). SETUP.EXE has an "Enable VNC remote
+    control" option, unticked by default; `/vnc` and `/novnc` set it for a
+    silent install. Ticked, setup writes `enabled=1`, starts the server from
+    `HKLM\...\Run` at every logon (on Windows 9x and 2000, since it needs a
+    desktop) and starts it now. Unticked, or on uninstall, setup removes that
+    and stops a running server. `INSTALL.BAT` copies the binary but never
+    enables it.
+  - **Separate process.** It runs apart from the agent, like `V9XSHOT.EXE`,
+    because GDI capture can hang in a broken display driver; the agent never
+    imports GDI32. Inside the server every GDI call runs on one worker
+    thread. A capture that takes over 5 s is logged as `capture-stalled`:
+    the server keeps reading input and sends no frames until it recovers
+    (`capture-resumed`). If setup or teardown is stuck for 15 s, it logs
+    `gdi-wedged-exit` and exits 10, releasing every held key first.
+  - **Settings.** One viewer at a time, security type None unless a password
+    is set (see below), `bind_address`
+    and `allowed_client` honoured. Port and poll rate are in `[vnc]` (default
+    5900, 100 ms).
+  - **Frames.** The screen is polled into a 32 bpp DIB section and only
+    changed 16x16 tiles are sent, as Raw or Hextile, in whatever 8/16/32 bpp
+    true-colour format the viewer asks for; a colour-map viewer gets a fixed
+    3-3-2 palette. The cursor is drawn into the frame (Windows 98 and later).
+    A mode change is sent as DesktopSize, or drops a viewer that does not
+    support it.
+  - **Keys.** X11 keysyms map to virtual keys, with extended keys flagged and
+    Shift added when a layout needs it. Everything held is released when the
+    viewer disconnects.
+  - **Cursor.** A viewer that takes the RichCursor pseudo-encoding gets the
+    cursor shape on its own and draws it locally, so the frame no longer
+    contains it and moving the mouse dirties no tiles. The shape is rendered
+    over black and over white to find transparent and inverting pixels.
+    PointerPos reports moves the guest makes itself. Other viewers still get
+    the cursor drawn into the frame.
+  - **A second viewer** gets RFB's connection-failed reply ("Another VNC
+    viewer is connected to this machine.") instead of hanging in the listen
+    backlog.
+  - **ZRLE.** The deflate encoder is written for this project
+    (`src\guest\vncz.c`: fixed Huffman, greedy LZ77, a sync flush after each
+    rectangle, one zlib stream per connection), since the build has no C
+    runtime or zlib. Each tile takes the smallest of raw, solid, packed
+    palette, plain RLE and palette RLE. One full 1024x768 frame of the test
+    desktop at 32 bpp took 20 KB, against 104 KB for Hextile and 3.1 MB for
+    Raw. The server takes the first of ZRLE, Hextile and Raw in the viewer's
+    order.
+  - **CopyRect.** When the foreground window turns up elsewhere at the same
+    size, the viewer copies the pixels it already has, and the tile diff
+    then sends only what the copy missed.
+  - **Clipboard both ways.** Text only, as `CF_TEXT` with Latin-1 and CRLF on
+    the Windows side. Changes are found by polling every 0.5 s and compared
+    by hash, so text from the viewer is not echoed back. All clipboard calls
+    run on the GDI worker, so the watchdog covers an owner that hangs; its
+    wait now also handles window messages, because the clipboard owner window
+    must answer them.
+  - **Optional VNC password** (`[vnc] password`, at most 8 characters, a
+    masked field in SETUP.EXE). Viewers then use VNC authentication; DES is
+    in `src\guest\vncdes.c` and checked against FIPS known answers by the new
+    host test. A wrong password is refused after 2 s. `vnc status` and
+    `v9x_vnc` report `PasswordSet`, never the password.
+  - **Sampled capture.** Reading the whole screen back was the bottleneck:
+    about 780 ms per 1024x768 frame on an emulated S3 ViRGE at 16 bpp,
+    against about 80 ms to diff and next to nothing to encode, which held a
+    viewer to roughly one frame a second. Each poll now reads one pixel row
+    per 16-row band of tiles, rotating which row through all 16. It then
+    reads in full only the tiles whose sampled row changed, those that
+    changed last frame, and the area under a drawn cursor, and the diff
+    checks only those tiles. A full read still happens for a full-frame
+    request and after a resize. In the same typing test, polls went from
+    10-12 to 98 per 10 s (about 54 ms each), so the 100 ms poll interval is
+    now the limit. `perf-*` lines in `VNC.LOG` (every 60 s and at session
+    end) give capture, diff, encode and send times.
+  - **Windows 2000.** On NT the server installs and runs as a Windows service
+    (`V9xRemoteVnc`) as LocalSystem, instead of the Run key, because only
+    SYSTEM can open the Winlogon (secure) desktop. The capture and input
+    threads follow the input desktop with `OpenInputDesktop` /
+    `SetThreadDesktop`, so a viewer sees and can drive the lock / "Unlock
+    Computer" dialog and the logon screen, not just the user desktop. The
+    capture thread owns no window (the clipboard moved to its own thread,
+    which owns the hidden clipboard window) so `SetThreadDesktop` can move
+    it. `V9XVNC.EXE -install` / `-uninstall` manage the service (SETUP.EXE
+    does this on NT); `-service` is the SCM entry point. Sending Ctrl+Alt+Del
+    from a viewer is not supported (no pre-Vista API); pair the VM with
+    autologon. All of this is resolved at run time and is inert on Windows 9x
+    and Windows 95. Service support: `src\guest\vncsvc.c`.
+  - **Command line.** `-stop` and `-status` (exit 0 running, 1 not).
+  - **Test hook.** While `C:\V9XREMOTE\TEMP\VNCSTALL.DAT` exists the capture
+    worker behaves as if wedged, so `tests\integration\vnc_stall.py` can
+    drive the watchdog on a healthy machine.
+- `v9xctl vnc status|start|stop` and the MCP `v9x_vnc` tool. They report
+  whether V9XVNC.EXE is installed, enabled and running. `start` is refused
+  (exit 23) on a guest where it is not enabled; the agent's protocol is
+  unchanged. `v9xctl update` and the MCP `v9x_update` also replace
+  `V9XVNC.EXE` when the package has it: they stop it first and restart it
+  only if it was running.
+- Verified on a Windows 98 SE VM:
+  - against a frame-exact test client (`tests\integration\vnc_smoke.py`) at
+    every depth and over all three RFB versions;
+  - input, a resolution change, and stop/start;
+  - SETUP.EXE's checkbox in the wizard, and `/S /vnc` and `/S /novnc`;
+  - both `update` paths;
+  - RichCursor (the frame then matched the cursor-less screenshot exactly)
+    and PointerPos;
+  - the busy reply to a second viewer;
+  - the service on Windows 2000, capturing and driving the locked secure
+    desktop ("Unlock Computer") that a user-context server could not;
+  - a forced stall: input was still served, no frames were sent until the
+    stall ended, and a stalled setup exited 10 after 15 s;
+  - ZRLE decoding to frames identical to Hextile's at 32, 16 and 8 bpp;
+  - CopyRect while dragging a window;
+  - clipboard text with umlauts and a line break in both directions;
+  - the password field in SETUP.EXE, and right and wrong passwords over RFB
+    3.3, 3.7 and 3.8.
+- `build-host-tests.ps1` also builds `tests\host\test_vnc.c`. It checks DES
+  against the FIPS known answers, and Python's zlib must inflate the ZRLE
+  deflate output back exactly, as one stream.
+
+  Design: `docs/decisions/2026-10-15-vnc-remote-control.md`.
+- Tray icon menu. Right-click the agent's notification-area icon for
+  **Settings...** and **Restart agent**; double-click opens Settings.
+  Settings runs the installed `C:\V9XREMOTE\SETUP.EXE /settings`, which
+  opens straight on the options page (LAN discovery, DOS programs, TCP port,
+  listen address, allowed client, VNC and its password) under a "Settings"
+  title. Save writes `AGENT.INI` and applies VNC as before; when setup exits
+  0 the agent restarts itself (new boot counter, about a second) so the
+  settings apply without a reboot. Cancel changes nothing. Settings is
+  greyed out when `SETUP.EXE` is not installed. Log events:
+  `tray-settings-opened`, `tray-settings-closed saved|unchanged`,
+  `tray-restart`, and `tray-class-failed`, `tray-settings-failed`,
+  `tray-restart-failed` with a `gle=` code. Verified on Windows 98 SE and 2000.
+
+### Changed
+- `put`, `get` and `push-tree` take files up to 2 GiB (2,147,483,647 bytes),
+  up from 256 MiB, on both the Windows and DOS agents (`V9X_MAX_FILE_SIZE`),
+  the same ceiling `download` has had since 0.8.1. The wire format is
+  unchanged: sizes and offsets were already 32-bit and every path streams
+  32 KiB chunks to disk. 2 GiB rather than 4 keeps every size inside a signed
+  32-bit file length (DOS `filelength`, FAT16's own limit). The MCP server now
+  streams `v9x_put_file`, `v9x_get_file` and `v9x_push_tree` through the file
+  instead of holding the whole file in memory, and `v9xctl put` no longer
+  reads a large file whole for the LF-only check. An older agent still
+  rejects anything over 256 MiB with `LIMIT_EXCEEDED` (exit 40), so update
+  the guest first. Verified on a Windows 98 SE VM with a 300 MiB `put`
+  (314,572,800 bytes, CRC matched); `get` round trips were checked at 16 MiB.
+- Faster `v9xctl put`, `get` and `push-tree`. The host hashed files with a
+  PowerShell loop at about 2.5 MiB/s, so a 300 MiB put spent two minutes
+  before sending anything; large buffers now go through a compiled CRC32
+  (`Add-Type`, compiled on first use, script-loop fallback): 300 MiB hashes in
+  about a second. The put loop reuses one frame buffer instead of building
+  two arrays per 32 KiB chunk, which had also been unrolled to `object[]` and
+  copied back on every write. 16 MiB `put` on the Windows 98 SE VM went from
+  0.91 to 1.07 MB/s, against 1.13 MB/s from the MCP server.
+- The agent asks for 64 KiB socket buffers on its listener and sets
+  `TCP_NODELAY` on each connection (Windows agent; the DOS agent is
+  unchanged). Round-trip time for a small request on the VM fell from about
+  4 ms to 1 ms, which helps many-request work such as `push-tree` of small
+  files. Bulk throughput did not change: on 86Box it is set by the emulated
+  NIC (about 1.1 MB/s on the ISA NE2000, 1.75 MB/s on PCnet-FAST at the same
+  200 MHz CPU), and sending several chunks before waiting for acks gained
+  nothing, so the protocol stays stop-and-wait.
+- `v9xctl update` and the MCP `v9x_update` also replace
+  `C:\V9XREMOTE\SETUP.EXE` when the package has it (`SetupUpdated` /
+  `setup_updated`). The tray's **Settings...** runs that copy, so after a hot
+  update it still showed the old version in its title. A copy that is open
+  in the guest is left alone with a warning; the agent update goes ahead.
+
+### Fixed
+- VNC on Windows 2000 could not be queried, stopped or upgraded from the
+  host. Three bugs, found while testing the tray menu:
+  - `v9xctl vnc status` failed with "You cannot call a method on a
+    null-valued expression", and `update` skipped `V9XVNC.EXE` with the same
+    warning, whenever `AGENT.INI` had a `[vnc] port=` line (the Windows 2000
+    VM's does). The port test's own `-match` replaced `$Matches` before the
+    value was read. The MCP server parses the INI without regexes and was
+    not affected.
+  - `V9XVNC.EXE -status` reported the Windows 2000 service as not running,
+    and `-stop` could not stop it: the service's stop event carries
+    LocalSystem's default DACL, so the logged-on user's `OpenEventA` gets
+    access denied. `-status` now counts access denied as running; `-stop`
+    and a plain start go through the SCM when the service is installed
+    (start or stop the service, 0 ok, 1 failed), so `v9xctl vnc start`
+    brings back the service rather than a user-session server that cannot
+    reach the logon desktop.
+  - SETUP.EXE upgrading an install on Windows 2000 while the VNC service ran
+    failed at "Copy V9XVNC.EXE" (setup exit 1), for the same reason. On NT
+    setup now runs the package's `V9XVNC.EXE -stop` first.
+  Verified on the Windows 2000 VM (`vnc status/stop/start`, `update` with a
+  running service, `SETUP.EXE /S` over a running service) and again on
+  Windows 98 SE.
+
+## 0.10.0 (released as part of 0.12.0)
+
+### Added
+- `reset` verb (`RESET_REQUEST` `0x0043` / `RESET_ACCEPTED` `0x8043`,
+  capability `V9X_CAP_HARD_RESET` `0x00010000`, Windows 9x only): restarts a
+  machine whose Windows restart hangs, without Windows' return to real mode.
+  For the Velocity9x netbook, where the resident real-mode NDIS2 ethernet
+  driver stops every restart at a flashing cursor or a fatal exception 0C.
+  Same proof as `reboot` (persisted token, new boot counter, reconnect). After
+  `RESET_ACCEPTED` the agent sends `WM_ENDSESSION` to other programs' top-level
+  windows (no `WM_QUERYENDSESSION`, as `EWX_FORCE`), flushes the registry,
+  takes a level-1 lock on every fixed drive (which commits VCACHE and leaves
+  the FAT clean, so ScanDisk does not run), stops writing its own log, waits
+  3 s for the drive to empty its write cache, then starts a full reset (a
+  power cycle) through the reset control register: `0Ah`, then `0Eh` to
+  `CF9h`. There is no fallback: if the machine is still running 8 s later
+  the agent releases the locks, logs `reset-failed` and keeps running. Port
+  `92h` INIT and the 8042 pulse were tried and dropped: the 8042 pulse goes
+  through VKD into Windows' own restart path, and the netbook went dark
+  until its power button was held after a hard reset (`02h`/`06h`) followed
+  by `92h`. Verified on the netbook: it comes back on its own in about 30 s
+  with no ScanDisk. Ring-3 access to `CF9h` was measured on Windows 98 SE on
+  a PIIX4 VM and an ICH7 netbook with `tests\integration\portprobe.c`; the
+  flush with `resetprb.c` and `flushprb.c`.
+
+### Fixed
+- The install ID no longer changes on every start when `AGENT.INI` has LF-only
+  line ends. The Windows 9x profile writer appends a key to an LF-only
+  section as `<CR>install_id=...<CR>`, which `GetPrivateProfileString` never
+  reads back, so each start generated and appended another ID (a netbook whose
+  `AGENT.INI` had been uploaded with `put` from an LF file held about 50).
+  The agent and SETUP.EXE now repair `AGENT.INI` before reading it: CRLF line
+  ends, blank-line runs collapsed, and only the first `install_id` kept (the
+  one Windows returns), with the original saved as `AGENT.BAK` and
+  `config-repaired` logged. A clean file is left alone. Reproduced and
+  verified on a Windows 98 SE VM.
+- `v9xctl put` and the MCP `v9x_put_file` tool warn (stderr and a `Warning` /
+  `warning` result field) when an `.INI`, `.BAT`, `.CMD`, `.REG`, `.CFG` or
+  `.INF` file is sent with LF-only line ends. The transfer stays byte-exact.
+
 ## 0.9.1 (2026-10-09)
 
 ### Changed

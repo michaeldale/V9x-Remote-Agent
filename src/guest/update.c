@@ -94,9 +94,11 @@ static int v9x_update_verify(V9xConnection *conn, const char *path,
 /* Launch a process with inheritable NUL standard handles. The agent runs from
    RunServices with no console and no standard handles, and a child launched
    without any at all fails on Win9x, exactly as the detached-exec path in
-   execute.c found. Both the swapper and the relaunched agent go through
-   here. The command line must be writable (CreateProcessA may modify it). */
-static int v9x_update_spawn(const char *command, DWORD *native_error)
+   execute.c found. The swapper, the relaunched agent and the tray's
+   SETUP.EXE all go through here. The command line is copied, because
+   CreateProcessA may modify it. With process_out the caller gets the process
+   handle and must close it. */
+int v9x_spawn(const char *command, HANDLE *process_out, DWORD *native_error)
 {
     STARTUPINFOA startup;
     PROCESS_INFORMATION process;
@@ -127,7 +129,8 @@ static int v9x_update_spawn(const char *command, DWORD *native_error)
             return 0;
         }
         CloseHandle(process.hThread);
-        CloseHandle(process.hProcess);
+        if (process_out != 0) *process_out = process.hProcess;
+        else CloseHandle(process.hProcess);
         return 1;
     }
     security.nLength = sizeof(security);
@@ -153,8 +156,16 @@ static int v9x_update_spawn(const char *command, DWORD *native_error)
     }
     CloseHandle(nul);
     CloseHandle(process.hThread);
-    CloseHandle(process.hProcess);
+    if (process_out != 0) *process_out = process.hProcess;
+    else CloseHandle(process.hProcess);
     return 1;
+}
+
+/* Start a fresh agent, for the tray's Restart. The caller exits right after;
+   the new agent's singleton guard waits out the old one's mutex. */
+int v9x_agent_relaunch(DWORD *native_error)
+{
+    return v9x_spawn(v9x_update_relaunch, 0, native_error);
 }
 
 int v9x_handle_update(V9xConnection *conn, unsigned long request_id,
@@ -192,7 +203,7 @@ int v9x_handle_update(V9xConnection *conn, unsigned long request_id,
     }
     /* A fresh log per swap, as the batch used to write. */
     (void)DeleteFileA(v9x_update_log);
-    if (!v9x_update_spawn(v9x_update_swap_command, &native_error)) {
+    if (!v9x_spawn(v9x_update_swap_command, 0, &native_error)) {
         return v9x_update_error(conn, request_id, V9X_STATUS_CREATE_FAILED,
                                 native_error, "hot-swap launch failed");
     }
@@ -318,7 +329,7 @@ int v9x_hotswap_run(void)
     }
     v9x_hotswap_register();
     v9x_hotswap_log("agent-relaunch");
-    if (!v9x_update_spawn(v9x_update_relaunch, &native_error)) {
+    if (!v9x_spawn(v9x_update_relaunch, 0, &native_error)) {
         v9x_hotswap_log("agent-relaunch-failed");
         return 3;
     }

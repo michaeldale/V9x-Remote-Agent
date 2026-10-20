@@ -9,10 +9,18 @@ static const char v9x_log_old_path[] = "C:\\V9XREMOTE\\AGENT.OLD";
 #define V9X_LOG_LINE_MAX 512ul
 
 static DWORD v9x_log_boot = 0ul;
+static volatile LONG v9x_log_frozen = 0l;
 
 void v9x_log_set_boot(DWORD boot_counter)
 {
     v9x_log_boot = boot_counter;
+}
+
+/* RESET freezes the log once its flush starts, so no agent thread (a client
+   reconnecting to look for the reset, say) dirties the disk cache again. */
+void v9x_log_freeze(int frozen)
+{
+    v9x_log_frozen = frozen ? 1l : 0l;
 }
 
 static unsigned long v9x_log_pad(char *target, unsigned long offset,
@@ -74,6 +82,7 @@ void v9x_log_event(const char *event_name, const char *detail)
     char line[V9X_LOG_LINE_MAX];
     unsigned long offset = 0ul;
 
+    if (v9x_log_frozen) return;
     v9x_log_rotate();
 
     GetLocalTime(&now);

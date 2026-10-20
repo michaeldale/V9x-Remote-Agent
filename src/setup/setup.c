@@ -18,7 +18,21 @@
 
      SETUP.EXE             the wizard
      SETUP.EXE /S          silent install with current or default settings
+     SETUP.EXE /vnc        tick the VNC option (/novnc unticks it); with /S too
      SETUP.EXE /uninstall  remove autostart and the Add/Remove Programs entry
+     SETUP.EXE /settings   the tray icon's Settings: opens on the options page
+                           (installed copy only); exit 0 means saved, and the
+                           agent then restarts itself to apply them
+     SETUP.EXE /remote     the tray icon's Remote help: the opt-in page for
+                           lending this machine to the developer (installed
+                           copy only); exit 0 means saved, as /settings
+     SETUP.EXE /update     check for, verify and stage a newer version
+                           (selfupdate.c)
+
+   VNC remote control (V9XVNC.EXE) is off unless the VNC option is ticked:
+   then [vnc] enabled=1 is written and the server starts from Run at each
+   logon, and now; unticked, or on uninstall, both are undone. The optional
+   VNC password (at most 8 characters) goes to [vnc] password.
 
    Exit code: 0 success, 1 failed, 2 cancelled. */
 
@@ -30,13 +44,14 @@
 #include "../guest/platform_win.h"
 
 #define V9X_SETUP_WIDTH 480
-#define V9X_SETUP_HEIGHT 340
-#define V9X_SETUP_MAX_CONTROLS 40
+#define V9X_SETUP_HEIGHT 424
+#define V9X_SETUP_MAX_CONTROLS 64
 
 #define V9X_PAGE_WELCOME 0
 #define V9X_PAGE_OPTIONS 1
 #define V9X_PAGE_INSTALL 2
 #define V9X_PAGE_FINISH 3
+#define V9X_PAGE_REMOTE 4
 #define V9X_PAGE_ALL -1
 
 #define V9X_ID_BACK 100
@@ -49,6 +64,17 @@
 #define V9X_ID_CLIENT 114
 #define V9X_ID_PROGRESS 115
 #define V9X_ID_REBOOT 116
+#define V9X_ID_VNC 117
+#define V9X_ID_VNCPASS 118
+#define V9X_ID_REMOTE_OFF 120
+#define V9X_ID_REMOTE_ON 121
+#define V9X_ID_REMOTE_NAME 122
+#define V9X_ID_REMOTE_GITHUB 123
+#define V9X_ID_REMOTE_EMAIL 124
+#define V9X_ID_REMOTE_STATUS 126
+#define V9X_ID_UPDATE_STARTUP 127
+
+int v9x_self_update(int child);
 
 static const char v9x_root[] = "C:\\V9XREMOTE";
 static const char v9x_ini[] = "C:\\V9XREMOTE\\AGENT.INI";
@@ -62,23 +88,42 @@ static const char v9x_run_key_9x[] =
     "Software\\Microsoft\\Windows\\CurrentVersion\\RunServices";
 static const char v9x_run_key_nt[] =
     "Software\\Microsoft\\Windows\\CurrentVersion\\Run";
+/* V9XVNC.EXE needs a logged-on desktop, so it starts from Run on both
+   Windows 9x and 2000, never RunServices. */
+static const char v9x_vnc_run_value[] = "V9xRemoteVnc";
+static const char v9x_vnc_exe[] = "C:\\V9XREMOTE\\V9XVNC.EXE";
 static const char v9x_arp_key[] =
     "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\V9xRemoteAgent";
-static const char v9x_title[] = "V9x Remote Agent " V9X_AGENT_VERSION " Setup";
+static const char v9x_setup_title[] = "V9x Remote Agent " V9X_AGENT_VERSION " Setup";
+static const char v9x_settings_title[] =
+    "V9x Remote Agent " V9X_AGENT_VERSION " Settings";
+static const char v9x_remote_title[] =
+    "V9x Remote Agent " V9X_AGENT_VERSION " - Remote help";
+static const char v9x_status_ini[] = "C:\\V9XREMOTE\\STATUS.INI";
+static const char *v9x_title = v9x_setup_title;
 
 /* Support files copied as-is; AGENT.INI is copied only when none exists. */
 static const char *const v9x_support_files[] = {
     "INSTALL.REG", "REMOVE.REG", "UPDATE.REG", "UPDATE.BAT", "UNINSTALL.BAT",
-    "README.TXT"
+    "README.TXT", "V9XVNC.EXE"
 };
 
 typedef struct V9xSettings {
     int discovery;
     int allow_dos_vm;
+    int vnc;
     char port[8];
     char bind_address[16];
     char allowed_client[16];
+    char vnc_password[9];
     char install_id[V9X_INSTALL_ID_SIZE];
+    /* [remote], the /remote page */
+    int remote_on;
+    int update_on_startup;
+    char remote_name[64];
+    char remote_github[40];
+    char remote_email[96];
+    char remote_machine[16];
 } V9xSettings;
 
 typedef struct V9xControl {
@@ -94,6 +139,8 @@ static int v9x_control_count;
 static int v9x_page;
 static int v9x_existing;       /* V9XAGNT.EXE already in C:\V9XREMOTE */
 static int v9x_settings_only;  /* running from C:\V9XREMOTE: no files to copy */
+static int v9x_from_tray;      /* /settings: the agent restarts when this saves */
+static int v9x_remote_page;    /* /remote: only the remote help page */
 static int v9x_install_ok;
 static int v9x_busy;           /* install steps running: the window cannot close */
 static int v9x_exit_code = 2;
@@ -196,18 +243,41 @@ static void v9x_decimal(char *target, unsigned long value)
    the checkbox is how a user opts in, and it is in plain view. */
 static void v9x_load_settings(void)
 {
-    UINT port = GetPrivateProfileIntA("agent", "port", 9869, v9x_ini);
+    UINT port;
+    /* Same repair as the agent's, so an LF-only AGENT.INI does not get the
+       new keys written in a form Windows 9x cannot read back. */
+    (void)v9x_ini_normalize(v9x_ini);
+    port = GetPrivateProfileIntA("agent", "port", 9869, v9x_ini);
     if (port == 0u || port > 65535u) port = 9869u;
     v9x_decimal(v9x_settings.port, port);
     v9x_settings.discovery = GetPrivateProfileIntA("agent", "discovery", 1, v9x_ini) != 0;
     v9x_settings.allow_dos_vm =
         GetPrivateProfileIntA("agent", "allow_dos_vm", 1, v9x_ini) != 0;
+    /* VNC is opt-in: unticked unless this machine already turned it on. */
+    v9x_settings.vnc = GetPrivateProfileIntA("vnc", "enabled", 0, v9x_ini) == 1;
+    (void)GetPrivateProfileStringA("vnc", "password", "", v9x_settings.vnc_password,
+                                   sizeof(v9x_settings.vnc_password), v9x_ini);
     (void)GetPrivateProfileStringA("agent", "bind_address", "0.0.0.0",
                                    v9x_settings.bind_address,
                                    sizeof(v9x_settings.bind_address), v9x_ini);
     (void)GetPrivateProfileStringA("agent", "allowed_client", "",
                                    v9x_settings.allowed_client,
                                    sizeof(v9x_settings.allowed_client), v9x_ini);
+    {
+        char mode[16];
+        (void)GetPrivateProfileStringA("remote", "mode", "off", mode, sizeof(mode), v9x_ini);
+        v9x_settings.remote_on = lstrcmpiA(mode, "on") == 0;
+    }
+    v9x_settings.update_on_startup =
+        GetPrivateProfileIntA("update", "check_on_startup", 0, v9x_ini) != 0;
+    (void)GetPrivateProfileStringA("remote", "display_name", "", v9x_settings.remote_name,
+                                   sizeof(v9x_settings.remote_name), v9x_ini);
+    (void)GetPrivateProfileStringA("remote", "github", "", v9x_settings.remote_github,
+                                   sizeof(v9x_settings.remote_github), v9x_ini);
+    (void)GetPrivateProfileStringA("remote", "email", "", v9x_settings.remote_email,
+                                   sizeof(v9x_settings.remote_email), v9x_ini);
+    (void)GetPrivateProfileStringA("remote", "machine_id", "", v9x_settings.remote_machine,
+                                   sizeof(v9x_settings.remote_machine), v9x_ini);
     {
         char current[64];
         (void)GetPrivateProfileStringA("agent", "install_id", "", current,
@@ -237,10 +307,31 @@ static int v9x_write_settings(void)
            WritePrivateProfileStringA("agent", "discovery",
                                       v9x_settings.discovery ? "1" : "0", v9x_ini) &&
            WritePrivateProfileStringA("agent", "install_id",
-                                      v9x_settings.install_id, v9x_ini);
+                                      v9x_settings.install_id, v9x_ini) &&
+           WritePrivateProfileStringA("vnc", "enabled",
+                                      v9x_settings.vnc ? "1" : "0", v9x_ini) &&
+           WritePrivateProfileStringA("vnc", "password",
+                                      v9x_settings.vnc_password, v9x_ini);
     /* Flush the profile cache so the file is on disk before a restart. On
        Windows 98 this call returns FALSE even when it works, so its result
        is not a failure. */
+    (void)WritePrivateProfileStringA(0, 0, 0, v9x_ini);
+    return ok;
+}
+
+/* The /remote page's settings. */
+static int v9x_write_remote(void)
+{
+    int ok = WritePrivateProfileStringA("remote", "mode",
+                                        v9x_settings.remote_on ? "on" : "off", v9x_ini) &&
+             WritePrivateProfileStringA("remote", "display_name",
+                                        v9x_settings.remote_name, v9x_ini) &&
+             WritePrivateProfileStringA("remote", "github",
+                                        v9x_settings.remote_github, v9x_ini) &&
+             WritePrivateProfileStringA("remote", "email",
+                                        v9x_settings.remote_email, v9x_ini) &&
+             WritePrivateProfileStringA("update", "check_on_startup",
+                                        v9x_settings.update_on_startup ? "1" : "0", v9x_ini);
     (void)WritePrivateProfileStringA(0, 0, 0, v9x_ini);
     return ok;
 }
@@ -286,6 +377,32 @@ static void v9x_remove(const char *name)
     (void)DeleteFileA(target);
 }
 
+static int v9x_run_vnc_at(const char *exe, const char *switches);
+
+/* A running V9XVNC.EXE holds its image open, so the copy over it would fail:
+   ask it to exit and give it a moment. On Windows 9x that is its -stop
+   event. The Windows 2000 service's event is LocalSystem's and cannot be
+   opened from here, so on NT run "V9XVNC.EXE -stop", which stops the service
+   through the SCM: the package's copy when there is one, because a
+   V9XVNC.EXE from before 0.11.0's fix only tries the event. */
+static void v9x_stop_vnc(void)
+{
+    HANDLE stop = OpenEventA(EVENT_MODIFY_STATE, FALSE, "V9XVNC.STOP");
+    if (stop != 0) {
+        (void)SetEvent(stop);
+        CloseHandle(stop);
+        Sleep(1500ul);
+        return;
+    }
+    if (v9x_platform_is_nt()) {
+        char exe[MAX_PATH];
+        exe[0] = '\0';
+        if (v9x_source[0] != '\0') v9x_path(exe, v9x_source, "V9XVNC.EXE");
+        if (exe[0] == '\0' || !v9x_exists(exe)) v9x_copy(exe, v9x_vnc_exe, sizeof(exe));
+        if (v9x_exists(exe) && v9x_run_vnc_at(exe, "-stop")) Sleep(1500ul);
+    }
+}
+
 static int v9x_set_string(HKEY root, const char *path, const char *name,
                           const char *value)
 {
@@ -300,6 +417,99 @@ static int v9x_set_string(HKEY root, const char *path, const char *name,
                             v9x_len(value) + 1ul);
     (void)RegCloseKey(key);
     return status == ERROR_SUCCESS;
+}
+
+static void v9x_delete_vnc_autostart(void)
+{
+    HKEY key;
+    if (RegOpenKeyExA(HKEY_LOCAL_MACHINE, v9x_run_key_nt, 0ul, KEY_WRITE, &key) ==
+        ERROR_SUCCESS) {
+        (void)RegDeleteValueA(key, v9x_vnc_run_value);
+        (void)RegCloseKey(key);
+    }
+}
+
+/* Run V9XVNC.EXE with one switch and wait for it (for -install / -uninstall,
+   which are quick). Returns 1 when it exited with code 0. */
+static int v9x_run_vnc_at(const char *exe, const char *switches)
+{
+    STARTUPINFOA startup;
+    PROCESS_INFORMATION process;
+    char command[MAX_PATH + 32];
+    unsigned long index = 0ul;
+    const char *source = exe;
+    DWORD code = 1ul;
+    command[index++] = '"';
+    while (*source != '\0' && index < MAX_PATH) command[index++] = *source++;
+    command[index++] = '"';
+    command[index++] = ' ';
+    while (*switches != '\0' && index < sizeof(command) - 1ul) command[index++] = *switches++;
+    command[index] = '\0';
+    GetStartupInfoA(&startup);
+    if (!CreateProcessA(exe, command, 0, 0, FALSE, 0ul, 0, v9x_root,
+                        &startup, &process)) {
+        return 0;
+    }
+    (void)WaitForSingleObject(process.hProcess, 20000ul);
+    (void)GetExitCodeProcess(process.hProcess, &code);
+    CloseHandle(process.hThread);
+    CloseHandle(process.hProcess);
+    return code == 0ul;
+}
+
+static int v9x_run_vnc(const char *switches)
+{
+    return v9x_run_vnc_at(v9x_vnc_exe, switches);
+}
+
+/* The VNC option. On Windows 2000 V9XVNC.EXE runs as a SYSTEM service, the
+   only way to reach the Winlogon (logon and lock) desktop; on Windows 9x it
+   is a plain program started from the RunServices-era Run key. On, it is
+   installed and started now; off, removed and stopped. */
+static int v9x_apply_vnc(void)
+{
+    int ok;
+    v9x_stop_vnc();
+    if (v9x_platform_is_nt()) {
+        /* A VNC build before 0.11 service support may have left a Run value. */
+        v9x_delete_vnc_autostart();
+        if (!v9x_settings.vnc) {
+            v9x_step("VNC remote control is off", v9x_run_vnc("-uninstall"));
+            return 1;
+        }
+        if (!v9x_exists(v9x_vnc_exe)) { v9x_step("V9XVNC.EXE is missing", 0); return 0; }
+        ok = v9x_run_vnc("-install");
+        v9x_step("Install and start the VNC service", ok);
+        return ok;
+    }
+    if (!v9x_settings.vnc) {
+        v9x_delete_vnc_autostart();
+        v9x_step("VNC remote control is off", 1);
+        return 1;
+    }
+    ok = v9x_exists(v9x_vnc_exe) &&
+         v9x_set_string(HKEY_LOCAL_MACHINE, v9x_run_key_nt, v9x_vnc_run_value,
+                        v9x_vnc_exe);
+    v9x_step("Start VNC remote control at logon (Run)", ok);
+    if (!ok) return 0;
+    /* CreateProcess, not WinExec: on Windows 9x WinExec waits for the new
+       process to read its message queue, which V9XVNC.EXE never does, so
+       setup stalled about 30 s here. */
+    {
+        STARTUPINFOA startup;
+        PROCESS_INFORMATION process;
+        char command[MAX_PATH];
+        v9x_copy(command, v9x_vnc_exe, sizeof(command));
+        GetStartupInfoA(&startup);
+        ok = CreateProcessA(v9x_vnc_exe, command, 0, 0, FALSE, 0ul, 0, v9x_root,
+                            &startup, &process) != FALSE;
+        if (ok) {
+            CloseHandle(process.hThread);
+            CloseHandle(process.hProcess);
+        }
+    }
+    v9x_step("Start VNC remote control now", ok);
+    return 1;
 }
 
 static int v9x_register_arp(void)
@@ -332,6 +542,7 @@ static int v9x_install(void)
             !v9x_copy_file("AGENT.INI", "AGENT.INI")) {
             return 0;
         }
+        v9x_stop_vnc();
         for (index = 0u; index < sizeof(v9x_support_files) / sizeof(v9x_support_files[0]);
              ++index) {
             if (!v9x_copy_file(v9x_support_files[index], v9x_support_files[index])) {
@@ -343,8 +554,11 @@ static int v9x_install(void)
     ok = v9x_write_settings();
     v9x_step("Write settings to AGENT.INI", ok);
     if (!ok) return 0;
+    if (!v9x_apply_vnc()) return 0;
 
-    if (v9x_settings_only) {
+    if (v9x_from_tray) {
+        v9x_step("The agent restarts to apply the settings", 1);
+    } else if (v9x_settings_only) {
         v9x_step("Settings take effect when the agent next starts", 1);
     } else if (v9x_existing) {
         /* Same as INSTALL.BAT's update path: stage beside the running agent
@@ -418,6 +632,10 @@ static int v9x_uninstall(int quiet)
         (void)RegCloseKey(key);
     }
     (void)RegDeleteKeyA(HKEY_LOCAL_MACHINE, v9x_arp_key);
+    v9x_delete_vnc_autostart();
+    v9x_stop_vnc();
+    /* Remove the VNC service too (NT); a no-op if it was never installed. */
+    if (v9x_platform_is_nt() && v9x_exists(v9x_vnc_exe)) (void)v9x_run_vnc("-uninstall");
     v9x_remove("V9XNEW.EXE");
     v9x_remove("V9XSNEW.EXE");
     if (!quiet) {
@@ -511,14 +729,57 @@ static void v9x_build(void)
     v9x_add(V9X_PAGE_OPTIONS, WS_EX_CLIENTEDGE, "EDIT", v9x_settings.allowed_client,
             ES_AUTOHSCROLL | WS_TABSTOP, 150, 211, 130, 22, V9X_ID_CLIENT);
     v9x_text(V9X_PAGE_OPTIONS, "(blank = any host)", 290, 214, w - 306, 18);
+    v9x_add(V9X_PAGE_OPTIONS, 0ul, "BUTTON",
+            "Enable VNC remote control (screen, keyboard and mouse)",
+            BS_AUTOCHECKBOX | WS_TABSTOP, 24, 244, w - 48, 20, V9X_ID_VNC);
+    v9x_text(V9X_PAGE_OPTIONS,
+             "Any VNC viewer on TCP port 5900, from logon on.", 44, 264, w - 68, 18);
+    v9x_text(V9X_PAGE_OPTIONS, "VNC password:", 44, 289, 100, 18);
+    v9x_add(V9X_PAGE_OPTIONS, WS_EX_CLIENTEDGE, "EDIT", v9x_settings.vnc_password,
+            ES_AUTOHSCROLL | ES_PASSWORD | WS_TABSTOP, 150, 286, 100, 22, V9X_ID_VNCPASS);
+    v9x_text(V9X_PAGE_OPTIONS, "(optional, up to 8 characters)", 260, 289, w - 276, 18);
     v9x_copy(id_line, "Install ID:  ", sizeof(id_line));
     v9x_append(id_line, v9x_settings.install_id, sizeof(id_line));
-    v9x_text(V9X_PAGE_OPTIONS, id_line, 24, 248, w - 48, 18);
+    v9x_text(V9X_PAGE_OPTIONS, id_line, 24, 326, w - 48, 18);
     v9x_text(V9X_PAGE_OPTIONS,
              "Identifies this machine even when its IP address changes.",
-             24, 266, w - 48, 18);
+             24, 344, w - 48, 18);
 
-    v9x_text(V9X_PAGE_INSTALL, "Installing...", 24, 48, w - 48, 18);
+    v9x_text(V9X_PAGE_REMOTE,
+             "Remote help lets the developer of this agent use this computer over "
+             "the Internet, to debug or write drivers for hardware they do not "
+             "have: run programs, see the screen, use the keyboard and mouse, copy "
+             "files and restart it. Every command is signed on the developer's PC and checked "
+             "here. The connection is not encrypted, so do not keep private files "
+             "on this machine while it is on.",
+             24, 46, w - 48, 92);
+    v9x_add(V9X_PAGE_REMOTE, 0ul, "BUTTON", "Off: never contact the server (default)",
+            BS_AUTORADIOBUTTON | WS_TABSTOP | WS_GROUP, 24, 142, w - 48, 20,
+            V9X_ID_REMOTE_OFF);
+    v9x_add(V9X_PAGE_REMOTE, 0ul, "BUTTON",
+            "On: offer this machine for remote help",
+            BS_AUTORADIOBUTTON, 24, 162, w - 48, 20, V9X_ID_REMOTE_ON);
+    v9x_text(V9X_PAGE_REMOTE,
+             "\"Pause remote help\" on the tray icon blocks commands until the "
+             "agent restarts; chat keeps working.", 44, 182, w - 68, 30);
+    v9x_text(V9X_PAGE_REMOTE, "Your name:", 24, 220, 120, 18);
+    v9x_add(V9X_PAGE_REMOTE, WS_EX_CLIENTEDGE, "EDIT", v9x_settings.remote_name,
+            ES_AUTOHSCROLL | WS_TABSTOP | WS_GROUP, 150, 217, w - 174, 22, V9X_ID_REMOTE_NAME);
+    v9x_text(V9X_PAGE_REMOTE, "GitHub username:", 24, 248, 120, 18);
+    v9x_add(V9X_PAGE_REMOTE, WS_EX_CLIENTEDGE, "EDIT", v9x_settings.remote_github,
+            ES_AUTOHSCROLL | WS_TABSTOP, 150, 245, 160, 22, V9X_ID_REMOTE_GITHUB);
+    v9x_text(V9X_PAGE_REMOTE, "(optional, for issues)", 318, 248, w - 334, 18);
+    v9x_text(V9X_PAGE_REMOTE, "Contact email:", 24, 276, 120, 18);
+    v9x_add(V9X_PAGE_REMOTE, WS_EX_CLIENTEDGE, "EDIT", v9x_settings.remote_email,
+            ES_AUTOHSCROLL | WS_TABSTOP, 150, 273, w - 174, 22, V9X_ID_REMOTE_EMAIL);
+    v9x_add(V9X_PAGE_REMOTE, 0ul, "STATIC", "", SS_LEFT, 24, 302, w - 48, 34,
+            V9X_ID_REMOTE_STATUS);
+    v9x_add(V9X_PAGE_REMOTE, 0ul, "BUTTON",
+            "Check for agent updates when Windows starts",
+            BS_AUTOCHECKBOX | WS_TABSTOP, 24, 336, w - 48, 20, V9X_ID_UPDATE_STARTUP);
+
+    v9x_text(V9X_PAGE_INSTALL, v9x_settings_only ? "Saving..." : "Installing...",
+             24, 48, w - 48, 18);
     v9x_add(V9X_PAGE_INSTALL, WS_EX_CLIENTEDGE, "LISTBOX", "",
             WS_VSCROLL | LBS_NOINTEGRALHEIGHT, 24, 70, w - 48, 200, V9X_ID_PROGRESS);
 
@@ -526,21 +787,64 @@ static void v9x_build(void)
     v9x_add(V9X_PAGE_FINISH, 0ul, "BUTTON", "Restart Windows now",
             BS_AUTOCHECKBOX | WS_TABSTOP, 24, 150, w - 48, 20, V9X_ID_REBOOT);
 
-    v9x_add(V9X_PAGE_ALL, 0ul, "STATIC", "", SS_ETCHEDHORZ, 16, 290, w - 32, 2, -1);
+    v9x_add(V9X_PAGE_ALL, 0ul, "STATIC", "", SS_ETCHEDHORZ, 16, 374, w - 32, 2, -1);
     v9x_add(V9X_PAGE_ALL, 0ul, "BUTTON", "< Back", BS_PUSHBUTTON | WS_TABSTOP,
-            w - 272, 302, 80, 24, V9X_ID_BACK);
+            w - 272, 386, 80, 24, V9X_ID_BACK);
     v9x_add(V9X_PAGE_ALL, 0ul, "BUTTON", "Next >", BS_DEFPUSHBUTTON | WS_TABSTOP,
-            w - 186, 302, 80, 24, V9X_ID_NEXT);
+            w - 186, 386, 80, 24, V9X_ID_NEXT);
     v9x_add(V9X_PAGE_ALL, 0ul, "BUTTON", "Cancel", BS_PUSHBUTTON | WS_TABSTOP,
-            w - 96, 302, 80, 24, V9X_ID_CANCEL);
+            w - 96, 386, 80, 24, V9X_ID_CANCEL);
 
     (void)SendMessageA(GetDlgItem(v9x_main, V9X_ID_DISCOVERY), BM_SETCHECK,
                        v9x_settings.discovery ? BST_CHECKED : BST_UNCHECKED, 0);
     (void)SendMessageA(GetDlgItem(v9x_main, V9X_ID_DOS), BM_SETCHECK,
                        v9x_settings.allow_dos_vm ? BST_CHECKED : BST_UNCHECKED, 0);
+    (void)SendMessageA(GetDlgItem(v9x_main, V9X_ID_VNC), BM_SETCHECK,
+                       v9x_settings.vnc ? BST_CHECKED : BST_UNCHECKED, 0);
     (void)SendMessageA(GetDlgItem(v9x_main, V9X_ID_PORT), EM_LIMITTEXT, 5, 0);
     (void)SendMessageA(GetDlgItem(v9x_main, V9X_ID_BIND), EM_LIMITTEXT, 15, 0);
     (void)SendMessageA(GetDlgItem(v9x_main, V9X_ID_CLIENT), EM_LIMITTEXT, 15, 0);
+    (void)SendMessageA(GetDlgItem(v9x_main, V9X_ID_VNCPASS), EM_LIMITTEXT, 8, 0);
+    (void)SendMessageA(GetDlgItem(v9x_main, v9x_settings.remote_on ? V9X_ID_REMOTE_ON :
+                                                                     V9X_ID_REMOTE_OFF),
+                       BM_SETCHECK, BST_CHECKED, 0);
+    (void)SendMessageA(GetDlgItem(v9x_main, V9X_ID_UPDATE_STARTUP), BM_SETCHECK,
+                       v9x_settings.update_on_startup ? BST_CHECKED : BST_UNCHECKED, 0);
+    (void)SendMessageA(GetDlgItem(v9x_main, V9X_ID_REMOTE_NAME), EM_LIMITTEXT, 60, 0);
+    (void)SendMessageA(GetDlgItem(v9x_main, V9X_ID_REMOTE_GITHUB), EM_LIMITTEXT, 39, 0);
+    (void)SendMessageA(GetDlgItem(v9x_main, V9X_ID_REMOTE_EMAIL), EM_LIMITTEXT, 90, 0);
+    {
+        /* What the agent last wrote about its check-ins (remote.c). */
+        char line[200];
+        char value[64];
+        line[0] = '\0';
+        (void)GetPrivateProfileStringA("remote", "status", "", value, sizeof(value),
+                                       v9x_status_ini);
+        if (v9x_settings.remote_machine[0] != '\0') {
+            v9x_append(line, "This machine is ", sizeof(line));
+            v9x_append(line, v9x_settings.remote_machine, sizeof(line));
+            v9x_append(line, value[0] != '\0' ? ", " : ".", sizeof(line));
+        }
+        if (value[0] != '\0') {
+            v9x_append(line, line[0] != '\0' ? "status: " : "Status: ", sizeof(line));
+            v9x_append(line, value, sizeof(line));
+            (void)GetPrivateProfileStringA("remote", "last_contact", "", value,
+                                           sizeof(value), v9x_status_ini);
+            if (value[0] != '\0') {
+                v9x_append(line, ", last contact ", sizeof(line));
+                v9x_append(line, value, sizeof(line));
+            }
+            (void)GetPrivateProfileStringA("remote", "last_command_age", "-1", value,
+                                           sizeof(value), v9x_status_ini);
+            if (value[0] != '-') {
+                v9x_append(line, ". Last command ", sizeof(line));
+                v9x_append(line, value, sizeof(line));
+                v9x_append(line, " s before that", sizeof(line));
+            }
+            v9x_append(line, ".", sizeof(line));
+        }
+        SetWindowTextA(GetDlgItem(v9x_main, V9X_ID_REMOTE_STATUS), line);
+    }
 }
 
 static void v9x_show_page(int page)
@@ -553,15 +857,21 @@ static void v9x_show_page(int page)
                       v9x_controls[index].page == page;
         ShowWindow(v9x_controls[index].window, visible ? SW_SHOW : SW_HIDE);
     }
-    EnableWindow(GetDlgItem(v9x_main, V9X_ID_BACK), page == V9X_PAGE_OPTIONS);
+    EnableWindow(GetDlgItem(v9x_main, V9X_ID_BACK),
+                 page == V9X_PAGE_OPTIONS && !v9x_from_tray);
     EnableWindow(GetDlgItem(v9x_main, V9X_ID_NEXT), page != V9X_PAGE_INSTALL);
     EnableWindow(GetDlgItem(v9x_main, V9X_ID_CANCEL), page != V9X_PAGE_INSTALL);
     ShowWindow(GetDlgItem(v9x_main, V9X_ID_CANCEL), page == V9X_PAGE_FINISH ? SW_HIDE : SW_SHOW);
     ShowWindow(GetDlgItem(v9x_main, V9X_ID_BACK), page == V9X_PAGE_FINISH ? SW_HIDE : SW_SHOW);
     SetWindowTextA(GetDlgItem(v9x_main, V9X_ID_NEXT),
+                   page == V9X_PAGE_REMOTE ? "Save" :
                    page == V9X_PAGE_OPTIONS ? (v9x_settings_only ? "Save" : "Install") :
                    page == V9X_PAGE_FINISH ? "Finish" : "Next >");
     if (page == V9X_PAGE_OPTIONS) focus = GetDlgItem(v9x_main, V9X_ID_DISCOVERY);
+    if (page == V9X_PAGE_REMOTE) {
+        focus = GetDlgItem(v9x_main, v9x_settings.remote_on ? V9X_ID_REMOTE_ON :
+                                                              V9X_ID_REMOTE_OFF);
+    }
     if (focus == 0) focus = GetDlgItem(v9x_main, V9X_ID_NEXT);
     SetFocus(focus);
 }
@@ -602,6 +912,47 @@ static int v9x_collect(void)
                                           BM_GETCHECK, 0, 0) == BST_CHECKED;
     v9x_settings.allow_dos_vm = SendMessageA(GetDlgItem(v9x_main, V9X_ID_DOS),
                                              BM_GETCHECK, 0, 0) == BST_CHECKED;
+    v9x_settings.vnc = SendMessageA(GetDlgItem(v9x_main, V9X_ID_VNC),
+                                    BM_GETCHECK, 0, 0) == BST_CHECKED;
+    /* VNC authentication uses at most 8 characters; the field is limited
+       to that, so a longer one cannot be typed. */
+    GetWindowTextA(GetDlgItem(v9x_main, V9X_ID_VNCPASS), v9x_settings.vnc_password,
+                   sizeof(v9x_settings.vnc_password));
+    return 1;
+}
+
+/* Reads the remote help page; the name is required to turn it on. */
+static int v9x_collect_remote(void)
+{
+    unsigned long index;
+    int at;
+    v9x_settings.remote_on = SendMessageA(GetDlgItem(v9x_main, V9X_ID_REMOTE_ON),
+                                          BM_GETCHECK, 0, 0) == BST_CHECKED;
+    v9x_settings.update_on_startup =
+        SendMessageA(GetDlgItem(v9x_main, V9X_ID_UPDATE_STARTUP), BM_GETCHECK, 0, 0) ==
+        BST_CHECKED;
+    GetWindowTextA(GetDlgItem(v9x_main, V9X_ID_REMOTE_NAME), v9x_settings.remote_name,
+                   sizeof(v9x_settings.remote_name));
+    GetWindowTextA(GetDlgItem(v9x_main, V9X_ID_REMOTE_GITHUB), v9x_settings.remote_github,
+                   sizeof(v9x_settings.remote_github));
+    GetWindowTextA(GetDlgItem(v9x_main, V9X_ID_REMOTE_EMAIL), v9x_settings.remote_email,
+                   sizeof(v9x_settings.remote_email));
+    /* GitHub names are letters, digits and hyphens; drop an @ and spaces. */
+    at = 0;
+    for (index = 0ul; v9x_settings.remote_github[index] != '\0'; ++index) {
+        char c = v9x_settings.remote_github[index];
+        if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
+            c == '-') {
+            v9x_settings.remote_github[at++] = c;
+        }
+    }
+    v9x_settings.remote_github[at] = '\0';
+    if (v9x_settings.remote_on && v9x_settings.remote_name[0] == '\0') {
+        MessageBoxA(v9x_main, "Please enter a name so the developer knows whose machine "
+                    "this is.", v9x_title, MB_OK | MB_ICONEXCLAMATION);
+        SetFocus(GetDlgItem(v9x_main, V9X_ID_REMOTE_NAME));
+        return 0;
+    }
     return 1;
 }
 
@@ -613,6 +964,17 @@ static void v9x_finish_text(void)
         text = "Setup could not finish; the step list marked the one that FAILED. "
                "A running agent has not been changed. Check that C:\\ is writable "
                "and run Setup again.";
+    } else if (v9x_remote_page) {
+        text = v9x_settings.remote_on ?
+               "Remote help is on. The agent restarts when you click Finish and then "
+               "checks in with the developer's server; the tray icon's menu has "
+               "Pause and Chat." :
+               "Remote help is off. The agent restarts when you click Finish and does "
+               "not contact the server any more.";
+    } else if (v9x_from_tray) {
+        text = "The settings were saved. The agent restarts when you click Finish "
+               "and uses them from then on; a command or file transfer it is "
+               "running at that moment is cut off.";
     } else if (v9x_settings_only) {
         text = "The settings were saved. They take effect when the agent next "
                "starts, which is at the next restart.";
@@ -631,12 +993,21 @@ static void v9x_finish_text(void)
         }
     }
     (void)SendMessageA(GetDlgItem(v9x_main, V9X_ID_REBOOT), BM_SETCHECK,
-                       v9x_install_ok ? BST_CHECKED : BST_UNCHECKED, 0);
+                       v9x_install_ok && !v9x_from_tray ? BST_CHECKED : BST_UNCHECKED, 0);
     EnableWindow(GetDlgItem(v9x_main, V9X_ID_REBOOT), v9x_install_ok);
 }
 
 static void v9x_next(void)
 {
+    if (v9x_page == V9X_PAGE_REMOTE) {
+        if (!v9x_collect_remote()) return;
+        v9x_install_ok = v9x_write_remote();
+        v9x_exit_code = v9x_install_ok ? 0 : 1;
+        v9x_finish_text();
+        v9x_show_page(V9X_PAGE_FINISH);
+        ShowWindow(GetDlgItem(v9x_main, V9X_ID_REBOOT), SW_HIDE);
+        return;
+    }
     if (v9x_page == V9X_PAGE_WELCOME) {
         v9x_show_page(V9X_PAGE_OPTIONS);
     } else if (v9x_page == V9X_PAGE_OPTIONS) {
@@ -657,6 +1028,8 @@ static void v9x_next(void)
         SetFocus(GetDlgItem(v9x_main, V9X_ID_NEXT));
     } else if (v9x_page == V9X_PAGE_INSTALL) {
         v9x_show_page(V9X_PAGE_FINISH);
+        /* Restarting the agent replaces a reboot. */
+        if (v9x_from_tray) ShowWindow(GetDlgItem(v9x_main, V9X_ID_REBOOT), SW_HIDE);
     } else {
         int reboot = SendMessageA(GetDlgItem(v9x_main, V9X_ID_REBOOT), BM_GETCHECK,
                                   0, 0) == BST_CHECKED;
@@ -695,7 +1068,9 @@ static LRESULT CALLBACK v9x_window_proc(HWND window, UINT message, WPARAM wparam
     case WM_CLOSE:
         if (v9x_busy) return 0;
         if (v9x_page == V9X_PAGE_INSTALL || v9x_page == V9X_PAGE_FINISH ||
-            MessageBoxA(window, "Cancel setup? Nothing has been installed.", v9x_title,
+            MessageBoxA(window, (v9x_from_tray || v9x_remote_page) ?
+                                "Close without saving the settings?" :
+                        "Cancel setup? Nothing has been installed.", v9x_title,
                         MB_YESNO | MB_ICONQUESTION) == IDYES) {
             DestroyWindow(window);
         }
@@ -741,8 +1116,11 @@ static int v9x_run_wizard(void)
     if (v9x_main == 0) return 1;
     v9x_font = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
     v9x_build();
-    v9x_show_page(V9X_PAGE_WELCOME);
+    v9x_show_page(v9x_remote_page ? V9X_PAGE_REMOTE :
+                  v9x_from_tray ? V9X_PAGE_OPTIONS : V9X_PAGE_WELCOME);
     ShowWindow(v9x_main, SW_SHOWNORMAL);
+    /* Started by the agent from a tray click, so bring it to the front. */
+    (void)SetForegroundWindow(v9x_main);
     UpdateWindow(v9x_main);
     while (GetMessageA(&message, 0, 0u, 0u) > 0) {
         if (IsWindow(v9x_main) && IsDialogMessageA(v9x_main, &message)) continue;
@@ -802,6 +1180,17 @@ void WINAPI V9xSetupEntry(void)
     v9x_copy(v9x_source, module, sizeof(v9x_source));
     v9x_settings_only = lstrcmpiA(v9x_source, v9x_root) == 0;
     v9x_existing = v9x_exists(v9x_agent);
+    /* Only the installed copy edits the running agent's settings. */
+    v9x_from_tray = v9x_settings_only && v9x_has_switch(line, "settings");
+    if (v9x_from_tray) v9x_title = v9x_settings_title;
+    if (v9x_has_switch(line, "update")) {
+        ExitProcess((UINT)v9x_self_update(v9x_has_switch(line, "child")));
+    }
+    v9x_remote_page = v9x_settings_only && v9x_has_switch(line, "remote");
+    if (v9x_remote_page) {
+        v9x_from_tray = 1;
+        v9x_title = v9x_remote_title;
+    }
     if (!v9x_settings_only) {
         char agent[MAX_PATH];
         char helper[MAX_PATH];
@@ -817,6 +1206,8 @@ void WINAPI V9xSetupEntry(void)
         }
     }
     v9x_load_settings();
+    if (v9x_has_switch(line, "vnc")) v9x_settings.vnc = 1;
+    if (v9x_has_switch(line, "novnc")) v9x_settings.vnc = 0;
     if (silent) ExitProcess(v9x_install() ? 0u : 1u);
     ExitProcess((UINT)v9x_run_wizard());
 }

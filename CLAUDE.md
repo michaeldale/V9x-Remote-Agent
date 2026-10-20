@@ -75,15 +75,24 @@ commit per release. Publish only when explicitly asked.
   fires `.github/workflows/release.yml`, which builds the artifacts on a clean
   runner and creates the release itself, named `V9x Remote Agent v<version>`
   with every `CHANGELOG.md` section newer than the previous `v*` tag as its
-  body (the public repo skips versions) and the three `build\release`
-  artifacts attached (`v9xremote-<version>.zip`, `V9XREMOTE.ISO`,
-  `SHA256SUMS`). A manual `gh release create` races that workflow and makes it
+  body (the public repo skips versions) and the `build\release` artifacts
+  attached (`v9xremote-<version>.zip`, `V9XREMOTE.ISO`, the self-update
+  package `v9x-remote-agent-<version>-win32.zip` (0.12.0+) and `SHA256SUMS`).
+  A manual `gh release create` races that workflow and makes it
   fail with "a release with the same tag name already exists", which is exactly
   what happened on 0.6.2. Push the tag, then watch
   `gh run list --repo <public repo> --limit 3`.
 - Because CI builds the published artifacts, the release contents come from the
   tagged tree on a clean machine, not from the dev box. That is the point: do
   not replace them with local builds.
+- **Self-update (0.12.0+).** Once the workflow has published the release, run
+  `.\scripts\sign-release.ps1 -Version <version> -Upload`: it downloads the
+  CI-built update zip, writes SIGNED.TXT, signs it with
+  `%USERPROFILE%\.v9x\release-signing.key` (refusing a key that does not match
+  `include\v9xremote\release_key.h`) and attaches it. Then mirror it onto the
+  update server with the `updates_publish_github_release` MCP tool, app
+  `v9x-remote-agent` (register the app once with `updates_add_app` and the
+  public repo). The signing keys never go to CI or the server.
 - **Never pipe these scripts through `2>&1`.** `git push` and
   `python -m unittest` write progress to stderr, and PowerShell 5.1 turns a
   native command's redirected stderr into `NativeCommandError` records, which
