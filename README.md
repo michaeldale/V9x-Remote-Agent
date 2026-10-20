@@ -107,6 +107,12 @@ Internet connection, and the V9x Remote Agent 0.12.0 or later.
    - the hardware involved (card make and model, or the PCI ID from Device
      Manager) and what goes wrong;
    - roughly when the machine can be left on.
+
+   If you can, leave the machine on and online for at least 48 hours after
+   opening the issue. The developer may be in a different time zone, and
+   driver work often needs several sessions with rebuilds in between. You
+   can keep using the machine meanwhile; just pause remote help (step 5)
+   whenever you need it to yourself.
 4. **Talk it through.** The developer will say hello in the agent's chat
    window before starting, which pops up on your screen by itself. You can
    reply there at any time, or open it from the icon (**Chat with
