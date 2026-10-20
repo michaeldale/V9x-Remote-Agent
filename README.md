@@ -15,6 +15,11 @@ resume-token, and desktop-readiness checks.
 *The screenshot above was taken by the agent itself:
 `v9xctl.ps1 screenshot -Destination desktop.bmp`.*
 
+> **Have hardware the drivers don't support yet, or a bug only your machine
+> shows?** You can lend that machine to the developer over the Internet,
+> safely and only while you choose: see
+> [Request remote support](#request-remote-support).
+
 ## Why
 
 Retro Windows development has a brutal inner loop: build on a modern host,
@@ -69,6 +74,70 @@ clean reboot without a human touching the emulator.
 - Self-repair of an `AGENT.INI` saved with LF-only line ends, and a `put`
   warning when an `.INI`, `.BAT`, `.REG` or similar Windows text file is sent
   with LF-only line ends
+- Opt-in remote help (0.12.0+): an owner can lend a real machine to the
+  developer over the Internet, with every command signed on the developer's
+  PC and checked by the agent, a Pause switch in the tray and a chat window
+  ([Request remote support](#request-remote-support))
+- Self-update from the tray: "Check for updates..." downloads, verifies
+  (Ed25519-signed release, SHA-256) and installs a newer agent
+
+## Request remote support
+
+Windows 9x drivers are written against real hardware, and there is far more
+of it than any one developer owns. If you have a machine with a graphics,
+sound or network card that the Velocity9x drivers do not support yet, or a
+problem that only shows up on your hardware, you can lend that machine to
+the developer for a while. They then work on it directly, as if it were on
+their desk, and you stay in control the whole time.
+
+**What you need:** the machine running Windows 95, 98, Me or 2000 with an
+Internet connection, and the V9x Remote Agent 0.12.0 or later.
+
+1. **Install the agent.** Download `V9XREMOTE.ISO` or
+   `v9x-remote-agent-<version>-win32.zip` from the
+   [latest release](../../releases/latest), copy the files to the machine and
+   run `SETUP.EXE`. An icon appears next to the clock. (Already have an older
+   agent? Right-click the icon and choose **Check for updates...**.)
+2. **Turn on remote help.** Right-click the icon and choose **Remote
+   help...**. Read what it allows, choose **On**, enter your name and, if you
+   have one, your GitHub username, then click **Save**. The agent restarts
+   and the page now shows this machine's id, such as `M-4F7K2Q`.
+3. **Ask for help.** [Open an issue](../../issues/new) with:
+   - the machine id from the Remote help page;
+   - the hardware involved (card make and model, or the PCI ID from Device
+     Manager) and what goes wrong;
+   - roughly when the machine can be left on.
+4. **Talk it through.** The developer will say hello in the agent's chat
+   window before starting, which pops up on your screen by itself. You can
+   reply there at any time, or open it from the icon (**Chat with
+   developer...**).
+5. **Stop whenever you like.** **Pause remote help** on the icon's menu blocks
+   all commands at once (chat keeps working) until you choose **Resume** or
+   the agent restarts. To end it for good, open **Remote help...** again and
+   choose **Off**.
+
+| The Remote help page | Chat with the developer | The tray menu |
+|---|---|---|
+| ![SETUP.EXE Remote help page: what lending allows, Off/On, name, GitHub username, email, this machine's id and status](docs/images/remote-help-page.png) | ![Chat window: the developer asks before testing, the owner replies](docs/images/remote-help-chat.png) | ![Tray menu: Settings, Remote help, Pause remote help, Chat with developer, Check for updates, Restart agent](docs/images/remote-help-tray.png) |
+
+**What lending allows, and what protects you:**
+
+- While remote help is on and not paused, the developer can run programs,
+  see the screen, use the keyboard and mouse, copy files and restart the
+  machine. That is what driver work needs.
+- Every command is signed with a key that exists only on the developer's own
+  PC, and the agent checks the signature before acting on it. Neither the
+  update server nor anyone between you and it can make the machine do
+  anything.
+- The connection is plain HTTP (Windows 9x has no usable encryption), so
+  someone on the network path could watch a session. Do not keep private
+  files on a machine while you lend it.
+- The tray icon tells you when the machine was last used: its tooltip reads
+  "In use: last command ... ago" for a minute after each command.
+- Remote help is off by default and does nothing until you turn it on. Off
+  means the agent never contacts the server for it.
+
+The details, for the curious: [docs/remote-help.md](docs/remote-help.md).
 
 ## Supported guests
 
