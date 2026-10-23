@@ -66,6 +66,20 @@ operator key comes from `%USERPROFILE%\.v9x\operator.key` or
 | `v9x_stat` | Existence/size/attributes of a guest path |
 | `v9x_list_dir` | Directory listing |
 | `v9x_mkdir` | Idempotent directory creation |
+| `v9x_read_text` | A guest text file inline: last `tail` lines, lines containing `match`, bounded (agent 0.13.0+) |
+| `v9x_hash` | Size, CRC32, SHA-256 of a guest file; `local_path` compares with a host file (0.13.0+) |
+| `v9x_delete` | Delete a file, or a directory (`recursive`, `force`); refuses roots, WINDOWS, SYSTEM, the agent folder (0.13.0+) |
+| `v9x_ps` | Guest processes; marks the agent and its exec jobs (0.13.0+, Windows 9x/2000) |
+| `v9x_kill` | Terminate a process by pid or unique name, e.g. a stuck exec job (0.13.0+) |
+| `v9x_reg_query` | Subkeys and values of one registry key, read-only (0.13.0+) |
+| `v9x_wait_file` | Wait until a guest file exists (`gone`, `stable_ms`) instead of sleeping; any agent |
+| `v9x_windows` | Visible top-level windows; `wait_for` a title to appear (`gone`: close) (0.13.0+) |
+
+No tool needs a sleep around it: `v9x_ping` takes `wait_seconds` (keeps
+retrying while the guest boots), `v9x_exec`/`v9x_shell` take
+`wait_for_file` / `wait_for_window` (+ `wait_seconds`), `v9x_screenshot` and
+the input tools take `window` (capture just that window), and every
+connection that is dropped before HELLO is retried twice.
 | `v9x_screenshot` | Capture the guest screen, returned as a PNG image block the model can see |
 | `v9x_click` | Click a mouse button, optionally moving to (x,y) first; `double` for double-click |
 | `v9x_move` | Move the cursor to absolute screen coordinates |
@@ -84,10 +98,22 @@ operator key comes from `%USERPROFILE%\.v9x\operator.key` or
 Every tool opens a fresh connection, so a crashed VM never wedges the server;
 errors come back as tool results with `isError` set.
 
-The screenshot tool converts the agent's 24-bit BMP to PNG in-process (also
-standard library only) and returns it as an MCP image content block, so the
-model can actually look at the Windows 98 screen. Pass `save_path` to keep a
-copy on disk.
+The screenshot tool converts the agent's BMP (24-bit, or from agent 0.13.0
+8-bit/RLE8) to PNG in-process (also standard library only) and returns it as
+an MCP image content block, so the model can actually look at the Windows 98
+screen. Pass `save_path` to keep a copy on disk. Pass `region`
+(`[x, y, width, height]`), `scale` (0.01-1) and `gray` to keep the image
+small: image cost grows with pixels. 0.13.0+ agents shape and losslessly pack
+the image before sending it (much faster over remote help); for older ones
+the server shapes it after the download. The metadata then includes
+`region_x`/`region_y`/`region_width`/`region_height`, so
+`screen_x = region_x + image_x * region_width / width`.
+
+Every input tool (`v9x_click`, `v9x_move`, `v9x_type`, `v9x_key`,
+`v9x_scroll`, `v9x_input`) also takes `screenshot: true`: after the input it
+waits `settle_ms` (default 500, max 30000) for the guest to repaint and returns
+the PNG in the same call, on the same connection (`save_path` works there too).
+One GUI step (act, look) is then one tool call.
 
 Never request a screenshot during a fullscreen mode transition or suspected
 display wedge. Use info, direct trace execution, and file retrieval first;

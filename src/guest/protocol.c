@@ -378,6 +378,10 @@ int v9x_serve_client(V9xConnection *conn)
                           v9x_execution_cancel(conn, target_request) ? 1ul : 0ul);
             if (!v9x_send_frame(conn, V9X_MSG_CANCEL_RESPONSE,
                                 header.request_id, conn->response, 8ul)) return 0;
+        } else if (v9x_is_tools_message(header.type)) {
+            if (!v9x_handle_tools_message(conn, header.type,
+                                          header.request_id, conn->payload,
+                                          header.payload_length)) return 0;
         } else if (v9x_is_file_message(header.type)) {
             if (!v9x_handle_file_message(conn, header.type,
                                          header.request_id, conn->payload,

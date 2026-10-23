@@ -59,8 +59,43 @@ static HANDLE v9x_tray_setup_process;
 /* Standard 16-colour palette indices used by the drawing. */
 #define V9X_PAL_BLACK 0u
 #define V9X_PAL_NAVY 4u
+#define V9X_PAL_SILVER 7u
+#define V9X_PAL_GREY 8u
 #define V9X_PAL_LIME 10u
+#define V9X_PAL_YELLOW 11u
+#define V9X_PAL_BLUE 12u
 #define V9X_PAL_WHITE 15u
+
+/* Second index of state->tray_icons. */
+#define V9X_TRAY_BODY_IDLE 0
+#define V9X_TRAY_BODY_BUSY 1
+#define V9X_TRAY_BODY_VNC 2
+
+/* The remote-help badge: a white cloud with a blue outline in the bottom
+   right corner (silver with a grey outline while paused), drawn over the
+   window (and its transparent margin) so it reads against every body colour.
+   'O' outline, 'W' fill, '.' leaves the window pixel underneath. */
+#define V9X_TRAY_CLOUD_NONE 0
+#define V9X_TRAY_CLOUD_ON 1
+#define V9X_TRAY_CLOUD_PAUSED 2
+#define V9X_CLOUD_X 6ul
+#define V9X_CLOUD_Y 10ul
+#define V9X_CLOUD_W 10ul
+#define V9X_CLOUD_H 6ul
+static const char v9x_cloud[V9X_CLOUD_H][V9X_CLOUD_W + 1ul] = {
+    "...OOO....",
+    "..OWWWOOO.",
+    ".OOWWWWWWO",
+    "OWWWWWWWWO",
+    "OWWWWWWWWO",
+    ".OOOOOOOO."
+};
+
+/* V9XVNC.EXE holds this event while a viewer is connected (vnc.c). On
+   Windows 2000 the server runs as a SYSTEM service, so opening it may fail
+   with access denied: that still means it exists. */
+static const char v9x_tray_vnc_session[] = "V9XVNC.SESSION";
+static int v9x_tray_vnc_active;
 
 static unsigned long v9x_tray_append(char *target, unsigned long offset,
                                      const char *text)
@@ -103,6 +138,13 @@ static void v9x_tray_tooltip(V9xAgentState *state,
         offset = v9x_tray_append_decimal(tooltip, offset, (unsigned long)age);
         offset = v9x_tray_append(tooltip, offset, " s ago from ");
         (void)v9x_tray_append(tooltip, offset, state->last_command_source);
+        return;
+    }
+    if (v9x_tray_vnc_active) {
+        offset = v9x_tray_append(tooltip, offset, "VNC viewer connected | Agent ");
+        offset = v9x_tray_append(tooltip, offset, V9X_AGENT_VERSION);
+        offset = v9x_tray_append(tooltip, offset, " | IP ");
+        (void)v9x_tray_append(tooltip, offset, address);
         return;
     }
     if (state->remote_on) {
@@ -167,10 +209,20 @@ static unsigned long v9x_icon_put16(unsigned char *target, unsigned long at,
 /* Palette index of pixel (x, y) in top-down coordinates, or 16 for
    transparent. The picture is the classic application window: a black
    outline, a navy title bar with a white button, and a body that is white
-   when idle and lime while the agent is busy. */
+   when idle, yellow while a VNC viewer is connected, and flashes lime while
+   the agent is busy. `cloud` (V9X_TRAY_CLOUD_*) puts the remote-help badge
+   on top. */
 static unsigned int v9x_icon_pixel(unsigned long x, unsigned long y,
-                                   unsigned int body)
+                                   unsigned int body, int cloud)
 {
+    if (cloud != V9X_TRAY_CLOUD_NONE &&
+        x >= V9X_CLOUD_X && x < V9X_CLOUD_X + V9X_CLOUD_W &&
+        y >= V9X_CLOUD_Y && y < V9X_CLOUD_Y + V9X_CLOUD_H) {
+        char mark = v9x_cloud[y - V9X_CLOUD_Y][x - V9X_CLOUD_X];
+        int paused = cloud == V9X_TRAY_CLOUD_PAUSED;
+        if (mark == 'O') return paused ? V9X_PAL_GREY : V9X_PAL_BLUE;
+        if (mark == 'W') return paused ? V9X_PAL_SILVER : V9X_PAL_WHITE;
+    }
     if (x == 0ul || x == 15ul || y == 0ul || y == 15ul) return 16u;
     if (x == 1ul || x == 14ul || y == 1ul || y == 14ul) return V9X_PAL_BLACK;
     if (y <= 4ul) {
@@ -179,7 +231,8 @@ static unsigned int v9x_icon_pixel(unsigned long x, unsigned long y,
     return body;
 }
 
-static unsigned long v9x_icon_build(unsigned char *out, unsigned int body)
+static unsigned long v9x_icon_build(unsigned char *out, unsigned int body,
+                                    int cloud)
 {
     static const unsigned char palette[16][3] = {
         /* R, G, B */
@@ -222,8 +275,8 @@ static unsigned long v9x_icon_build(unsigned char *out, unsigned int body)
     for (row = 0ul; row < V9X_ICON_SIZE; ++row) {
         y = V9X_ICON_SIZE - 1ul - row;
         for (x = 0ul; x < V9X_ICON_SIZE; x += 2ul) {
-            unsigned int left = v9x_icon_pixel(x, y, body);
-            unsigned int right = v9x_icon_pixel(x + 1ul, y, body);
+            unsigned int left = v9x_icon_pixel(x, y, body, cloud);
+            unsigned int right = v9x_icon_pixel(x + 1ul, y, body, cloud);
             if (left > 15u) left = V9X_PAL_BLACK;
             if (right > 15u) right = V9X_PAL_BLACK;
             out[at++] = (unsigned char)((left << 4) | right);
@@ -236,7 +289,7 @@ static unsigned long v9x_icon_build(unsigned char *out, unsigned int body)
         y = V9X_ICON_SIZE - 1ul - row;
         for (x = 0ul; x < V9X_ICON_SIZE; ++x) {
             bits <<= 1;
-            if (v9x_icon_pixel(x, y, body) > 15u) bits |= 1ul;
+            if (v9x_icon_pixel(x, y, body, cloud) > 15u) bits |= 1ul;
         }
         out[at++] = (unsigned char)((bits >> 8) & 0xFFul);
         out[at++] = (unsigned char)(bits & 0xFFul);
@@ -246,15 +299,15 @@ static unsigned long v9x_icon_build(unsigned char *out, unsigned int body)
     return at;
 }
 
-static HICON v9x_icon_create(unsigned int body)
+static HICON v9x_icon_create(unsigned int body, int cloud)
 {
     static unsigned char resource[V9X_ICON_BYTES];
-    unsigned long length = v9x_icon_build(resource, body);
+    unsigned long length = v9x_icon_build(resource, body, cloud);
     return CreateIconFromResource(resource, (DWORD)length, TRUE, 0x00030000ul);
 }
 
 static int v9x_tray_notify(V9xAgentState *state, DWORD message,
-                           const char *address, int busy)
+                           const char *address, HICON icon)
 {
     NOTIFYICONDATAA data;
     data.cbSize = NOTIFYICONDATAA_V1_SIZE;
@@ -262,7 +315,7 @@ static int v9x_tray_notify(V9xAgentState *state, DWORD message,
     data.uID = V9X_TRAY_ICON_ID;
     data.uFlags = NIF_ICON | NIF_TIP | NIF_MESSAGE;
     data.uCallbackMessage = V9X_TRAY_CALLBACK;
-    data.hIcon = busy ? state->tray_icon_busy : state->tray_icon;
+    data.hIcon = icon;
     v9x_tray_tooltip(state, address, data.szTip);
     return Shell_NotifyIconA(message, &data) != FALSE;
 }
@@ -492,7 +545,13 @@ void v9x_tray_chat_service(V9xAgentState *state)
 
 static int v9x_tray_create_window(V9xAgentState *state)
 {
+    static const unsigned int bodies[3] = {
+        V9X_PAL_WHITE, V9X_PAL_LIME, V9X_PAL_YELLOW
+    };
     WNDCLASSA klass;
+    int created;
+    int cloud;
+    int body;
     klass.style = 0u;
     klass.lpfnWndProc = v9x_tray_proc;
     klass.cbClsExtra = 0;
@@ -514,18 +573,32 @@ static int v9x_tray_create_window(V9xAgentState *state)
         v9x_tray_log_error("tray-window-failed");
         return 0;
     }
-    state->tray_icon = v9x_icon_create(V9X_PAL_WHITE);
-    if (state->tray_icon != 0) {
-        state->tray_icon_busy = v9x_icon_create(V9X_PAL_LIME);
+    created = 1;
+    for (cloud = 0; cloud < 3 && created; ++cloud) {
+        for (body = 0; body < 3; ++body) {
+            state->tray_icons[cloud][body] = v9x_icon_create(bodies[body], cloud);
+            if (state->tray_icons[cloud][body] == 0) {
+                created = 0;
+                break;
+            }
+        }
     }
-    if (state->tray_icon == 0 || state->tray_icon_busy == 0) {
+    if (!created) {
         /* Fall back to the stock application icon, without activity
            feedback, rather than lose the tray icon altogether. */
+        HICON stock;
         v9x_tray_log_error("tray-createicon-failed");
-        if (state->tray_icon != 0) DestroyIcon(state->tray_icon);
-        state->tray_icon = LoadIconA(0, IDI_APPLICATION);
-        state->tray_icon_busy = state->tray_icon;
+        stock = LoadIconA(0, IDI_APPLICATION);
+        for (cloud = 0; cloud < 3; ++cloud) {
+            for (body = 0; body < 3; ++body) {
+                if (state->tray_icons[cloud][body] != 0) {
+                    DestroyIcon(state->tray_icons[cloud][body]);
+                }
+                state->tray_icons[cloud][body] = stock;
+            }
+        }
     }
+    state->tray_icon = state->tray_icons[0][V9X_TRAY_BODY_IDLE];
     if (state->tray_icon == 0) {
         v9x_tray_log_error("tray-loadicon-failed");
         DestroyWindow(state->tray_window);
@@ -554,6 +627,26 @@ static int v9x_tray_sample_busy(V9xAgentState *state, LONG *last_activity,
     if (*hold_ms != 0ul) return 1;
     if (v9x_flag_read(&state->active_connections) > 0l) return 1;
     return v9x_execution_any_active(state);
+}
+
+/* The cloud badge: remote help is registered with the relay; grey while
+   paused, when it still checks in but refuses sessions. */
+static int v9x_tray_sample_cloud(V9xAgentState *state)
+{
+    if (!state->remote_on ||
+        v9x_flag_read(&state->remote_status) != V9X_REMOTE_ONLINE) {
+        return V9X_TRAY_CLOUD_NONE;
+    }
+    return v9x_flag_read(&state->remote_paused) ? V9X_TRAY_CLOUD_PAUSED :
+                                                 V9X_TRAY_CLOUD_ON;
+}
+
+static int v9x_tray_sample_vnc(void)
+{
+    HANDLE session = OpenEventA(SYNCHRONIZE, FALSE, v9x_tray_vnc_session);
+    if (session == 0) return GetLastError() == ERROR_ACCESS_DENIED;
+    CloseHandle(session);
+    return 1;
 }
 
 /* Restart: drop the icon (it would otherwise linger as a ghost until the
@@ -637,8 +730,9 @@ static DWORD WINAPI v9x_tray_worker(LPVOID parameter)
     unsigned long flash_elapsed;
     int phase;
     int was_busy;
-    int shown_busy;
     int want_busy;
+    HICON shown_icon;
+    HICON want_icon;
 
     /* The owner window is created here, not by v9x_tray_start: this is the
        only thread in the agent that pumps messages, and a window belongs to
@@ -649,7 +743,11 @@ static DWORD WINAPI v9x_tray_worker(LPVOID parameter)
     for (;;) {
         while (FindWindowA("Shell_TrayWnd", 0) == 0) v9x_tray_wait(1000ul);
         v9x_tray_address(state, address);
-        if (!v9x_tray_notify(state, NIM_ADD, address, 0)) {
+        v9x_tray_vnc_active = v9x_tray_sample_vnc();
+        shown_icon = state->tray_icons[v9x_tray_sample_cloud(state)]
+                                      [v9x_tray_vnc_active ? V9X_TRAY_BODY_VNC :
+                                                             V9X_TRAY_BODY_IDLE];
+        if (!v9x_tray_notify(state, NIM_ADD, address, shown_icon)) {
             if (!reported) {
                 v9x_tray_log_error("tray-notify-failed");
                 reported = 1;
@@ -661,7 +759,9 @@ static DWORD WINAPI v9x_tray_worker(LPVOID parameter)
         reported = 0;
 
         /* Steady state: sample activity every slice, swap the icon between
-           the white and lime bodies at V9X_TRAY_FLASH_MS while busy, and
+           the resting body (white, or yellow during a VNC session) and lime
+           at V9X_TRAY_FLASH_MS while busy, every one of them with the
+           cloud badge while remote help is connected, and
            re-assert the icon with a fresh address every V9X_TRAY_REFRESH_MS
            when idle. Any failed NIM_MODIFY or a vanished taskbar (Explorer
            restarted) drops back to NIM_ADD. */
@@ -671,12 +771,17 @@ static DWORD WINAPI v9x_tray_worker(LPVOID parameter)
         flash_elapsed = 0ul;
         phase = 0;
         was_busy = 0;
-        shown_busy = 0;
         for (;;) {
+            int vnc_active;
             v9x_tray_wait(V9X_TRAY_PUMP_SLICE);
             since_refresh += V9X_TRAY_PUMP_SLICE;
             v9x_tray_service(state);
             v9x_tray_chat_service(state);
+            vnc_active = v9x_tray_sample_vnc();
+            if (vnc_active != v9x_tray_vnc_active) {
+                v9x_tray_vnc_active = vnc_active;
+                v9x_log_event("tray-vnc-session", vnc_active ? "start" : "end");
+            }
             if (v9x_tray_sample_busy(state, &last_activity, &hold_ms)) {
                 if (!was_busy) {
                     /* Go lime on the first busy sample rather than waiting
@@ -698,7 +803,11 @@ static DWORD WINAPI v9x_tray_worker(LPVOID parameter)
                 flash_elapsed = 0ul;
                 want_busy = 0;
             }
-            if (want_busy == shown_busy && since_refresh < V9X_TRAY_REFRESH_MS) {
+            want_icon = state->tray_icons[v9x_tray_sample_cloud(state)]
+                                         [want_busy ? V9X_TRAY_BODY_BUSY :
+                                          vnc_active ? V9X_TRAY_BODY_VNC :
+                                                       V9X_TRAY_BODY_IDLE];
+            if (want_icon == shown_icon && since_refresh < V9X_TRAY_REFRESH_MS) {
                 continue;
             }
             if (since_refresh >= V9X_TRAY_REFRESH_MS) {
@@ -706,10 +815,10 @@ static DWORD WINAPI v9x_tray_worker(LPVOID parameter)
                 v9x_tray_address(state, address);
             }
             if (FindWindowA("Shell_TrayWnd", 0) == 0 ||
-                !v9x_tray_notify(state, NIM_MODIFY, address, want_busy)) {
+                !v9x_tray_notify(state, NIM_MODIFY, address, want_icon)) {
                 break;
             }
-            shown_busy = want_busy;
+            shown_icon = want_icon;
         }
     }
 }

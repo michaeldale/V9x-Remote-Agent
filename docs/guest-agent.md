@@ -61,8 +61,18 @@ The icon is a small application window: black outline, navy title bar, white
 body. The body flashes lime (250 ms on, 250 ms off) while the agent is busy:
 any client connected, any execution running, or a frame received or sent in
 the last 750 ms, so even a `ping` produces one visible blink and a long
-`exec` flashes for its whole duration. Both icon variants are built by the
-agent in memory as 16-colour icon resources and created with
+`exec` flashes for its whole duration. While a VNC viewer is connected the
+body is yellow instead of white (still flashing lime for commands) and the
+tooltip starts "VNC viewer connected": `V9XVNC.EXE` holds the named event
+`V9XVNC.SESSION` for the length of each session, and the tray checks for it
+every 100 ms (access denied, from the Windows 2000 SYSTEM service, counts as
+present). Changes are logged as `tray-vnc-session start|end`. While remote
+help is connected to the relay (status online) a small white cloud with a
+blue outline (grey while remote help is paused) sits in the icon's
+bottom-right corner, on top of
+whichever body is showing, so the flashing and the VNC colour still read
+through it. All icon
+variants are built by the agent in memory as 16-colour icon resources and created with
 `CreateIconFromResource`, because the agent is not allowed to import GDI32;
 if that fails the agent logs `tray-createicon-failed` and uses the stock
 `IDI_APPLICATION` icon without activity feedback. See

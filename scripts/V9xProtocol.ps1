@@ -449,6 +449,219 @@ function ConvertFrom-V9xListPayload {
     return $entries.ToArray()
 }
 
+# ---- File tools, processes, registry (agent 0.13.0+) -------------------
+# FILE_DELETE 0x0028 (u32 flags: 1 recursive, 2 force; path), FILE_HASH
+# 0x0029 (path), FILE_READ_TEXT 0x002A (u32 tail, u32 max bytes, match, path)
+# need V9X_CAP_FILE_TOOLS 0x00040000; PROCESS_LIST 0x0080 / PROCESS_KILL
+# 0x0081 need 0x00080000; REG_QUERY 0x0090 needs 0x00100000.
+
+# Names and text from the guest are in the Windows ANSI code page, not ASCII.
+$script:V9xAnsi = [Text.Encoding]::GetEncoding(1252)
+
+function Read-V9xAnsiString {
+    param([byte[]]$Bytes, [ref]$Offset)
+    if ($Offset.Value + 2 -gt $Bytes.Length) { throw 'Truncated protocol string length.' }
+    $length = [BitConverter]::ToUInt16($Bytes, $Offset.Value)
+    $Offset.Value += 2
+    if ($Offset.Value + $length -gt $Bytes.Length) { throw 'Truncated protocol string.' }
+    $value = $script:V9xAnsi.GetString($Bytes, $Offset.Value, $length)
+    $Offset.Value += $length
+    return $value
+}
+
+function New-V9xDeletePayload {
+    param([Parameter(Mandatory = $true)][string]$Path, [switch]$Recurse, [switch]$Force)
+    $flags = [uint32]0
+    if ($Recurse) { $flags = $flags -bor 1 }
+    if ($Force) { $flags = $flags -bor 2 }
+    $bytes = [Collections.Generic.List[byte]]::new()
+    $bytes.AddRange([BitConverter]::GetBytes($flags))
+    Add-V9xString -Bytes $bytes -Value $Path
+    return $bytes.ToArray()
+}
+
+function ConvertFrom-V9xDeletePayload {
+    param([byte[]]$Payload)
+    if ($Payload.Length -ne 8) { throw 'Invalid FILE_DELETE_RESPONSE payload.' }
+    [pscustomobject]@{
+        FilesDeleted = [BitConverter]::ToUInt32($Payload, 0)
+        DirectoriesDeleted = [BitConverter]::ToUInt32($Payload, 4)
+    }
+}
+
+function ConvertFrom-V9xHashPayload {
+    param([byte[]]$Payload)
+    if ($Payload.Length -ne 40) { throw 'Invalid FILE_HASH_RESPONSE payload.' }
+    [pscustomobject]@{
+        Size = [BitConverter]::ToUInt32($Payload, 0)
+        Crc32 = ('{0:X8}' -f [BitConverter]::ToUInt32($Payload, 4))
+        Sha256 = (($Payload[8..39] | ForEach-Object { $_.ToString('X2') }) -join '')
+    }
+}
+
+function New-V9xReadTextPayload {
+    param([Parameter(Mandatory = $true)][string]$Path, [uint32]$Tail = 0,
+          [uint32]$MaxBytes = 0, [string]$Match = '')
+    $bytes = [Collections.Generic.List[byte]]::new()
+    $bytes.AddRange([BitConverter]::GetBytes($Tail))
+    $bytes.AddRange([BitConverter]::GetBytes($MaxBytes))
+    Add-V9xString -Bytes $bytes -Value $Match
+    Add-V9xString -Bytes $bytes -Value $Path
+    return $bytes.ToArray()
+}
+
+function ConvertFrom-V9xReadTextPayload {
+    param([byte[]]$Payload)
+    if ($Payload.Length -lt 24) { throw 'Truncated FILE_READ_TEXT_RESPONSE payload.' }
+    $length = [BitConverter]::ToUInt32($Payload, 20)
+    if (24 + $length -ne $Payload.Length) { throw 'FILE_READ_TEXT_RESPONSE length mismatch.' }
+    $flags = [BitConverter]::ToUInt32($Payload, 16)
+    [pscustomobject]@{
+        FileSize = [BitConverter]::ToUInt32($Payload, 0)
+        Lines = [BitConverter]::ToUInt32($Payload, 4)
+        Matched = [BitConverter]::ToUInt32($Payload, 8)
+        Returned = [BitConverter]::ToUInt32($Payload, 12)
+        Truncated = [bool]($flags -band 1)
+        LongLinesCut = [bool]($flags -band 2)
+        Text = $script:V9xAnsi.GetString($Payload, 24, $length)
+    }
+}
+
+function ConvertFrom-V9xProcessListPayload {
+    param([byte[]]$Payload)
+    if ($Payload.Length -lt 4) { throw 'Truncated PROCESS_LIST_RESPONSE payload.' }
+    $count = [BitConverter]::ToUInt32($Payload, 0)
+    $offset = 4
+    $list = [Collections.Generic.List[object]]::new()
+    for ($index = 0; $index -lt $count; ++$index) {
+        if ($offset + 20 -gt $Payload.Length) { throw 'Truncated process entry.' }
+        $processId = [BitConverter]::ToUInt32($Payload, $offset)
+        $parent = [BitConverter]::ToUInt32($Payload, $offset + 4)
+        $threads = [BitConverter]::ToUInt32($Payload, $offset + 8)
+        $flags = [BitConverter]::ToUInt32($Payload, $offset + 12)
+        $job = [BitConverter]::ToUInt32($Payload, $offset + 16)
+        $offset += 20
+        $path = Read-V9xAnsiString -Bytes $Payload -Offset ([ref]$offset)
+        $list.Add([pscustomobject]@{
+            Pid = $processId; ParentPid = $parent; Threads = $threads
+            Name = Split-Path -Leaf $path; Path = $path
+            Agent = [bool]($flags -band 2); AgentJob = [bool]($flags -band 1)
+            JobRequestId = $job
+        })
+    }
+    if ($offset -ne $Payload.Length) { throw 'PROCESS_LIST_RESPONSE contains trailing data.' }
+    return $list.ToArray()
+}
+
+# WINDOW_LIST 0x0062 (empty) -> 0x8062: u32 count, u32 truncated, then per
+# window u32 hwnd, u32 pid, u32 flags (1 foreground, 2 minimized), i32 left,
+# top, right, bottom, class string, title string. V9X_CAP_WINDOWS 0x00200000.
+function ConvertFrom-V9xWindowListPayload {
+    param([byte[]]$Payload)
+    if ($Payload.Length -lt 8) { throw 'Truncated WINDOW_LIST_RESPONSE payload.' }
+    $count = [BitConverter]::ToUInt32($Payload, 0)
+    $offset = 8
+    $list = [Collections.Generic.List[object]]::new()
+    for ($index = 0; $index -lt $count; ++$index) {
+        if ($offset + 28 -gt $Payload.Length) { throw 'Truncated window entry.' }
+        $flags = [BitConverter]::ToUInt32($Payload, $offset + 8)
+        $left = [BitConverter]::ToInt32($Payload, $offset + 12)
+        $top = [BitConverter]::ToInt32($Payload, $offset + 16)
+        $right = [BitConverter]::ToInt32($Payload, $offset + 20)
+        $bottom = [BitConverter]::ToInt32($Payload, $offset + 24)
+        $window = [ordered]@{
+            Handle = [BitConverter]::ToUInt32($Payload, $offset)
+            Pid = [BitConverter]::ToUInt32($Payload, $offset + 4)
+            Foreground = [bool]($flags -band 1); Minimized = [bool]($flags -band 2)
+            X = $left; Y = $top; Width = $right - $left; Height = $bottom - $top
+        }
+        $offset += 28
+        $window.Class = Read-V9xAnsiString -Bytes $Payload -Offset ([ref]$offset)
+        $window.Title = Read-V9xAnsiString -Bytes $Payload -Offset ([ref]$offset)
+        $list.Add([pscustomobject]$window)
+    }
+    if ($offset -ne $Payload.Length) { throw 'WINDOW_LIST_RESPONSE contains trailing data.' }
+    return $list.ToArray()
+}
+
+$script:V9xRegHives = [ordered]@{
+    'HKCR' = 0x80000000L; 'HKEY_CLASSES_ROOT' = 0x80000000L
+    'HKCU' = 0x80000001L; 'HKEY_CURRENT_USER' = 0x80000001L
+    'HKLM' = 0x80000002L; 'HKEY_LOCAL_MACHINE' = 0x80000002L
+    'HKU' = 0x80000003L; 'HKEY_USERS' = 0x80000003L
+    'HKCC' = 0x80000005L; 'HKEY_CURRENT_CONFIG' = 0x80000005L
+    'HKDD' = 0x80000006L; 'HKEY_DYN_DATA' = 0x80000006L
+}
+
+function New-V9xRegQueryPayload {
+    param([Parameter(Mandatory = $true)][string]$Key)
+    $parts = $Key.Replace('/', '\').TrimEnd('\').Split([char[]]'\', 2)
+    $hiveName = $parts[0].TrimEnd(':').ToUpperInvariant()
+    if (-not $script:V9xRegHives.Contains($hiveName)) {
+        throw "Unknown registry hive '$($parts[0])' (HKLM, HKCU, HKCR, HKU, HKCC, HKDD)."
+    }
+    $bytes = [Collections.Generic.List[byte]]::new()
+    $bytes.AddRange([BitConverter]::GetBytes([uint32]$script:V9xRegHives[$hiveName]))
+    Add-V9xString -Bytes $bytes -Value $(if ($parts.Count -gt 1) { $parts[1] } else { '' })
+    return $bytes.ToArray()
+}
+
+function ConvertFrom-V9xRegQueryPayload {
+    param([byte[]]$Payload)
+    if ($Payload.Length -lt 12) { throw 'Truncated REG_QUERY_RESPONSE payload.' }
+    $subkeyCount = [BitConverter]::ToUInt32($Payload, 0)
+    $valueCount = [BitConverter]::ToUInt32($Payload, 4)
+    $flags = [BitConverter]::ToUInt32($Payload, 8)
+    $offset = 12
+    $subkeys = @(for ($index = 0; $index -lt $subkeyCount; ++$index) {
+        Read-V9xAnsiString -Bytes $Payload -Offset ([ref]$offset)
+    })
+    $typeNames = @{ 0 = 'REG_NONE'; 1 = 'REG_SZ'; 2 = 'REG_EXPAND_SZ'; 3 = 'REG_BINARY'
+                    4 = 'REG_DWORD'; 5 = 'REG_DWORD_BIG_ENDIAN'; 7 = 'REG_MULTI_SZ' }
+    $values = @(for ($index = 0; $index -lt $valueCount; ++$index) {
+        $name = Read-V9xAnsiString -Bytes $Payload -Offset ([ref]$offset)
+        if ($offset + 8 -gt $Payload.Length) { throw 'Truncated registry value.' }
+        $type = [BitConverter]::ToUInt32($Payload, $offset)
+        $length = [BitConverter]::ToUInt32($Payload, $offset + 4)
+        $offset += 8
+        if ($offset + $length -gt $Payload.Length) { throw 'Truncated registry data.' }
+        $raw = [byte[]]@(if ($length -gt 0) { $Payload[$offset..($offset + $length - 1)] })
+        $offset += $length
+        $data = switch ($type) {
+            { $_ -in 1, 2 } { $script:V9xAnsi.GetString($raw).TrimEnd([char]0) }
+            4 { if ($raw.Length -ge 4) { [BitConverter]::ToUInt32($raw, 0) } else { $null } }
+            7 { @($script:V9xAnsi.GetString($raw).Split([char]0) | Where-Object { $_ -ne '' }) }
+            default { ($raw | ForEach-Object { $_.ToString('X2') }) -join ' ' }
+        }
+        [pscustomobject]@{
+            Name = $(if ($name -eq '') { '(Default)' } else { $name })
+            Type = $(if ($typeNames.ContainsKey([int]$type)) { $typeNames[[int]$type] } else { "type $type" })
+            Data = $data
+        }
+    })
+    if ($offset -ne $Payload.Length) { throw 'REG_QUERY_RESPONSE contains trailing data.' }
+    [pscustomobject]@{ Subkeys = $subkeys; Values = $values; Truncated = [bool]($flags -band 1) }
+}
+
+# SCREENSHOT_REQUEST: the guest path, then (V9X_CAP_SCREENSHOT_OPTIONS
+# 0x00020000, agent 0.13.0+) six u32s: flags (0x1 compact = lossless 8-bit
+# palette/RLE8 when <= 256 colours, 0x2 gray), region x, y, width, height
+# (width or height 0 = whole screen) and scale percent (1-100, 0 = 100).
+# Without -Options the payload is the bare path every agent accepts.
+function New-V9xScreenshotPayload {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [uint32[]]$Options
+    )
+    $bytes = [Collections.Generic.List[byte]]::new()
+    Add-V9xString -Bytes $bytes -Value $Path
+    if ($null -ne $Options) {
+        if ($Options.Count -ne 6) { throw 'Screenshot options are six u32 values.' }
+        foreach ($value in $Options) { $bytes.AddRange([BitConverter]::GetBytes([uint32]$value)) }
+    }
+    return $bytes.ToArray()
+}
+
 function ConvertFrom-V9xScreenshotPayload {
     param([byte[]]$Payload)
     if ($Payload.Length -lt 22) { throw 'Truncated SCREENSHOT_RESPONSE payload.' }

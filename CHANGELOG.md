@@ -2,6 +2,91 @@
 
 All notable changes to the V9x Remote Agent. Dates are in YYYY-MM-DD.
 
+## 0.13.0 (2026-10-23)
+
+### Added
+- **Smaller, faster screenshots.** `screenshot` and `input -OutFile` take
+  `-Region x,y,w,h`, `-Scale <0.01-1>` and `-Gray`; the MCP's
+  `v9x_screenshot` and every input tool take `region`, `scale` and `gray`.
+  The result reports `RegionX/Y/Width/Height` and `ScalePercent` so image
+  coordinates map back to the screen.
+- The agent shapes the capture before sending it (new capability
+  `V9X_CAP_SCREENSHOT_OPTIONS` `0x00020000`, an options block after the
+  SCREENSHOT_REQUEST path; `src\common\shotxf.c`): crop, box-filtered
+  downscale, and lossless packing. A screen with at most 256 colours (every
+  8-bpp desktop and most dialogs) goes out as 8-bit with an exact palette,
+  RLE8-compressed when smaller, instead of 24-bit. New hosts always ask for
+  that, so even a plain screenshot crosses the wire (and the remote-help
+  relay) in a fraction of the bytes. `-Gray` is the lossy option.
+- Against older agents, v9xctl and the MCP crop/scale/grey on the host after
+  the download, so the options work everywhere.
+- The MCP reads 8-bit and RLE8 BMPs and sends greyscale PNGs as one channel.
+- **The verbs agents kept improvising** (each its own capability, so older
+  agents are refused cleanly with exit 23):
+  - `cat -Path <file> [-Tail N] [-Match text] [-MaxBytes n]` / MCP
+    `v9x_read_text`: a text file inline, filtered and bounded in the guest,
+    instead of `get` and reading the download (`V9X_CAP_FILE_TOOLS`
+    `0x00040000`, `FILE_READ_TEXT`; filter in `src\common\textscan.c`).
+  - `hash -Path <file> [-Source <local>]` / `v9x_hash`: size, CRC32 and
+    SHA-256 computed in the guest, compared with a local file on request.
+  - `delete -Path <path> [-Recurse] [-Force]` / `v9x_delete`; refuses roots,
+    the Windows and system directories, `C:\V9XREMOTE` and their parents.
+  - `ps [-Name]` / `v9x_ps` and `kill -Pid|-Name` / `v9x_kill`
+    (`V9X_CAP_PROCESS` `0x00080000`, toolhelp): processes started by `exec`
+    are marked with their request id, so a job holding the slot (BUSY on
+    screenshot, reboot or update) can be found and ended; its `exec`
+    completes as usual. The agent and Windows core processes are refused.
+    Exit 45.
+  - `reg -Key HKLM\...` / `v9x_reg_query` (`V9X_CAP_REGISTRY` `0x00100000`):
+    subkeys and decoded values of one key, read-only, instead of
+    `REGEDIT /E` and `get`. Exit 46.
+- **Waits instead of sleeps.** Transcripts showed thousands of
+  `Start-Sleep` calls between v9xctl calls; each now has a verb or option
+  that returns as soon as the condition holds (AGENTS.md "Never sleep and
+  poll"):
+  - `wait-file -Path [-Gone] [-StableMs]` and `exec`/`shell -WaitForFile`
+    (stat polling on one connection; every agent). MCP `v9x_wait_file`,
+    `wait_for_file`. Exit 47.
+  - `windows`, `wait-window -Title [-Gone]`, `exec -WaitForWindow` and
+    `screenshot -Window <title>` (captures that window only) on a new
+    `WINDOW_LIST` request (`V9X_CAP_WINDOWS` `0x00200000`). MCP
+    `v9x_windows`, `wait_for_window`, `window`. Exit 48.
+  - Connections dropped before HELLO are retried twice by default;
+    `-WaitForAgent N` (any verb) retries every transport failure for N s
+    with backoff. `wait-desktop` and `ping -WaitSeconds` wait for the agent
+    too. MCP: same retry, `v9x_ping` `wait_seconds`.
+- v9xctl usage: `help <verb>`; a one-line unknown-verb error (verb list, this
+  copy's version and path) instead of the full help; verb aliases agents
+  guess (`ls`, `pull`, `status`, `rm`, `type`, `tasklist`, `wait-ready`...);
+  `-Target host:port`; `-HostName`/`-EndpointPort` aliases.
+- The tray icon carries a small cloud in its bottom-right corner while remote
+  help is connected to the relay: white with a blue outline, or grey while
+  remote help is paused. It sits on every state, so the white/yellow resting
+  body and the lime command flash work as before.
+
+### Fixed
+- `get` (and `stat`) could return a stale or garbage copy of an INI file that
+  a running program had just written with `WritePrivateProfileString`:
+  Windows 9x caches that file in memory and writes it lazily, which is why
+  `shell TYPE` (a DOS VM start flushes it) showed the right contents.
+  `stat`, `get`, `hash` and `cat` now flush that file's cache first.
+  Reproduced on 98 SE: a five-key INI read back as 17 bytes of garbage before,
+  intact after.
+- `help update` (any `help <verb>`) failed parameter binding: the second
+  positional argument only accepted vnc's status/start/stop.
+
+## 0.12.1 (2026-10-20)
+
+### Added
+- One GUI step in one call: `v9xctl.ps1 input -OutFile <image>` and
+  `screenshot: true` on every MCP input tool send the input, wait
+  `-SettleMs`/`settle_ms` (default 500) and capture a screenshot on the same
+  connection. Host-side only; no protocol or guest change.
+
+### Changed
+- `v9x_input` with raw `moverel` actions now checks that the agent supports
+  relative mouse moves, as `v9x_move` already did.
+
 ## 0.12.0 (2026-10-20)
 
 ### Added
@@ -52,6 +137,11 @@ All notable changes to the V9x Remote Agent. Dates are in YYYY-MM-DD.
 - `make-release.ps1` also builds `v9x-remote-agent-<version>-win32.zip`, the
   self-update package, and the release workflow publishes it;
   `scripts\sign-release.ps1` signs it afterwards on the developer's PC.
+- The tray icon's body turns yellow while a VNC viewer is connected, so the
+  owner can see someone is watching; it still flashes lime for commands.
+  `V9XVNC.EXE` holds a named event, `V9XVNC.SESSION`, for each session and
+  the tray polls for it; the tooltip reads "VNC viewer connected", and the
+  log gets `tray-vnc-session start|end`.
 
 ### Changed
 - The DOWNLOAD verb's HTTP client moved to `src\guest\http.c`, shared with

@@ -222,7 +222,8 @@ silently and `SETUP.EXE /uninstall` removes the autostart.
 
 Once installed, the agent starts with Windows before anyone logs on and puts
 an icon in the notification area. Its body flashes green while a host is
-connected or a program it started is running, and its tooltip gives the agent
+connected or a program it started is running, it turns yellow while a VNC
+viewer is connected, and its tooltip gives the agent
 version, port, and IP address:
 
 ![Agent tray icon: green while active, and its tooltip showing version, port and IP](docs/images/tray-icon.png)

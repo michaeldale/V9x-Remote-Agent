@@ -321,6 +321,7 @@ static DWORD WINAPI v9x_execution_worker(LPVOID parameter)
         goto complete_job;
     }
     CloseHandle(process.hThread); process.hThread = 0;
+    if (!detach) job->process_id = process.dwProcessId;
 
     result = V9X_EXEC_RESULT_OK;
     if (detach) {
@@ -398,6 +399,7 @@ static DWORD WINAPI v9x_execution_worker(LPVOID parameter)
     }
 
 complete_job:
+    job->process_id = 0ul;
     if (stdout_write != 0) CloseHandle(stdout_write);
     if (stderr_write != 0) CloseHandle(stderr_write);
     if (stdin_handle != INVALID_HANDLE_VALUE) CloseHandle(stdin_handle);

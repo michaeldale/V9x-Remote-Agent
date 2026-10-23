@@ -67,6 +67,8 @@ $sources = @(
     "src\common\sha512.c",
     "src\common\relay.c",
     "src\common\update_proto.c",
+    "src\common\shotxf.c",
+    "src\common\textscan.c",
     "src\guest\agent.c",
     "src\guest\discovery.c",
     "src\guest\download.c",
@@ -84,6 +86,7 @@ $sources = @(
     "src\guest\remote.c",
     "src\guest\reset.c",
     "src\guest\screenshot.c",
+    "src\guest\tools.c",
     "src\guest\tray.c",
     "src\guest\update.c"
 )
@@ -182,7 +185,11 @@ foreach ($requiredImport in @('Accept', 'Bind', 'CreateFileA', 'CreateMutexA',
                                'sendto', 'recvfrom', 'setsockopt', 'select',
                                'WritePrivateProfileStringA',
                                'DeviceIoControl', 'RegFlushKey', 'EnumWindows',
-                               'SendMessageTimeoutA')) {
+                               'SendMessageTimeoutA',
+                               'RemoveDirectoryA', 'SetFileAttributesA',
+                               'GetFullPathNameA', 'OpenProcess',
+                               'RegEnumValueA', 'GetWindowRect', 'IsIconic',
+                               'GetForegroundWindow')) {
     if ($dumpText -notmatch "(?im)\s$([regex]::Escape($requiredImport))\s*$") {
         throw "Guest output is missing expected import $requiredImport."
     }

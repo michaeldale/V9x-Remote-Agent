@@ -133,6 +133,79 @@ the guest verifies size and CRC32. `get` writes a uniquely named local `.part`
 and replaces the requested destination only after matching the guest's final
 size and CRC32.
 
+File, process and registry tools (agent 0.13.0+; exit 23 on older agents):
+
+```powershell
+.\scripts\v9xctl.ps1 cat -Path C:\V9XREMOTE\AGENT.LOG -Tail 40 -Match error
+.\scripts\v9xctl.ps1 hash -Path C:\WINDOWS\SYSTEM\V9X.DRV -Source .\build\V9X.DRV -Json
+.\scripts\v9xctl.ps1 delete -Path C:\V9XREMOTE\JOBS\demo -Recurse -Json
+.\scripts\v9xctl.ps1 ps
+.\scripts\v9xctl.ps1 kill -Name NOTEPAD.EXE -Json
+.\scripts\v9xctl.ps1 reg -Key HKLM\System\CurrentControlSet\Services\Class\Display -Json
+```
+
+- `cat` prints the text itself (with `-Json`: the text plus `Lines`,
+  `Matched`, `Returned`, `Truncated`). `-Tail N` keeps the last N lines after
+  `-Match` filtering (case-insensitive substring); `-MaxBytes` (default 16384,
+  at most 65512) bounds the answer, and a cut is reported on stderr.
+- `hash` returns `Size`, `Crc32` and `Sha256`; with `-Source <local file>`
+  also `LocalSha256` and `Matches`.
+- `delete` removes a file, an empty directory, or with `-Recurse` a tree;
+  `-Force` clears read-only/hidden/system attributes. It refuses drive roots,
+  the Windows and system directories, `C:\V9XREMOTE` and any folder holding
+  one of them (exit 40).
+- `ps` lists processes with `Agent` and `AgentJob`/`JobRequestId` (a process
+  an `exec` started); `-Name` filters with wildcards. `kill -Pid <id>` or
+  `-Name <image>` (exactly one match) terminates it; a killed exec job's
+  `exec` call then returns. Exit 45 for no match, several matches, or a
+  refused target (the agent, Windows core processes).
+- `reg` returns `Subkeys` and `Values` (`Name`, `Type`, decoded `Data`) of one
+  key; hives `HKLM`, `HKCU`, `HKCR`, `HKU`, `HKCC`, `HKDD`. Read-only. Exit 46
+  when the key does not exist.
+- `stat`, `get`, `hash` and `cat` flush Windows 9x's INI write cache first, so
+  an INI a running program just wrote reads current (see docs\protocol.md).
+
+Waiting without sleeping:
+
+```powershell
+.\scripts\v9xctl.ps1 ping -WaitSeconds 120 -Json             # until the agent answers
+.\scripts\v9xctl.ps1 info -WaitForAgent 60 -Json            # any verb: retry the connection
+.\scripts\v9xctl.ps1 exec -Application C:\SETUP\SETUP.EXE -Detach -WaitForWindow "Setup" -Json
+.\scripts\v9xctl.ps1 screenshot -Window "Setup" -OutFile .\setup.png -Json
+.\scripts\v9xctl.ps1 wait-window -Title "Setup" -Gone -WaitSeconds 300 -Json
+.\scripts\v9xctl.ps1 exec -Application C:\JOBS\RUN\BENCH.EXE -Detach -WaitForFile C:\JOBS\RUN\RESULT.TXT -StableMs 1000 -Json
+.\scripts\v9xctl.ps1 wait-file -Path C:\JOBS\RUN\LOCK -Gone -WaitSeconds 600 -Json
+.\scripts\v9xctl.ps1 windows
+```
+
+- Every connection is retried when it is dropped before HELLO (a port forward
+  that accepts while the agent is not listening yet), twice, 0.5 and 1 s
+  apart. `-WaitForAgent <seconds>` retries any transport failure (refused,
+  reset, timed out) for that long, backing off 1, 2, 4, then 5 s. Without it
+  a refused connection still fails at once with exit 20. `wait-desktop`
+  waits for the agent too, for its `-WaitSeconds`, and so does `ping` when
+  given `-WaitSeconds`.
+- `wait-file -Path` polls `stat` on one connection (every 250 ms; a relay
+  round trip is its own pace) until the file exists, with `-Gone` until it
+  does not, and with `-StableMs N` until its size has not changed for N ms.
+  Works with every agent. `exec`/`shell` take the same as `-WaitForFile`,
+  run after the program returns (immediately with `-Detach`). Exit 47 at the
+  `-WaitSeconds` deadline (default 120).
+- `windows` lists visible top-level windows; `wait-window -Title <text>`
+  waits for one whose title contains the text (case-insensitive, literal) and
+  returns its position and size, `-Gone` for it to close. `exec
+  -WaitForWindow <text>` does the same after launching. `screenshot -Window
+  <text>` captures that window's rectangle only (it becomes `-Region`); add
+  `-WaitSeconds` to wait for it first. Agent 0.13.0+; exit 48 when there is
+  no such window or the deadline passed.
+- Usage: `help <verb>` prints one verb; an unknown verb gets one line (the
+  verb list and this copy's version and path), not the full help. Verbs
+  agents often guess are accepted: `ls`/`dir` (list), `pull` (get), `push`
+  (put), `status` (info), `rm`/`del` (delete), `type`/`tail` (cat),
+  `tasklist` (ps), `taskkill` (kill), `wait-ready` (wait-desktop), and
+  more. `-Target host:port` sets `-Host` and `-Port` together; `-HostName`
+  and `-EndpointPort` are aliases.
+
 Boot and capture examples:
 
 ```powershell
@@ -154,6 +227,23 @@ does not advertise it. `wait-desktop` must
 then confirm Explorer readiness before post-reboot work; it polls INFO until the Explorer
 desktop (`Progman` or `Shell_TrayWnd`) appears. `screenshot` writes on the guest
 and then transactionally downloads and verifies the BMP.
+
+```powershell
+.\scripts\v9xctl.ps1 screenshot -OutFile .\dialog.png -Region 200,150,400,300 -Json
+.\scripts\v9xctl.ps1 screenshot -OutFile .\overview.png -Scale 0.5 -Gray -Json
+```
+
+`-Region x,y,w,h` captures one rectangle (clipped to the screen; one that
+starts off screen exits 10), `-Scale 0.01-1` downscales with a box filter, and
+`-Gray` stores 8-bit greyscale. The result then also carries `RegionX`,
+`RegionY`, `RegionWidth`, `RegionHeight`, `ScalePercent`, `Gray` and
+`ShapedBy`; a point in the image maps to the screen as
+`RegionX + x * RegionWidth / Width`. Agents 0.13.0+ (capability `0x00020000`)
+do the shaping before sending (`ShapedBy: guest`), and v9xctl always asks
+them to pack the image losslessly: 8-bit with an exact palette, RLE8 when that
+is smaller, whenever the screen has at most 256 colours. `Bytes` is what
+crossed the wire. Against older agents v9xctl shapes the full frame itself
+(`ShapedBy: host`). The same options work on `input -OutFile`.
 
 Input injection:
 
@@ -183,6 +273,17 @@ order as one atomic batch (at most 256 steps):
 
 The result reports the actions performed and the final cursor position. Input
 needs a ready desktop; run `wait-desktop` first after a reboot.
+
+Add `-OutFile` to make one GUI step one call: after the input, `input` waits
+`-SettleMs` (default 500, 0-30000) for the guest to repaint, then captures a
+screenshot on the same connection exactly as `screenshot -OutFile` does. The
+result carries both the screenshot fields and the input fields plus `SettleMs`.
+Raise `-SettleMs` for dialogs that open slowly; the screenshot caveats
+(no fullscreen transitions, no suspected display wedge) still apply.
+
+```powershell
+.\scripts\v9xctl.ps1 input -Sequence "move 80,486; click left" -OutFile .\after.png -Json
+```
 
 The guest's VNC server (for a person with a VNC viewer):
 

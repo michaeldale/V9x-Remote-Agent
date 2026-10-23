@@ -188,6 +188,7 @@ static int v9x_handle_stat(V9xConnection *conn, DWORD request_id,
         return v9x_file_error(conn, request_id, V9X_STATUS_INVALID_PAYLOAD,
                               ERROR_INVALID_PARAMETER, "invalid stat path");
     }
+    v9x_flush_ini_cache(path);
     attributes = GetFileAttributesA(path);
     if (attributes == 0xfffffffful) {
         native_error = GetLastError();
@@ -485,6 +486,7 @@ static int v9x_handle_read(V9xConnection *conn, DWORD request_id,
         return v9x_file_error(conn, request_id, V9X_STATUS_INVALID_PAYLOAD,
                               ERROR_INVALID_PARAMETER, "invalid read path");
     }
+    v9x_flush_ini_cache(path);
     file = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
                        0, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, 0);
     if (file == INVALID_HANDLE_VALUE) {

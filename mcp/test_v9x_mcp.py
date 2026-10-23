@@ -199,6 +199,154 @@ class BmpToPngTests(unittest.TestCase):
         with self.assertRaises(v9x_mcp.V9xError):
             v9x_mcp.bmp_to_png(b"PK\x03\x04" + b"\x00" * 60)
 
+    def test_rle8(self):
+        # 4x2, palette black/red: bottom row a run of 4 reds, top row the
+        # literal 0,1,0 then a run of one black; end of line, end of bitmap.
+        palette = b"\x00\x00\x00\x00" + b"\x00\x00\xff\x00"
+        pixels = b"\x04\x01\x00\x00" + b"\x00\x03\x00\x01\x00\x00" + b"\x01\x00\x00\x01"
+        offset = 54 + len(palette)
+        bmp = (b"BM" + struct.pack("<IHHI", offset + len(pixels), 0, 0, offset)
+               + struct.pack("<IiiHHIIiiII", 40, 4, 2, 1, 8, 1, len(pixels), 0, 0, 2, 2)
+               + palette + pixels)
+        width, height, rows = v9x_mcp.decode_bmp(bmp)
+        red, black = b"\xff\x00\x00", b"\x00\x00\x00"
+        self.assertEqual((width, height), (4, 2))
+        self.assertEqual(rows, [black + red + black + black, red * 4])
+
+    def test_agent_fixtures(self):
+        """The BMPs the agent's shotxf.c writes (dumped by build-host-tests.ps1)
+        decode to exactly the RGB its C reference decoder produced."""
+        folder = os.path.join(os.path.dirname(__file__), "..", "build", "host-tests", "shotxf")
+        if not os.path.isdir(folder):
+            self.skipTest("run scripts\\build-host-tests.ps1 to dump the shotxf fixtures")
+        names = sorted(n[:-4] for n in os.listdir(folder) if n.endswith(".bmp"))
+        self.assertGreaterEqual(len(names), 6)
+        for name in names:
+            with open(os.path.join(folder, name + ".bmp"), "rb") as handle:
+                width, height, rows = v9x_mcp.decode_bmp(handle.read())
+            with open(os.path.join(folder, name + ".rgb"), "rb") as handle:
+                self.assertEqual(b"".join(rows), handle.read(), name)
+
+    def test_host_shape_matches_agent(self):
+        """The fallback for pre-0.13.0 agents crops and box-scales like
+        shotxf.c: the crop_scale fixture is region 3,2,20,16 at 50 percent of
+        full24."""
+        folder = os.path.join(os.path.dirname(__file__), "..", "build", "host-tests", "shotxf")
+        if not os.path.isdir(folder):
+            self.skipTest("run scripts\\build-host-tests.ps1 to dump the shotxf fixtures")
+        with open(os.path.join(folder, "full24.bmp"), "rb") as handle:
+            width, height, rows = v9x_mcp.decode_bmp(handle.read())
+        out_w, out_h, shaped = v9x_mcp.shape_rgb(width, height, rows, [3, 2, 20, 16], 50)
+        with open(os.path.join(folder, "crop_scale.rgb"), "rb") as handle:
+            self.assertEqual(b"".join(shaped), handle.read())
+        self.assertEqual((out_w, out_h), (10, 8))
+
+    def test_gray_png_is_one_channel(self):
+        png = v9x_mcp.encode_png(1, 1, [b"\x40\x40\x40"], gray=True)
+        self.assertEqual(png[24:26], bytes((8, 0)))
+
+
+class ToolCodecTests(unittest.TestCase):
+    """FILE_READ_TEXT, PROCESS_LIST, REG_QUERY (agent 0.13.0+)."""
+
+    @staticmethod
+    def string(value, encoding="ascii"):
+        raw = value.encode(encoding)
+        return struct.pack("<H", len(raw)) + raw
+
+    def test_read_text(self):
+        text = b"one\nzwei \xfc\n"
+        payload = struct.pack("<6I", 9000, 50, 2, 2, 1, len(text)) + text
+        result = v9x_mcp.parse_read_text(payload)
+        self.assertEqual(result["text"], "one\nzwei \u00fc\n")
+        self.assertTrue(result["truncated"])
+        self.assertEqual((result["lines"], result["matched"], result["returned"]), (50, 2, 2))
+        with self.assertRaises(v9x_mcp.V9xError):
+            v9x_mcp.parse_read_text(payload + b"x")
+
+    def test_process_list(self):
+        payload = (struct.pack("<I", 2)
+                   + struct.pack("<5I", 0xFFFE8075, 0, 5, 2, 0) + self.string("C:\\V9XREMOTE\\V9XAGNT.EXE")
+                   + struct.pack("<5I", 0x10, 0xFFFE8075, 1, 1, 99) + self.string("NOTEPAD.EXE"))
+        agent, job = v9x_mcp.parse_process_list(payload)
+        self.assertEqual(agent["name"], "V9XAGNT.EXE")
+        self.assertTrue(agent["agent"])
+        self.assertFalse(agent["agent_job"])
+        self.assertEqual((job["name"], job["agent_job"], job["job_request_id"]), ("NOTEPAD.EXE", True, 99))
+
+    def test_reg_query(self):
+        values = (self.string("") + struct.pack("<II", 1, 3) + b"hi\x00"
+                  + self.string("N") + struct.pack("<II", 4, 4) + struct.pack("<I", 7)
+                  + self.string("M") + struct.pack("<II", 7, 5) + b"a\x00b\x00\x00"
+                  + self.string("B") + struct.pack("<II", 3, 2) + b"\x01\xff")
+        payload = struct.pack("<III", 1, 4, 1) + self.string("Sub") + values
+        result = v9x_mcp.parse_reg_query(payload)
+        self.assertEqual(result["subkeys"], ["Sub"])
+        self.assertTrue(result["truncated"])
+        data = {v["name"]: (v["type"], v["data"]) for v in result["values"]}
+        self.assertEqual(data["(Default)"], ("REG_SZ", "hi"))
+        self.assertEqual(data["N"], ("REG_DWORD", 7))
+        self.assertEqual(data["M"], ("REG_MULTI_SZ", ["a", "b"]))
+        self.assertEqual(data["B"], ("REG_BINARY", "01 ff"))
+
+    def test_reg_key_encoding(self):
+        self.assertEqual(v9x_mcp.encode_reg_key("HKLM\\Software\\X"),
+                         struct.pack("<I", 0x80000002) + self.string("Software\\X"))
+        self.assertEqual(v9x_mcp.encode_reg_key("hkey_current_user"),
+                         struct.pack("<I", 0x80000001) + self.string(""))
+        with self.assertRaises(v9x_mcp.V9xError):
+            v9x_mcp.encode_reg_key("HKXX\\Software")
+
+    def test_window_list(self):
+        entry = (struct.pack("<IIIiiii", 0x20, 7, 1, -4, 10, 500, 350)
+                 + self.string("#32770") + self.string("Setup"))
+        (window,) = v9x_mcp.parse_window_list(struct.pack("<II", 1, 0) + entry)
+        self.assertEqual((window["title"], window["class"], window["x"], window["y"]),
+                         ("Setup", "#32770", -4, 10))
+        self.assertEqual((window["width"], window["height"], window["foreground"]), (504, 340, True))
+
+    def test_connect_retries_a_connection_dropped_before_hello(self):
+        attempts = []
+
+        def fake_client(*_args, **_kwargs):
+            attempts.append(1)
+            if len(attempts) == 1:
+                raise ConnectionResetError("forward answered, agent not listening")
+            return "client"
+
+        original, original_sleep = v9x_mcp.V9xClient, v9x_mcp.time.sleep
+        v9x_mcp.V9xClient, v9x_mcp.time.sleep = fake_client, lambda _s: None
+        try:
+            handler = v9x_mcp.ToolHandler("127.0.0.1", 1, 0.1)
+            self.assertEqual(handler.connect(), "client")
+            self.assertEqual(len(attempts), 2)
+        finally:
+            v9x_mcp.V9xClient, v9x_mcp.time.sleep = original, original_sleep
+
+    def test_connect_refused_fails_fast_without_wait(self):
+        attempts = []
+
+        def refused(*_args, **_kwargs):
+            attempts.append(1)
+            raise ConnectionRefusedError("refused")
+
+        original = v9x_mcp.V9xClient
+        v9x_mcp.V9xClient = refused
+        try:
+            handler = v9x_mcp.ToolHandler("127.0.0.1", 1, 0.1)
+            with self.assertRaises(v9x_mcp.V9xError):
+                handler.connect()
+            self.assertEqual(len(attempts), 1)
+        finally:
+            v9x_mcp.V9xClient = original
+
+    def test_tools_are_listed(self):
+        names = {tool["name"] for tool in v9x_mcp.TOOLS}
+        for name in ("v9x_read_text", "v9x_hash", "v9x_delete", "v9x_ps", "v9x_kill", "v9x_reg_query",
+                     "v9x_windows", "v9x_wait_file"):
+            self.assertIn(name, names)
+            self.assertTrue(callable(getattr(v9x_mcp.ToolHandler, name)))
+
 
 class JsonRpcTests(unittest.TestCase):
     def run_server(self, messages):
@@ -243,7 +391,7 @@ class JsonRpcTests(unittest.TestCase):
         self.assertIn("v9x_vnc", names)
         self.assertIn("v9x_relay_machines", names)
         self.assertIn("v9x_chat", names)
-        self.assertEqual(len(tools), 28)
+        self.assertEqual(len(tools), 36)
         # Every tool that talks to an agent can go through the relay.
         for tool in tools:
             if tool["name"] in ("v9x_discover", "v9x_relay_machines", "v9x_chat"):
@@ -343,6 +491,79 @@ class InputEncodingTests(unittest.TestCase):
         self.assertEqual(v9x_mcp.virtual_key("7"), 0x37)
         with self.assertRaises(v9x_mcp.V9xError):
             v9x_mcp.virtual_key("NOPE")
+
+
+class InputScreenshotTests(unittest.TestCase):
+    """screenshot=true on an input tool: input, settle, capture, one connection."""
+
+    BMP = (
+        b"BM" + struct.pack("<IHHI", 62, 0, 0, 54)
+        + struct.pack("<IiiHHIIiiII", 40, 1, 1, 1, 24, 0, 8, 0, 0, 0, 0)
+        + b"\x00\x00\xff\x00"
+    )
+
+    class FakeClient:
+        def __init__(self, calls):
+            self.calls = calls
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_exc):
+            self.calls.append("close")
+
+        def send_input(self, actions):
+            self.calls.append(("input", actions))
+            return {"actions_performed": len(actions), "cursor_x": 5, "cursor_y": 6}
+
+        def screenshot(self, **shape):
+            self.calls.append(("screenshot", shape))
+            return {"width": 1, "height": 1}, InputScreenshotTests.BMP
+
+    def make_handler(self):
+        calls = []
+        handler = v9x_mcp.ToolHandler("127.0.0.1", 1, 0.1)
+        handler.connect = lambda: self.FakeClient(calls)
+        return handler, calls
+
+    def test_without_screenshot_is_text_only(self):
+        handler, calls = self.make_handler()
+        content = handler.call("v9x_key", {"keys": "ENTER"})
+        self.assertEqual([part["type"] for part in content], ["text"])
+        self.assertNotIn("screenshot", calls)
+
+    def test_screenshot_follows_input_on_same_connection(self):
+        handler, calls = self.make_handler()
+        content = handler.call("v9x_click", {"x": 10, "y": 20, "screenshot": True, "settle_ms": 0})
+        self.assertEqual([part["type"] for part in content], ["text", "text", "image"])
+        self.assertEqual([c if isinstance(c, str) else c[0] for c in calls],
+                         ["input", "screenshot", "close"])
+        self.assertEqual(json.loads(content[0]["text"])["settle_ms"], 0)
+        self.assertEqual(calls[1][1], {"region": None, "scale_percent": 100, "gray": False, "window": None})
+
+    def test_shape_arguments_reach_the_capture(self):
+        handler, calls = self.make_handler()
+        handler.call("v9x_key", {"keys": "ENTER", "screenshot": True, "settle_ms": 0,
+                                 "region": [10, 20, 300, 200], "scale": 0.5, "gray": True, "window": None})
+        self.assertEqual(calls[1][1], {"region": [10, 20, 300, 200], "scale_percent": 50,
+                                       "gray": True, "window": None})
+
+    def test_bad_region_is_refused_before_input(self):
+        handler, calls = self.make_handler()
+        with self.assertRaises(v9x_mcp.V9xError):
+            handler.call("v9x_key", {"keys": "ENTER", "screenshot": True, "region": [1, 2]})
+        self.assertEqual(calls, [])
+
+    def test_settle_ms_range(self):
+        handler, _ = self.make_handler()
+        with self.assertRaises(v9x_mcp.V9xError):
+            handler.call("v9x_type", {"text": "x", "screenshot": True, "settle_ms": 999999})
+
+    def test_input_tools_advertise_screenshot(self):
+        for tool in v9x_mcp.TOOLS:
+            props = tool["inputSchema"]["properties"]
+            self.assertEqual("screenshot" in props, tool["name"] in v9x_mcp.INPUT_TOOLS,
+                             tool["name"])
 
 
 class InfoInstallIdTests(unittest.TestCase):

@@ -16,6 +16,8 @@ controls the guest. This server therefore refuses non-loopback hosts unless
 
 import argparse
 import base64
+import fnmatch
+import hashlib
 import io
 import json
 import os
@@ -84,6 +86,19 @@ MSG_INPUT = 0x0060
 MSG_INPUT_RESPONSE = 0x8060
 MSG_INVENTORY = 0x0070
 MSG_INVENTORY_RESPONSE = 0x8070
+# File tools, processes, registry (agent 0.13.0+).
+MSG_FILE_DELETE = 0x0028
+MSG_FILE_DELETE_RESPONSE = 0x8028
+MSG_FILE_HASH = 0x0029
+MSG_FILE_HASH_RESPONSE = 0x8029
+MSG_FILE_READ_TEXT = 0x002A
+MSG_FILE_READ_TEXT_RESPONSE = 0x802A
+MSG_PROCESS_LIST = 0x0080
+MSG_PROCESS_LIST_RESPONSE = 0x8080
+MSG_PROCESS_KILL = 0x0081
+MSG_PROCESS_KILL_RESPONSE = 0x8081
+MSG_REG_QUERY = 0x0090
+MSG_REG_QUERY_RESPONSE = 0x8090
 MSG_ERROR = 0x8FFF
 
 CAP_INFO = 0x0001
@@ -101,6 +116,31 @@ CAP_INVENTORY = 0x2000
 CAP_INSTALL_ID = 0x4000
 CAP_INPUT_RELATIVE = 0x8000
 CAP_HARD_RESET = 0x10000
+# SCREENSHOT_REQUEST takes an options block after the path (agent 0.13.0+):
+# flags, region x, y, w, h (w or h 0 = whole screen), scale percent.
+CAP_SCREENSHOT_OPTIONS = 0x20000
+SHOT_COMPACT = 0x1  # lossless 8-bit palette + RLE8 when <= 256 colours
+SHOT_GRAY = 0x2
+CAP_FILE_TOOLS = 0x40000  # delete, hash, read-text; reads flush the 9x INI cache
+CAP_PROCESS = 0x80000
+CAP_REGISTRY = 0x100000
+CAP_WINDOWS = 0x200000
+MSG_WINDOW_LIST = 0x0062
+MSG_WINDOW_LIST_RESPONSE = 0x8062
+DELETE_RECURSIVE = 0x1
+DELETE_FORCE = 0x2
+REG_HIVES = {
+    "HKCR": 0x80000000, "HKEY_CLASSES_ROOT": 0x80000000,
+    "HKCU": 0x80000001, "HKEY_CURRENT_USER": 0x80000001,
+    "HKLM": 0x80000002, "HKEY_LOCAL_MACHINE": 0x80000002,
+    "HKU": 0x80000003, "HKEY_USERS": 0x80000003,
+    "HKCC": 0x80000005, "HKEY_CURRENT_CONFIG": 0x80000005,
+    "HKDD": 0x80000006, "HKEY_DYN_DATA": 0x80000006,
+}
+REG_TYPES = {0: "REG_NONE", 1: "REG_SZ", 2: "REG_EXPAND_SZ", 3: "REG_BINARY",
+             4: "REG_DWORD", 5: "REG_DWORD_BIG_ENDIAN", 7: "REG_MULTI_SZ"}
+# Guest names and text are in the Windows ANSI code page.
+GUEST_TEXT = "cp1252"
 
 INFO_FLAG_EXTENDED = 0x0001
 
@@ -252,6 +292,120 @@ def parse_string(payload, offset):
     if offset + length > len(payload):
         raise V9xError("truncated protocol string")
     return payload[offset : offset + length].decode("ascii"), offset + length
+
+
+def parse_ansi_string(payload, offset):
+    """A protocol string the guest filled from Windows itself (process and
+    registry names): ANSI, not necessarily ASCII."""
+    if offset + 2 > len(payload):
+        raise V9xError("truncated protocol string length")
+    (length,) = struct.unpack_from("<H", payload, offset)
+    offset += 2
+    if offset + length > len(payload):
+        raise V9xError("truncated protocol string")
+    return payload[offset : offset + length].decode(GUEST_TEXT, "replace"), offset + length
+
+
+def parse_read_text(payload):
+    if len(payload) < 24:
+        raise V9xError("truncated FILE_READ_TEXT_RESPONSE")
+    size, lines, matched, returned, flags, length = struct.unpack_from("<6I", payload, 0)
+    if 24 + length != len(payload):
+        raise V9xError("FILE_READ_TEXT_RESPONSE length mismatch")
+    return {
+        "file_size": size, "lines": lines, "matched": matched, "returned": returned,
+        "truncated": bool(flags & 1), "long_lines_cut": bool(flags & 2),
+        "text": payload[24:].decode(GUEST_TEXT, "replace"),
+    }
+
+
+def parse_process_list(payload):
+    if len(payload) < 4:
+        raise V9xError("truncated PROCESS_LIST_RESPONSE")
+    (count,) = struct.unpack_from("<I", payload, 0)
+    offset = 4
+    processes = []
+    for _ in range(count):
+        if offset + 20 > len(payload):
+            raise V9xError("truncated process entry")
+        pid, parent, threads, flags, job = struct.unpack_from("<5I", payload, offset)
+        path, offset = parse_ansi_string(payload, offset + 20)
+        processes.append({
+            "pid": pid, "parent_pid": parent, "threads": threads,
+            "name": re.split(r"[\\/:]", path)[-1], "path": path,
+            "agent": bool(flags & 2), "agent_job": bool(flags & 1),
+            "job_request_id": job,
+        })
+    if offset != len(payload):
+        raise V9xError("PROCESS_LIST_RESPONSE contains trailing data")
+    return processes
+
+
+def parse_window_list(payload):
+    if len(payload) < 8:
+        raise V9xError("truncated WINDOW_LIST_RESPONSE")
+    count, _truncated = struct.unpack_from("<II", payload, 0)
+    offset = 8
+    windows = []
+    for _ in range(count):
+        if offset + 28 > len(payload):
+            raise V9xError("truncated window entry")
+        handle, pid, flags, left, top, right, bottom = struct.unpack_from("<IIIiiii", payload, offset)
+        class_name, offset = parse_ansi_string(payload, offset + 28)
+        title, offset = parse_ansi_string(payload, offset)
+        windows.append({
+            "title": title, "class": class_name, "x": left, "y": top,
+            "width": right - left, "height": bottom - top,
+            "foreground": bool(flags & 1), "minimized": bool(flags & 2),
+            "pid": pid, "handle": handle,
+        })
+    if offset != len(payload):
+        raise V9xError("WINDOW_LIST_RESPONSE contains trailing data")
+    return windows
+
+
+def encode_reg_key(key):
+    parts = key.replace("/", "\\").rstrip("\\").split("\\", 1)
+    hive = REG_HIVES.get(parts[0].rstrip(":").upper())
+    if hive is None:
+        raise V9xError("unknown registry hive %r (HKLM, HKCU, HKCR, HKU, HKCC, HKDD)" % parts[0])
+    return struct.pack("<I", hive) + encode_string(parts[1] if len(parts) > 1 else "")
+
+
+def parse_reg_query(payload):
+    if len(payload) < 12:
+        raise V9xError("truncated REG_QUERY_RESPONSE")
+    subkey_count, value_count, flags = struct.unpack_from("<III", payload, 0)
+    offset = 12
+    subkeys = []
+    for _ in range(subkey_count):
+        name, offset = parse_ansi_string(payload, offset)
+        subkeys.append(name)
+    values = []
+    for _ in range(value_count):
+        name, offset = parse_ansi_string(payload, offset)
+        if offset + 8 > len(payload):
+            raise V9xError("truncated registry value")
+        value_type, length = struct.unpack_from("<II", payload, offset)
+        offset += 8
+        raw = payload[offset : offset + length]
+        if len(raw) != length:
+            raise V9xError("truncated registry data")
+        offset += length
+        if value_type in (1, 2):
+            data = raw.decode(GUEST_TEXT, "replace").rstrip("\x00")
+        elif value_type == 4 and length >= 4:
+            data = struct.unpack_from("<I", raw, 0)[0]
+        elif value_type == 7:
+            data = [s for s in raw.decode(GUEST_TEXT, "replace").split("\x00") if s]
+        else:
+            data = raw.hex(" ")
+        values.append({"name": name or "(Default)",
+                       "type": REG_TYPES.get(value_type, "type %d" % value_type),
+                       "data": data})
+    if offset != len(payload):
+        raise V9xError("REG_QUERY_RESPONSE contains trailing data")
+    return {"subkeys": subkeys, "values": values, "truncated": bool(flags & 1)}
 
 
 def parse_desktop_block(payload, offset, install_id=False):
@@ -608,35 +762,146 @@ def discover_agents(seconds=3.0, target=None, install_id=None):
     return fold_mdns_replies(replies)
 
 
-def bmp_to_png(data):
-    """Convert a bottom-up 24-bit BI_RGB BMP (the agent's screenshot format)
-    to a PNG, standard library only."""
+def decode_bmp(data):
+    """Decode the agent's screenshot BMP to (width, height, rows): rows are
+    top-down bytes of R, G, B. Handles what the agent writes: 24-bit BI_RGB,
+    and from 0.13.0 8-bit BI_RGB and BI_RLE8 with a palette (shotxf.c)."""
     if len(data) < 54 or data[:2] != b"BM":
         raise V9xError("not a BMP file")
     (pixel_offset,) = struct.unpack_from("<I", data, 10)
     _header_size, width, height, _planes, bpp, compression = struct.unpack_from(
         "<IiiHHI", data, 14
     )
-    if bpp != 24 or compression != 0:
-        raise V9xError("only 24-bit uncompressed BMP is supported")
+    (colours,) = struct.unpack_from("<I", data, 46)
     if width <= 0 or height == 0:
         raise V9xError("invalid BMP dimensions")
     bottom_up = height > 0
     rows = abs(height)
-    stride = (width * 3 + 3) & ~3
-    if pixel_offset + stride * rows > len(data):
-        raise V9xError("truncated BMP pixel data")
-    scanlines = []
-    for y in range(rows):
-        source_y = rows - 1 - y if bottom_up else y
-        start = pixel_offset + source_y * stride
-        row = data[start : start + width * 3]
-        rgb = bytearray(width * 3)
-        rgb[0::3] = row[2::3]
-        rgb[1::3] = row[1::3]
-        rgb[2::3] = row[0::3]
-        scanlines.append(b"\x00" + bytes(rgb))
-    raw = b"".join(scanlines)
+
+    def ordered(bottom_up_rows):
+        return bottom_up_rows[::-1] if bottom_up else bottom_up_rows
+
+    if bpp == 24 and compression == 0:
+        stride = (width * 3 + 3) & ~3
+        if pixel_offset + stride * rows > len(data):
+            raise V9xError("truncated BMP pixel data")
+        stored = []
+        for y in range(rows):
+            start = pixel_offset + y * stride
+            row = data[start : start + width * 3]
+            rgb = bytearray(width * 3)
+            rgb[0::3] = row[2::3]
+            rgb[1::3] = row[1::3]
+            rgb[2::3] = row[0::3]
+            stored.append(bytes(rgb))
+        return width, rows, ordered(stored)
+    if bpp != 8 or compression not in (0, 1):
+        raise V9xError("unsupported BMP format (%d-bit, compression %d)" % (bpp, compression))
+    colours = colours or 256
+    if colours > 256 or 54 + colours * 4 > pixel_offset or pixel_offset > len(data):
+        raise V9xError("invalid BMP palette")
+    palette = [
+        bytes((data[54 + i * 4 + 2], data[54 + i * 4 + 1], data[54 + i * 4]))
+        for i in range(colours)
+    ]
+    if compression == 0:
+        stride = (width + 3) & ~3
+        if pixel_offset + stride * rows > len(data):
+            raise V9xError("truncated BMP pixel data")
+        index_rows = [
+            data[pixel_offset + y * stride : pixel_offset + y * stride + width]
+            for y in range(rows)
+        ]
+    else:
+        index_rows = [bytearray(width) for _ in range(rows)]
+        at, x, y = pixel_offset, 0, 0
+        while True:
+            if at + 2 > len(data):
+                raise V9xError("truncated RLE8 data")
+            count, value = data[at], data[at + 1]
+            at += 2
+            if count:
+                if y >= rows or x + count > width:
+                    raise V9xError("RLE8 run outside the image")
+                index_rows[y][x : x + count] = bytes((value,)) * count
+                x += count
+            elif value == 0:
+                x, y = 0, y + 1
+            elif value == 1:
+                break
+            elif value == 2:
+                if at + 2 > len(data):
+                    raise V9xError("truncated RLE8 delta")
+                x, y = x + data[at], y + data[at + 1]
+                at += 2
+            else:
+                if y >= rows or x + value > width or at + value > len(data):
+                    raise V9xError("RLE8 literal outside the image")
+                index_rows[y][x : x + value] = data[at : at + value]
+                x += value
+                at += value + (value & 1)
+    stored = []
+    for indices in index_rows:
+        try:
+            stored.append(b"".join(palette[i] for i in indices))
+        except IndexError:
+            raise V9xError("BMP pixel outside the palette")
+    return width, rows, ordered(stored)
+
+
+def plan_shot(screen_width, screen_height, region=None, scale_percent=100):
+    """The agent's region/size resolution (shotxf.c v9x_shotxf_plan):
+    returns (x, y, w, h, out_w, out_h)."""
+    if not 1 <= scale_percent <= 100:
+        raise V9xError("scale must be 0.01..1")
+    if region:
+        x, y, w, h = (int(v) for v in region)
+        if w <= 0 or h <= 0 or x < 0 or y < 0:
+            raise V9xError("region is x, y, width, height with width and height >= 1")
+        if screen_width and (x >= screen_width or y >= screen_height):
+            raise V9xError("region starts outside the %dx%d screen" % (screen_width, screen_height))
+        if screen_width:
+            w = min(w, screen_width - x)
+            h = min(h, screen_height - y)
+    else:
+        x, y, w, h = 0, 0, screen_width, screen_height
+    out_w = max(1, (w * scale_percent + 99) // 100)
+    out_h = max(1, (h * scale_percent + 99) // 100)
+    return x, y, w, h, out_w, out_h
+
+
+def shape_rgb(width, height, rows, region=None, scale_percent=100, gray=False):
+    """Crop, box-scale and grey an RGB image the way the agent does, for
+    agents older than 0.13.0 that only send the full frame."""
+    x0, y0, w, h, out_w, out_h = plan_shot(width, height, region, scale_percent)
+    shaped = []
+    for oy in range(out_h):
+        sy0 = y0 + oy * h // out_h
+        sy1 = max(sy0 + 1, y0 + (oy + 1) * h // out_h)
+        line = bytearray(out_w * 3)
+        for ox in range(out_w):
+            sx0 = x0 + ox * w // out_w
+            sx1 = max(sx0 + 1, x0 + (ox + 1) * w // out_w)
+            count = (sx1 - sx0) * (sy1 - sy0)
+            sums = [0, 0, 0]
+            for sy in range(sy0, sy1):
+                row = rows[sy]
+                for channel in range(3):
+                    sums[channel] += sum(row[sx0 * 3 + channel : sx1 * 3 : 3])
+            r, g, b = ((value + count // 2) // count for value in sums)
+            if gray:
+                r = g = b = (r * 77 + g * 150 + b * 29 + 128) >> 8
+            line[ox * 3 : ox * 3 + 3] = bytes((r, g, b))
+        shaped.append(bytes(line))
+    return out_w, out_h, shaped
+
+
+def encode_png(width, height, rows, gray=False):
+    """PNG from top-down RGB rows, standard library only. gray stores one
+    channel (the rows must then have R = G = B)."""
+    if gray:
+        rows = [row[0::3] for row in rows]
+    raw = b"".join(b"\x00" + bytes(row) for row in rows)
 
     def chunk(tag, body):
         return (
@@ -646,13 +911,19 @@ def bmp_to_png(data):
             + struct.pack(">I", zlib.crc32(tag + body) & 0xFFFFFFFF)
         )
 
-    ihdr = struct.pack(">IIBBBBB", width, rows, 8, 2, 0, 0, 0)
+    ihdr = struct.pack(">IIBBBBB", width, height, 8, 0 if gray else 2, 0, 0, 0)
     return (
         b"\x89PNG\r\n\x1a\n"
         + chunk(b"IHDR", ihdr)
         + chunk(b"IDAT", zlib.compress(raw, 6))
         + chunk(b"IEND", b"")
     )
+
+
+def bmp_to_png(data, gray=False):
+    """Convert an agent screenshot BMP to a PNG, standard library only."""
+    width, height, rows = decode_bmp(data)
+    return encode_png(width, height, rows, gray)
 
 
 class V9xClient:
@@ -859,6 +1130,124 @@ class V9xClient:
             "native_error": native,
         }
 
+    def tool_request(self, capability, name, msg_type, payload, response_type):
+        self.require(capability, name)
+        self.next_id()
+        self.send(msg_type, payload)
+        _, _, _, answer = self.expect((response_type,))
+        return answer
+
+    def delete(self, guest_path, recursive=False, force=False):
+        flags = (DELETE_RECURSIVE if recursive else 0) | (DELETE_FORCE if force else 0)
+        answer = self.tool_request(CAP_FILE_TOOLS, "delete (agent 0.13.0+)", MSG_FILE_DELETE,
+                                   struct.pack("<I", flags) + encode_string(guest_path),
+                                   MSG_FILE_DELETE_RESPONSE)
+        if len(answer) != 8:
+            raise V9xError("invalid FILE_DELETE_RESPONSE")
+        files, directories = struct.unpack("<II", answer)
+        return {"path": guest_path, "files_deleted": files, "directories_deleted": directories}
+
+    def hash_file(self, guest_path):
+        answer = self.tool_request(CAP_FILE_TOOLS, "hash (agent 0.13.0+)", MSG_FILE_HASH,
+                                   encode_string(guest_path), MSG_FILE_HASH_RESPONSE)
+        if len(answer) != 40:
+            raise V9xError("invalid FILE_HASH_RESPONSE")
+        size, crc = struct.unpack_from("<II", answer, 0)
+        return {"path": guest_path, "size": size, "crc32": "%08X" % crc,
+                "sha256": answer[8:40].hex().upper()}
+
+    def read_text(self, guest_path, tail=0, match="", max_bytes=16384):
+        answer = self.tool_request(CAP_FILE_TOOLS, "read_text (agent 0.13.0+)", MSG_FILE_READ_TEXT,
+                                   struct.pack("<II", tail, max_bytes) + encode_string(match)
+                                   + encode_string(guest_path), MSG_FILE_READ_TEXT_RESPONSE)
+        result = parse_read_text(answer)
+        result["path"] = guest_path
+        return result
+
+    def processes(self):
+        return parse_process_list(self.tool_request(
+            CAP_PROCESS, "process list (agent 0.13.0+, Windows 9x/2000)", MSG_PROCESS_LIST,
+            b"", MSG_PROCESS_LIST_RESPONSE))
+
+    def kill(self, pid, exit_code=1):
+        answer = self.tool_request(CAP_PROCESS, "kill (agent 0.13.0+, Windows 9x/2000)",
+                                   MSG_PROCESS_KILL, struct.pack("<II", pid, exit_code),
+                                   MSG_PROCESS_KILL_RESPONSE)
+        if len(answer) != 8:
+            raise V9xError("invalid PROCESS_KILL_RESPONSE")
+        killed, job = struct.unpack("<II", answer)
+        return {"pid": killed, "was_agent_job": job != 0, "job_request_id": job}
+
+    def windows(self):
+        """Visible top-level windows (agent 0.13.0+)."""
+        answer = self.tool_request(CAP_WINDOWS, "window list (agent 0.13.0+)",
+                                   MSG_WINDOW_LIST, b"", MSG_WINDOW_LIST_RESPONSE)
+        return parse_window_list(answer)
+
+    def wait_window(self, title, wait_seconds, gone=False):
+        """Poll until a window whose title contains `title` is up (not
+        minimized), or with gone=True until none is."""
+        started = time.monotonic()
+        while True:
+            found = [w for w in self.windows()
+                     if title.lower() in w["title"].lower() and not w["minimized"]]
+            if bool(found) != gone:
+                return {"window": found[0] if found else None,
+                        "waited_ms": int((time.monotonic() - started) * 1000)}
+            if time.monotonic() - started >= wait_seconds:
+                raise V9xError("no window titled *%s* %s within %d s"
+                               % (title, "closed" if gone else "appeared", wait_seconds))
+            time.sleep(0.25)
+
+    def wait_file(self, guest_path, wait_seconds, gone=False, stable_ms=0):
+        """Poll FILE_STAT until the file exists (gone: does not), and with
+        stable_ms until its size has not changed for that long."""
+        started = time.monotonic()
+        last_size, stable_since = None, None
+        while True:
+            stat = self.stat(guest_path)
+            now = time.monotonic()
+            if gone:
+                done = not stat["exists"]
+            elif not stat["exists"]:
+                done = False
+            elif stable_ms <= 0:
+                done = True
+            else:
+                if stat["size"] != last_size:
+                    last_size, stable_since = stat["size"], now
+                done = (now - stable_since) * 1000 >= stable_ms
+            if done:
+                stat["waited_ms"] = int((now - started) * 1000)
+                return stat
+            if now - started >= wait_seconds:
+                raise V9xError("%s %s within %d s" % (
+                    guest_path, "still exists" if gone else
+                    ("kept changing size" if stat["exists"] else "did not appear"), wait_seconds))
+            time.sleep(0.25)
+
+    def window_region(self, title):
+        """The screen rectangle of the first visible window titled *title*,
+        clipped to the screen, as [x, y, w, h]."""
+        found = [w for w in self.windows()
+                 if title.lower() in w["title"].lower() and not w["minimized"]]
+        if not found:
+            raise V9xError("no visible window titled *%s* (see v9x_windows)" % title)
+        w = found[0]
+        left, top = max(0, w["x"]), max(0, w["y"])
+        right = min(self.hello.get("screen_width", 0) or w["x"] + w["width"], w["x"] + w["width"])
+        bottom = min(self.hello.get("screen_height", 0) or w["y"] + w["height"], w["y"] + w["height"])
+        if right <= left or bottom <= top:
+            raise V9xError("window %r is off screen" % w["title"])
+        return [left, top, right - left, bottom - top]
+
+    def reg_query(self, key):
+        result = parse_reg_query(self.tool_request(
+            CAP_REGISTRY, "registry (agent 0.13.0+)", MSG_REG_QUERY, encode_reg_key(key),
+            MSG_REG_QUERY_RESPONSE))
+        result["key"] = key
+        return result
+
     def list_dir(self, guest_path):
         self.require(CAP_FILE_READ, "file")
         self.next_id()
@@ -1030,10 +1419,27 @@ class V9xClient:
         boot, agent_bytes = struct.unpack("<II", payload)
         return {"boot_counter": boot, "agent_size": agent_bytes}
 
-    def screenshot(self, guest_path=DEFAULT_SCREENSHOT):
+    def screenshot(self, guest_path=DEFAULT_SCREENSHOT, region=None, scale_percent=100,
+                   gray=False, window=None):
+        """Capture; returns (metadata, bmp). An 0.13.0+ agent crops, scales
+        and packs the image itself (always losslessly 8-bit/RLE8 when it can);
+        for an older one metadata["host_shape"] tells screenshot_content to do
+        it after the download."""
         self.require(CAP_SCREENSHOT, "screenshot")
+        if window:
+            region = self.window_region(window)
+        x, y, w, h, out_w, out_h = plan_shot(
+            self.hello.get("screen_width", 0), self.hello.get("screen_height", 0),
+            region, scale_percent)
+        shaping = bool(region) or scale_percent < 100 or gray
+        guest_shapes = bool(self.hello["capabilities"] & CAP_SCREENSHOT_OPTIONS)
+        payload = encode_string(guest_path)
+        if guest_shapes:
+            flags = SHOT_COMPACT | (SHOT_GRAY if gray else 0)
+            payload += struct.pack("<6I", flags, x, y, w if region else 0,
+                                   h if region else 0, scale_percent)
         self.next_id()
-        self.send(MSG_SCREENSHOT, encode_string(guest_path))
+        self.send(MSG_SCREENSHOT, payload)
         old_timeout = self.timeout
         self.sock.settimeout(max(old_timeout, 60.0))
         try:
@@ -1049,12 +1455,23 @@ class V9xClient:
             self.sock.settimeout(old_timeout)
         if len(data) != file_bytes or (zlib.crc32(data) & 0xFFFFFFFF) != crc:
             raise V9xError("screenshot download does not match capture metadata")
-        return {
+        metadata = {
             "width": width,
             "height": height,
             "source_bits_per_pixel": bpp,
             "guest_path": path,
-        }, data
+            "wire_bytes": file_bytes,
+        }
+        if shaping:
+            # screen_x = region_x + image_x * region_width / width (same for y)
+            metadata.update({
+                "region_x": x, "region_y": y, "region_width": w, "region_height": h,
+                "scale_percent": scale_percent, "gray": bool(gray),
+                "shaped_by": "guest" if guest_shapes else "host",
+            })
+            if not guest_shapes:
+                metadata["host_shape"] = (region, scale_percent, bool(gray))
+        return metadata, data
 
     def send_input(self, actions):
         self.require(CAP_INPUT, "input")
@@ -1225,8 +1642,13 @@ TOOLS = [
     },
     {
         "name": "v9x_ping",
-        "description": "Check that the Windows 9x guest agent is alive; returns uptime and the agent-start counter (not reboot proof by itself).",
-        "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
+        "description": "Check that the Windows 9x guest agent is alive; returns uptime and the agent-start counter (not reboot proof by itself). wait_seconds keeps retrying while the guest boots: never loop ping with sleeps.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"wait_seconds": {"type": "integer", "minimum": 0, "maximum": 3600,
+                                            "description": "Retry connecting for up to this long (default 0)"}},
+            "additionalProperties": False,
+        },
     },
     {
         "name": "v9x_info",
@@ -1250,6 +1672,9 @@ TOOLS = [
                 "timeout_ms": {"type": "integer", "description": "Guest-side timeout in ms (default 60000, max 3600000)"},
                 "show_window": {"type": "boolean", "description": "Show the child's window (console children; GUI-subsystem EXEs manage their own window)"},
                 "detach": {"type": "boolean", "description": "Launch and return immediately without waiting or capturing output. Use for installers and programs that outlive the request."},
+                "wait_for_file": guest_path_schema("After the run (usually with detach): wait until this guest file exists, then return"),
+                "wait_for_window": {"type": "string", "description": "After the run (usually with detach): wait until a window whose title contains this is shown, then return it"},
+                "wait_seconds": {"type": "integer", "minimum": 1, "maximum": 3600, "description": "Limit for wait_for_file / wait_for_window (default 120)"},
             },
             "required": ["application"],
             "additionalProperties": False,
@@ -1264,6 +1689,9 @@ TOOLS = [
                 "command": {"type": "string", "description": "The shell command line"},
                 "timeout_ms": {"type": "integer", "description": "Guest-side timeout in ms (default 60000)"},
                 "detach": {"type": "boolean", "description": "Launch and return immediately without waiting or capturing output. Use instead of START for commands that spawn long-lived programs."},
+                "wait_for_file": guest_path_schema("After the run (usually with detach): wait until this guest file exists, then return"),
+                "wait_for_window": {"type": "string", "description": "After the run (usually with detach): wait until a window whose title contains this is shown, then return it"},
+                "wait_seconds": {"type": "integer", "minimum": 1, "maximum": 3600, "description": "Limit for wait_for_file / wait_for_window (default 120)"},
             },
             "required": ["command"],
             "additionalProperties": False,
@@ -1319,6 +1747,110 @@ TOOLS = [
         },
     },
     {
+        "name": "v9x_read_text",
+        "description": "Read a guest text file inline (logs, INI, batch output): optionally only the last `tail` lines and/or lines containing `match` (case-insensitive), bounded to max_bytes. One call instead of get + read; ask for little. Agent 0.13.0+.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "guest_path": guest_path_schema("Guest file to read"),
+                "tail": {"type": "integer", "minimum": 0, "description": "Only the last N (matching) lines; 0 = all"},
+                "match": {"type": "string", "description": "Only lines containing this text (ASCII, case-insensitive)"},
+                "max_bytes": {"type": "integer", "minimum": 1, "maximum": 65512, "description": "Most text to return (default 16384)"},
+            },
+            "required": ["guest_path"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "v9x_hash",
+        "description": "Size, CRC32 and SHA-256 of a guest file, computed in the guest; pass local_path to compare with a host file (verify a push without downloading). Agent 0.13.0+.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "guest_path": guest_path_schema("Guest file to hash"),
+                "local_path": {"type": "string", "description": "Optional host file to compare against"},
+            },
+            "required": ["guest_path"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "v9x_delete",
+        "description": "Delete a guest file, or a directory (empty, or with recursive=true everything in it). force=true clears read-only/hidden/system first. Refuses drive roots, the Windows and system directories, C:\\V9XREMOTE and any folder containing them. Agent 0.13.0+.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "guest_path": guest_path_schema("Guest file or directory to delete"),
+                "recursive": {"type": "boolean"},
+                "force": {"type": "boolean"},
+            },
+            "required": ["guest_path"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "v9x_ps",
+        "description": "List guest processes (pid, parent, threads, path); marks the agent and processes started by its exec requests (with their request id). Agent 0.13.0+ on Windows 9x or 2000.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "description": "Only image names matching this (wildcards * ?)"},
+            },
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "v9x_kill",
+        "description": "Terminate a guest process by pid (from v9x_ps) or by unique image name; ends a stuck exec job (its exec then completes). Refuses the agent and Windows core processes. Agent 0.13.0+.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "pid": {"type": "integer", "minimum": 1},
+                "name": {"type": "string", "description": "Image name, e.g. NOTEPAD.EXE; must match exactly one process"},
+            },
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "v9x_windows",
+        "description": "Visible top-level windows in the guest: title, class, x, y, width, height, foreground, minimized, pid. With wait_for (part of a title): wait until such a window is shown (gone=true: closed) instead of sleeping; then screenshot it with window=<title>. Agent 0.13.0+.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "title": {"type": "string", "description": "Only windows whose title contains this"},
+                "wait_for": {"type": "string", "description": "Wait until a window whose title contains this is shown"},
+                "gone": {"type": "boolean", "description": "With wait_for: wait until it is closed"},
+                "wait_seconds": {"type": "integer", "minimum": 1, "maximum": 3600, "description": "Limit for wait_for (default 60)"},
+            },
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "v9x_wait_file",
+        "description": "Wait until a guest file exists (gone=true: is removed; stable_ms: and its size stopped changing), polling on one connection: use instead of sleeping between exec and get. Any agent.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "guest_path": guest_path_schema("Guest file to wait for"),
+                "wait_seconds": {"type": "integer", "minimum": 1, "maximum": 3600, "description": "Limit (default 120)"},
+                "gone": {"type": "boolean"},
+                "stable_ms": {"type": "integer", "minimum": 0, "description": "Also wait until the size has not changed for this long"},
+            },
+            "required": ["guest_path"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "v9x_reg_query",
+        "description": "Read one registry key in the guest: its subkey names and values (strings, DWORDs, multi-strings, binary as hex). Read-only. Key like HKLM\\System\\CurrentControlSet\\Services\\Class\\Display. Agent 0.13.0+.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"key": {"type": "string", "description": "HKLM\\..., HKCU\\..., HKCR, HKU, HKCC or HKDD"}},
+            "required": ["key"],
+            "additionalProperties": False,
+        },
+    },
+    {
         "name": "v9x_list_dir",
         "description": "List a guest directory (bounded to 16 KiB of entries).",
         "inputSchema": {
@@ -1340,7 +1872,7 @@ TOOLS = [
     },
     {
         "name": "v9x_click",
-        "description": "Click a mouse button in the guest, optionally moving to (x,y) first. Take a v9x_screenshot to find coordinates.",
+        "description": "Click a mouse button in the guest, optionally moving to (x,y) first. Take a v9x_screenshot to find coordinates; pass screenshot=true (on any input tool) to see the result in the same call.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -1414,7 +1946,7 @@ TOOLS = [
     },
     {
         "name": "v9x_screenshot",
-        "description": "Capture a confirmed-stable guest desktop as PNG. Never call during a fullscreen transition or suspected display wedge; use info, trace execution, and file retrieval first.",
+        "description": "Capture a confirmed-stable guest desktop as PNG. Never call during a fullscreen transition or suspected display wedge; use info, trace execution, and file retrieval first. Keep images small: pass region to look at one dialog and scale (e.g. 0.5) when you only need layout; image cost grows with pixels. With region/scale, screen_x = region_x + image_x * region_width / width.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -1544,6 +2076,64 @@ for _tool in TOOLS:
     if _tool["name"] not in ("v9x_discover", "v9x_relay_machines", "v9x_chat"):
         _tool["inputSchema"].setdefault("properties", {})["relay"] = RELAY_PROPERTY
 
+# The input tools can end with a screenshot on the same connection, so one GUI
+# step (act, let the guest repaint, look) is one tool call.
+INPUT_TOOLS = ("v9x_click", "v9x_move", "v9x_type", "v9x_key", "v9x_scroll", "v9x_input")
+DEFAULT_SETTLE_MS = 500
+MAX_SETTLE_MS = 30000
+SCREENSHOT_PROPERTIES = {
+    "screenshot": {
+        "type": "boolean",
+        "description": "After the input, wait settle_ms and return a PNG of the guest "
+        "screen in the same call. Same caveats as v9x_screenshot: not during a "
+        "fullscreen transition or suspected display wedge.",
+    },
+    "settle_ms": {
+        "type": "integer",
+        "minimum": 0,
+        "maximum": MAX_SETTLE_MS,
+        "description": "Milliseconds to let the guest repaint before the screenshot "
+        "(default %d; raise it for slow dialogs)" % DEFAULT_SETTLE_MS,
+    },
+    "save_path": {
+        "type": "string",
+        "description": "With screenshot: optional local path to also save the PNG to",
+    },
+}
+# Shaping, for v9x_screenshot and the input tools' screenshot. 0.13.0+ agents
+# do it before sending (fast over the relay); older ones are shaped here.
+SHAPE_PROPERTIES = {
+    "region": {
+        "type": "array",
+        "items": {"type": "integer", "minimum": 0},
+        "minItems": 4,
+        "maxItems": 4,
+        "description": "[x, y, width, height] in screen pixels: capture only this "
+        "rectangle (clipped to the screen)",
+    },
+    "scale": {
+        "type": "number",
+        "minimum": 0.01,
+        "maximum": 1,
+        "description": "Downscale factor, e.g. 0.5 for half width and height "
+        "(a quarter of the image cost); default 1",
+    },
+    "gray": {
+        "type": "boolean",
+        "description": "8-bit greyscale (lossy, smaller); fine for reading text and layout",
+    },
+    "window": {
+        "type": "string",
+        "description": "Capture only the first visible window whose title contains this "
+        "(agent 0.13.0+); instead of region",
+    },
+}
+for _tool in TOOLS:
+    if _tool["name"] in INPUT_TOOLS:
+        _tool["inputSchema"]["properties"].update(SCREENSHOT_PROPERTIES)
+    if _tool["name"] in INPUT_TOOLS or _tool["name"] == "v9x_screenshot":
+        _tool["inputSchema"]["properties"].update(SHAPE_PROPERTIES)
+
 
 class ToolHandler:
     def __init__(self, host, port, timeout, install_id=None, query_address=None,
@@ -1621,15 +2211,36 @@ class ToolHandler:
             return lambda remaining: self.connect_relay(open_wait=remaining)
         return None
 
-    def connect(self):
+    def connect(self, wait_seconds=0):
+        """Connect and HELLO. A connection dropped before HELLO (a port
+        forward answering before the agent listens) is retried twice; with
+        wait_seconds every connection failure is retried for that long,
+        backing off 1, 2, 4, 5 s, so callers never sleep-and-poll."""
         if self.relay:
             return self.connect_relay()
         if self.install_id and not self.resolved:
             self.resolve()
-        try:
-            return V9xClient(self.host, self.port, timeout=self.timeout)
-        except OSError as exc:
-            error = exc
+        deadline = time.monotonic() + wait_seconds
+        attempt = 0
+        while True:
+            try:
+                return V9xClient(self.host, self.port, timeout=self.timeout)
+            except (OSError, V9xError) as exc:
+                error = exc
+            attempt += 1
+            dropped = isinstance(error, (ConnectionResetError, ConnectionAbortedError)) or (
+                isinstance(error, V9xError) and "closed" in str(error))
+            delay = min(5.0, 2.0 ** (attempt - 1))
+            if wait_seconds > 0 and time.monotonic() + delay < deadline:
+                time.sleep(delay)
+            elif wait_seconds <= 0 and dropped and attempt <= 2:
+                time.sleep(0.5 * attempt)
+            else:
+                break
+            if self.install_id:
+                self.resolve()
+        if isinstance(error, V9xError) and not isinstance(error, OSError):
+            raise error
         if self.install_id:
             self.resolve()
             try:
@@ -1678,8 +2289,10 @@ class ToolHandler:
         target = args.get("query_address") or self.query_address
         return self.text({"agents": discover_agents(seconds, target)})
 
-    def v9x_ping(self, _args):
-        with self.connect() as client:
+    def v9x_ping(self, args):
+        # wait_seconds: keep trying while the guest boots, instead of a
+        # caller's ping-and-sleep loop.
+        with self.connect(int(args.get("wait_seconds", 0))) as client:
             return self.text(client.ping())
 
     def v9x_info(self, _args):
@@ -1692,28 +2305,39 @@ class ToolHandler:
 
     def v9x_exec(self, args):
         with self.connect() as client:
-            return self.text(
-                client.execute(
-                    0,
-                    application=args["application"],
-                    arguments=args.get("arguments", ""),
-                    working_dir=args.get("working_dir", ""),
-                    timeout_ms=int(args.get("timeout_ms", 60000)),
-                    show_window=bool(args.get("show_window", False)),
-                    detach=bool(args.get("detach", False)),
-                )
+            result = client.execute(
+                0,
+                application=args["application"],
+                arguments=args.get("arguments", ""),
+                working_dir=args.get("working_dir", ""),
+                timeout_ms=int(args.get("timeout_ms", 60000)),
+                show_window=bool(args.get("show_window", False)),
+                detach=bool(args.get("detach", False)),
             )
+            return self.text(self.after_run(client, result, args))
 
     def v9x_shell(self, args):
         with self.connect() as client:
-            return self.text(
-                client.execute(
-                    1,
-                    arguments=args["command"],
-                    timeout_ms=int(args.get("timeout_ms", 60000)),
-                    detach=bool(args.get("detach", False)),
-                )
+            result = client.execute(
+                1,
+                arguments=args["command"],
+                timeout_ms=int(args.get("timeout_ms", 60000)),
+                detach=bool(args.get("detach", False)),
             )
+            return self.text(self.after_run(client, result, args))
+
+    @staticmethod
+    def after_run(client, result, args):
+        """wait_for_file / wait_for_window after a successful run, on the
+        same connection, so the caller does not sleep and poll."""
+        wait_seconds = int(args.get("wait_seconds", 120))
+        if result.get("result") != "ok":
+            return result
+        if args.get("wait_for_file"):
+            result["waited_for_file"] = client.wait_file(args["wait_for_file"], wait_seconds)
+        if args.get("wait_for_window"):
+            result["waited_for_window"] = client.wait_window(args["wait_for_window"], wait_seconds)
+        return result
 
     def v9x_put_file(self, args):
         with self.connect() as client:
@@ -1777,6 +2401,71 @@ class ToolHandler:
         with self.connect() as client:
             return self.text(client.stat(args["guest_path"]))
 
+    def v9x_read_text(self, args):
+        with self.connect() as client:
+            return self.text(client.read_text(args["guest_path"], int(args.get("tail", 0)),
+                                              args.get("match", ""),
+                                              int(args.get("max_bytes", 16384))))
+
+    def v9x_hash(self, args):
+        with self.connect() as client:
+            result = client.hash_file(args["guest_path"])
+        local = args.get("local_path")
+        if local:
+            digest = hashlib.sha256()
+            with open(local, "rb") as handle:
+                for block in iter(lambda: handle.read(65536), b""):
+                    digest.update(block)
+            result["local_path"] = os.path.abspath(local)
+            result["local_sha256"] = digest.hexdigest().upper()
+            result["matches"] = result["local_sha256"] == result["sha256"]
+        return self.text(result)
+
+    def v9x_delete(self, args):
+        with self.connect() as client:
+            return self.text(client.delete(args["guest_path"], bool(args.get("recursive")),
+                                           bool(args.get("force"))))
+
+    def v9x_ps(self, args):
+        with self.connect() as client:
+            processes = client.processes()
+        if args.get("name"):
+            processes = [p for p in processes
+                         if fnmatch.fnmatch(p["name"].upper(), args["name"].upper())]
+        return self.text({"count": len(processes), "processes": processes})
+
+    def v9x_kill(self, args):
+        pid, name = args.get("pid"), args.get("name")
+        if not pid and not name:
+            raise V9xError("kill needs pid or name")
+        with self.connect() as client:
+            if not pid:
+                found = [p for p in client.processes() if p["name"].upper() == name.upper()]
+                if len(found) != 1:
+                    raise V9xError("%r matches %d processes; pass pid (see v9x_ps)"
+                                   % (name, len(found)))
+                pid = found[0]["pid"]
+            return self.text(client.kill(int(pid)))
+
+    def v9x_windows(self, args):
+        with self.connect() as client:
+            if args.get("wait_for"):
+                return self.text(client.wait_window(args["wait_for"], int(args.get("wait_seconds", 60)),
+                                                    bool(args.get("gone"))))
+            windows = client.windows()
+        if args.get("title"):
+            windows = [w for w in windows if args["title"].lower() in w["title"].lower()]
+        return self.text({"count": len(windows), "windows": windows})
+
+    def v9x_wait_file(self, args):
+        with self.connect() as client:
+            return self.text(client.wait_file(args["guest_path"], int(args.get("wait_seconds", 120)),
+                                              bool(args.get("gone")), int(args.get("stable_ms", 0))))
+
+    def v9x_reg_query(self, args):
+        with self.connect() as client:
+            return self.text(client.reg_query(args["key"]))
+
     def v9x_list_dir(self, args):
         with self.connect() as client:
             return self.text(client.list_dir(args["guest_path"]))
@@ -1796,34 +2485,26 @@ class ToolHandler:
         for _ in range(presses):
             actions.append({"op": "button", "button": button, "down": True})
             actions.append({"op": "button", "button": button, "down": False})
-        with self.connect() as client:
-            return self.text(client.send_input(actions))
+        return self.input_step(actions, args)
 
     def v9x_move(self, args):
-        with self.connect() as client:
-            if args.get("relative"):
-                client.require(CAP_INPUT_RELATIVE, "relative mouse moves")
-                action = {"op": "moverel", "dx": args["x"], "dy": args["y"]}
-            else:
-                action = {"op": "move", "x": args["x"], "y": args["y"]}
-            return self.text(client.send_input([action]))
+        if args.get("relative"):
+            action = {"op": "moverel", "dx": args["x"], "dy": args["y"]}
+        else:
+            action = {"op": "move", "x": args["x"], "y": args["y"]}
+        return self.input_step([action], args)
 
     def v9x_type(self, args):
-        with self.connect() as client:
-            return self.text(client.send_input([{"op": "type", "text": args["text"]}]))
+        return self.input_step([{"op": "type", "text": args["text"]}], args)
 
     def v9x_key(self, args):
         vks = [virtual_key(name) for name in args["keys"].split("+")]
         actions = [{"op": "key", "vk": vk, "down": True} for vk in vks]
         actions += [{"op": "key", "vk": vk, "down": False} for vk in reversed(vks)]
-        with self.connect() as client:
-            return self.text(client.send_input(actions))
+        return self.input_step(actions, args)
 
     def v9x_scroll(self, args):
-        with self.connect() as client:
-            return self.text(
-                client.send_input([{"op": "wheel", "notches": args["notches"]}])
-            )
+        return self.input_step([{"op": "wheel", "notches": args["notches"]}], args)
 
     def v9x_input(self, args):
         actions = []
@@ -1832,14 +2513,57 @@ class ToolHandler:
             if action.get("op") == "key" and "vk" not in action and "name" in action:
                 action["vk"] = virtual_key(action.pop("name"))
             actions.append(action)
+        return self.input_step(actions, args)
+
+    def input_step(self, actions, args):
+        """Send input; with screenshot=true, settle and capture on the same
+        connection and return the input result followed by the image."""
+        settle_ms = int(args.get("settle_ms", DEFAULT_SETTLE_MS))
+        if not 0 <= settle_ms <= MAX_SETTLE_MS:
+            raise V9xError("settle_ms must be 0..%d" % MAX_SETTLE_MS)
+        shape = self.shot_args(args)  # reject bad options before any input
         with self.connect() as client:
-            return self.text(client.send_input(actions))
+            if any(action["op"] == "moverel" for action in actions):
+                client.require(CAP_INPUT_RELATIVE, "relative mouse moves")
+            result = client.send_input(actions)
+            if not args.get("screenshot"):
+                return self.text(result)
+            time.sleep(settle_ms / 1000.0)
+            capture = client.screenshot(**shape)
+        result["settle_ms"] = settle_ms
+        return self.text(result) + self.screenshot_content(capture, args.get("save_path"))
 
     def v9x_screenshot(self, args):
+        shape = self.shot_args(args)
         with self.connect() as client:
-            metadata, bmp = client.screenshot()
-        png = bmp_to_png(bmp)
-        save_path = args.get("save_path")
+            capture = client.screenshot(**shape)
+        return self.screenshot_content(capture, args.get("save_path"))
+
+    @staticmethod
+    def shot_args(args):
+        """region / scale / gray tool arguments as client.screenshot kwargs."""
+        region = args.get("region")
+        if region is not None and (not isinstance(region, list) or len(region) != 4):
+            raise V9xError("region is [x, y, width, height] in screen pixels")
+        scale = float(args.get("scale", 1.0))
+        if not 0.01 <= scale <= 1.0:
+            raise V9xError("scale must be 0.01..1")
+        window = args.get("window")
+        if window is not None and region is not None:
+            raise V9xError("pass region or window, not both")
+        return {"region": region, "scale_percent": max(1, int(round(scale * 100))),
+                "gray": bool(args.get("gray", False)), "window": window}
+
+    @staticmethod
+    def screenshot_content(capture, save_path):
+        metadata, bmp = capture
+        width, height, rows = decode_bmp(bmp)
+        host_shape = metadata.pop("host_shape", None)
+        if host_shape:
+            region, scale_percent, gray = host_shape
+            width, height, rows = shape_rgb(width, height, rows, region, scale_percent, gray)
+            metadata["width"], metadata["height"] = width, height
+        png = encode_png(width, height, rows, bool(metadata.get("gray")))
         if save_path:
             save_path = os.path.abspath(save_path)
             parent = os.path.dirname(save_path)
@@ -2061,7 +2785,7 @@ class ToolHandler:
     def v9x_wait_desktop(self, args):
         wait_seconds = int(args.get("wait_seconds", 120))
         deadline = time.monotonic() + wait_seconds
-        with self.connect() as client:
+        with self.connect(wait_seconds) as client:
             while True:
                 info = client.info()
                 if info["desktop_ready"]:

@@ -49,6 +49,9 @@ typedef struct V9xExecSlot {
     struct V9xConnection *owner;
     HANDLE thread;
     DWORD request_id;
+    /* The running child, 0 when none: lets `ps` mark agent jobs and `kill`
+       end a stuck one (its worker then completes the job as usual). */
+    volatile DWORD process_id;
     DWORD timeout_ms;
     DWORD stdout_limit;
     DWORD stderr_limit;
@@ -110,8 +113,12 @@ typedef struct V9xAgentState {
     volatile LONG active_connections;
     volatile LONG activity;
     HWND tray_window;
+    /* `tray_icon` is the idle picture (also the chat window's class icon);
+       `tray_icons` is every picture the tray shows, indexed
+       [cloud][V9X_TRAY_BODY_*], where cloud is 0 (none), 1 (remote help
+       connected to the relay) or 2 (connected but paused, drawn grey). */
     HICON tray_icon;
-    HICON tray_icon_busy;
+    HICON tray_icons[3][3];
     /* Remote help (remote.c, docsemote-help.md). `remote_on` is AGENT.INI
        [remote] mode=on; `remote_paused` is the tray's Pause, deliberately
        never saved so a restart is back to On; `remote_status` is one of
@@ -211,6 +218,13 @@ int v9x_handle_file_message(V9xConnection *conn, unsigned short type,
                             const unsigned char *payload,
                             unsigned long length);
 void v9x_files_disconnect(V9xConnection *conn);
+void v9x_flush_ini_cache(const char *path);
+int v9x_process_supported(void);
+int v9x_is_tools_message(unsigned short type);
+int v9x_handle_tools_message(V9xConnection *conn, unsigned short type,
+                             unsigned long request_id,
+                             const unsigned char *payload,
+                             unsigned long length);
 unsigned long v9x_promote_temp(const char *final_path, const char *temp_path,
                                DWORD *native_error);
 int v9x_handle_power_message(V9xConnection *conn, unsigned short type,

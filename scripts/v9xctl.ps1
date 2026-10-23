@@ -89,20 +89,42 @@ param(
     [ArgumentCompleter({
         param($commandName, $parameterName, $wordToComplete)
         @('discover', 'ping', 'info', 'inventory', 'exec', 'shell', 'stat', 'list', 'mkdir',
-          'put', 'get', 'push-tree', 'download', 'update', 'reboot', 'reset', 'shutdown',
+          'put', 'get', 'push-tree', 'wait-file', 'delete', 'hash', 'cat', 'ps', 'kill', 'reg',
+          'windows', 'wait-window',
+          'download', 'update', 'reboot', 'reset', 'shutdown',
           'wait-desktop', 'screenshot', 'input', 'vnc', 'help') |
             Where-Object { $_ -like "$wordToComplete*" }
     })]
     [string]$Action,
+    # vnc: status|start|stop; help: the verb to describe. Checked per verb
+    # below, so `help update` is not rejected by parameter binding.
     [Parameter(Position = 1)]
-    [ValidateSet('', 'status', 'start', 'stop')]
     [string]$VncCommand = '',
-    [Alias('Host')]
+    [Alias('Host', 'HostName', 'Address')]
     [string]$EndpointHost = '127.0.0.1',
+    [Alias('EndpointPort', 'TcpPort')]
     [ValidateRange(1, 65535)]
     [int]$Port = 9869,
+    # "host:port" in one argument, instead of -Host and -Port.
+    [string]$Target = '',
     [ValidateRange(1, 120)]
     [int]$ConnectTimeoutSeconds = 10,
+    # Keep retrying the connection (refused, reset, timed out) for up to this
+    # many seconds, with backoff: for a guest that is still booting. Without
+    # it only a connection dropped before HELLO is retried, twice.
+    [ValidateRange(0, 3600)]
+    [int]$WaitForAgent = 0,
+    # wait-file / exec -WaitForFile: until the file exists (or with -Gone,
+    # until it does not) and, with -StableMs, its size stopped changing.
+    [string]$WaitForFile = '',
+    # windows / wait-window -Title, exec -WaitForWindow, screenshot -Window:
+    # a case-insensitive part of a top-level window's title (agent 0.13.0+).
+    [string]$Title = '',
+    [string]$WaitForWindow = '',
+    [string]$Window = '',
+    [switch]$Gone,
+    [ValidateRange(0, 600000)]
+    [int]$StableMs = 0,
     [string]$Application,
     [string]$Arguments = '',
     [Alias('Command')]
@@ -127,6 +149,37 @@ param(
     [switch]$ShowWindow,
     [switch]$Detach,
     [string]$Sequence,
+    # input -OutFile: milliseconds to let the guest repaint before the capture.
+    [ValidateRange(0, 30000)]
+    [int]$SettleMs = 500,
+    # screenshot / input -OutFile: capture only this rectangle of the screen,
+    # "x,y,width,height" in screen pixels (clipped to the screen).
+    [ValidatePattern('^$|^\s*\d+\s*,\s*\d+\s*,\s*\d+\s*,\s*\d+\s*$')]
+    [string]$Region = '',
+    # ... scaled to this fraction (0.5 = half width and height, a quarter of
+    # the pixels and of the image tokens an AI client pays for).
+    [ValidateRange(0.01, 1.0)]
+    [double]$Scale = 1.0,
+    # ... in 8-bit greyscale (lossy; enough to read text and layout).
+    [switch]$Gray,
+    # delete: remove a directory and everything in it.
+    [switch]$Recurse,
+    # delete: clear read-only/hidden/system attributes first.
+    [switch]$Force,
+    # cat: only the last N lines (after -Match filtering); 0 = all.
+    [ValidateRange(0, 1000000)]
+    [int]$Tail = 0,
+    # cat: only lines containing this text (case-insensitive).
+    [string]$Match = '',
+    # cat: most bytes of text to return (the agent caps it near 64 KiB).
+    [ValidateRange(1, 65512)]
+    [int]$MaxBytes = 16384,
+    # kill: process id (from ps), or -Name for an image name.
+    [Alias('Pid')]
+    [uint32]$ProcessId = 0,
+    [string]$Name = '',
+    # reg: HKLM\Software\..., HKCU\..., HKCR, HKU, HKCC, HKDD.
+    [string]$Key = '',
     [ValidatePattern('^$|^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$')]
     [string]$Id,
     [string]$QueryAddress,
@@ -273,6 +326,120 @@ function Connect-V9xSession {
     } catch {
         $sessionClient.Dispose()
         throw
+    }
+}
+
+# Connect-V9xSession, retried instead of making the caller sleep and poll.
+# Nothing has been requested before HELLO completes, so a retry is always
+# safe. A connection dropped before HELLO (a port forward that answers while
+# the agent is not listening yet) is retried twice even by default; with
+# -WaitForAgent N every transport failure is retried for N seconds, backing
+# off 1, 2, 4, then 5 s.
+function Connect-V9xSessionWithRetry {
+    param([string]$HostName, [int]$TcpPort, [int]$TimeoutSeconds, [int]$WaitSeconds)
+    $deadline = [DateTime]::UtcNow.AddSeconds($WaitSeconds)
+    $attempt = 0
+    for (;;) {
+        try {
+            return Connect-V9xSession -HostName $HostName -TcpPort $TcpPort -TimeoutSeconds $TimeoutSeconds
+        } catch {
+            $failure = $_.Exception
+            while ($failure -is [Management.Automation.MethodInvocationException] -and $failure.InnerException) {
+                $failure = $failure.InnerException
+            }
+            $dropped = $failure -is [IO.IOException] -or
+                ($failure -is [Net.Sockets.SocketException] -and
+                 $failure.SocketErrorCode -eq [Net.Sockets.SocketError]::ConnectionReset)
+            $transport = $dropped -or $failure -is [Net.Sockets.SocketException] -or
+                $failure -is [TimeoutException]
+            ++$attempt
+            $delay = [Math]::Min(5, [Math]::Pow(2, $attempt - 1))
+            $retry = ($WaitSeconds -gt 0 -and $transport -and
+                      [DateTime]::UtcNow.AddSeconds($delay) -lt $deadline) -or
+                     ($WaitSeconds -le 0 -and $dropped -and $attempt -le 2)
+            if (-not $retry) { throw $failure }
+            if ($WaitSeconds -le 0) { $delay = 0.5 * $attempt }
+            Start-Sleep -Milliseconds ([int]($delay * 1000))
+            # -Id: the guest may come back on a new address (DHCP).
+            if ($Id) { try { [void](Update-V9xTargetFromId -Seconds 2) } catch { } }
+        }
+    }
+}
+
+# Poll FILE_STAT on an open connection until -Path exists (or with -Gone,
+# does not), and with -StableMs until its size has not changed for that
+# long. Returns the last stat plus how long it waited, or throws with exit
+# code 47 at the deadline.
+function Wait-V9xGuestFile {
+    param($Stream, [ref]$RequestId, [string]$Path, [int]$WaitSeconds, [switch]$Gone, [int]$StableMs)
+    $started = [Diagnostics.Stopwatch]::StartNew()
+    $lastSize = -1
+    $stableSince = $null
+    for (;;) {
+        $payload = New-V9xPathPayload -Path $Path
+        $bytes = New-V9xFrameBytes -Type 0x0020 -RequestId $RequestId.Value -Payload $payload
+        $Stream.Write($bytes, 0, $bytes.Length)
+        $frame = Read-V9xOperationFrame -Stream $Stream -RequestId $RequestId.Value `
+            -ExpectedTypes 0x8020 -GuestErrorExitCode 40
+        $RequestId.Value = [uint32]($RequestId.Value + 1)
+        $stat = ConvertFrom-V9xStatPayload -Payload $frame.Payload
+        $done = if ($Gone) { -not $stat.Exists } elseif (-not $stat.Exists) { $false } elseif ($StableMs -le 0) { $true } else {
+            if ($stat.Size -ne $lastSize) { $lastSize = $stat.Size; $stableSince = $started.ElapsedMilliseconds }
+            $started.ElapsedMilliseconds - $stableSince -ge $StableMs
+        }
+        if ($done) {
+            return [pscustomobject]@{ Stat = $stat; WaitedMilliseconds = $started.ElapsedMilliseconds }
+        }
+        if ($started.Elapsed.TotalSeconds -ge $WaitSeconds) {
+            # Not a TimeoutException: that type means "transport" (exit 20).
+            $exception = [InvalidOperationException]::new(
+                "$Path $(if ($Gone) { 'still exists' } elseif ($stat.Exists) { 'kept changing size' } else { 'did not appear' }) within $WaitSeconds s.")
+            $exception.Data['V9xExitCode'] = 47
+            throw $exception
+        }
+        # 250 ms on the LAN; a relay round trip is slow enough on its own.
+        if (-not $Relay) { Start-Sleep -Milliseconds 250 }
+    }
+}
+
+# WINDOW_LIST on an open connection (needs V9X_CAP_WINDOWS 0x00200000).
+function Get-V9xGuestWindows {
+    param($Stream, [ref]$RequestId)
+    if (($hello.Capabilities -band [uint32]0x00200000) -eq 0) {
+        $exception = [InvalidOperationException]::new(
+            "Agent build '$($hello.BuildId)' cannot list windows (needs agent 0.13.0+).")
+        $exception.Data['V9xExitCode'] = 23
+        throw $exception
+    }
+    $bytes = New-V9xFrameBytes -Type 0x0062 -RequestId $RequestId.Value -Payload ([byte[]]@())
+    $Stream.Write($bytes, 0, $bytes.Length)
+    $frame = Read-V9xOperationFrame -Stream $Stream -RequestId $RequestId.Value `
+        -ExpectedTypes 0x8062 -GuestErrorExitCode 48
+    $RequestId.Value = [uint32]($RequestId.Value + 1)
+    return @(ConvertFrom-V9xWindowListPayload -Payload $frame.Payload)
+}
+
+# Poll WINDOW_LIST until a window whose title contains -Title is visible (not
+# minimized), or with -Gone until none is. Exit 48 at the deadline.
+function Wait-V9xGuestWindow {
+    param($Stream, [ref]$RequestId, [string]$Title, [int]$WaitSeconds, [switch]$Gone)
+    $started = [Diagnostics.Stopwatch]::StartNew()
+    for (;;) {
+        $windows = @(Get-V9xGuestWindows -Stream $Stream -RequestId $RequestId)
+        $found = @($windows | Where-Object { $_.Title -like "*$([Management.Automation.WildcardPattern]::Escape($Title))*" -and -not $_.Minimized })
+        if (($Gone -and $found.Count -eq 0) -or (-not $Gone -and $found.Count -gt 0)) {
+            return [pscustomobject]@{
+                Window = $(if ($found.Count) { $found[0] } else { $null })
+                WaitedMilliseconds = $started.ElapsedMilliseconds
+            }
+        }
+        if ($started.Elapsed.TotalSeconds -ge $WaitSeconds) {
+            $exception = [InvalidOperationException]::new(
+                "No window titled '*$Title*' $(if ($Gone) { 'closed' } else { 'appeared' }) within $WaitSeconds s.")
+            $exception.Data['V9xExitCode'] = 48
+            throw $exception
+        }
+        if (-not $Relay) { Start-Sleep -Milliseconds 250 }
     }
 }
 
@@ -556,6 +723,53 @@ function Invoke-V9xGetInternal {
     }
 }
 
+# -Region/-Scale/-Gray for agents older than 0.13.0, which only send the
+# full 24-bit frame: the same crop, box-ish downscale and luma as shotxf.c,
+# done here after the download.
+function ConvertTo-V9xShapedBitmap {
+    param(
+        [Parameter(Mandatory = $true)][Drawing.Image]$Image,
+        [uint32]$X, [uint32]$Y, [uint32]$Width, [uint32]$Height,
+        [uint32]$ScalePercent = 100,
+        [switch]$Gray
+    )
+    $outW = [int][Math]::Max(1, [Math]::Floor(($Width * $ScalePercent + 99) / 100))
+    $outH = [int][Math]::Max(1, [Math]::Floor(($Height * $ScalePercent + 99) / 100))
+    $result = [Drawing.Bitmap]::new($outW, $outH, [Drawing.Imaging.PixelFormat]::Format24bppRgb)
+    $graphics = [Drawing.Graphics]::FromImage($result)
+    $attributes = [Drawing.Imaging.ImageAttributes]::new()
+    try {
+        $graphics.InterpolationMode = [Drawing.Drawing2D.InterpolationMode]::HighQualityBilinear
+        $graphics.PixelOffsetMode = [Drawing.Drawing2D.PixelOffsetMode]::Half
+        # Edge pixels are repeated, not blended with transparent black.
+        $attributes.SetWrapMode([Drawing.Drawing2D.WrapMode]::TileFlipXY)
+        if ($Gray) {
+            $r = [single]0.299; $g = [single]0.587; $b = [single]0.114
+            $matrix = [Drawing.Imaging.ColorMatrix]::new([single[][]]@(
+                [single[]]@($r, $r, $r, 0, 0), [single[]]@($g, $g, $g, 0, 0),
+                [single[]]@($b, $b, $b, 0, 0), [single[]]@(0, 0, 0, 1, 0),
+                [single[]]@(0, 0, 0, 0, 1)))
+            $attributes.SetColorMatrix($matrix)
+        }
+        $graphics.DrawImage($Image, [Drawing.Rectangle]::new(0, 0, $outW, $outH),
+            [int]$X, [int]$Y, [int]$Width, [int]$Height, [Drawing.GraphicsUnit]::Pixel, $attributes)
+    } finally {
+        $attributes.Dispose()
+        $graphics.Dispose()
+    }
+    return $result
+}
+
+# The common result fields followed by a verb's own, as one object.
+function Join-V9xResult {
+    param([Collections.IDictionary]$First, [Collections.IDictionary]$Second)
+    $merged = [ordered]@{}
+    foreach ($entry in @($First, $Second)) {
+        foreach ($name in $entry.Keys) { $merged[$name] = $entry[$name] }
+    }
+    return [pscustomobject]$merged
+}
+
 function Join-V9xGuestPath {
     param([string]$Parent, [string]$Child)
     if ([string]::IsNullOrEmpty($Child)) { return $Parent }
@@ -587,8 +801,8 @@ $script:V9xVerbs = [ordered]@{
     }
     'ping' = @{
         Purpose = 'Liveness check; returns uptime and boot counter'
-        Usage = 'ping'
-        Example = 'ping -Host 127.0.0.1 -Port 9869'
+        Usage = 'ping [-WaitSeconds <n>]   (with -WaitSeconds: until the agent answers, e.g. while booting)'
+        Example = 'ping -WaitSeconds 120 -Json'
     }
     'info' = @{
         Purpose = 'Agent version, build ID, computer name, screen mode, pending job'
@@ -602,13 +816,13 @@ $script:V9xVerbs = [ordered]@{
     }
     'exec' = @{
         Purpose = 'Run a Win32 EXE directly and capture stdout/stderr'
-        Usage = 'exec -Application <guest EXE> [-Arguments <text>] [-WorkingDirectory <guest dir>] [-TimeoutSeconds <n>] [-ExpectedExitCode <n>] [-ShowWindow] [-Detach]'
+        Usage = 'exec -Application <guest EXE> [-Arguments <text>] [-WorkingDirectory <guest dir>] [-TimeoutSeconds <n>] [-ExpectedExitCode <n>] [-ShowWindow] [-Detach] [-WaitForFile <guest path> | -WaitForWindow <title part>] [-WaitSeconds <n>]'
         Example = 'exec -Application C:\WINDOWS\NOTEPAD.EXE -Arguments C:\README.TXT -TimeoutSeconds 30 -Json'
         Required = @{ Application = '-Application' }
     }
     'shell' = @{
         Purpose = 'Run a command through COMMAND.COM /C, or CMD.EXE /C on Windows 2000 (built-ins, batch files)'
-        Usage = 'shell -Command <text> [-TimeoutSeconds <n>] [-Detach]'
+        Usage = 'shell -Command <text> [-TimeoutSeconds <n>] [-Detach] [-WaitForFile <guest path> [-WaitSeconds <n>]]'
         Example = 'shell -Command "DIR C:\ /W" -Json'
         Required = @{ ShellCommand = '-Command' }
     }
@@ -648,6 +862,57 @@ $script:V9xVerbs = [ordered]@{
         Example = 'push-tree -Source .\build\install -Destination C:\V9XREMOTE\JOBS\install'
         Required = @{ Source = '-Source'; Destination = '-Destination' }
     }
+    'delete' = @{
+        Purpose = 'Delete a guest file, or a directory with -Recurse (agent 0.13.0+; refuses roots, WINDOWS, SYSTEM, the agent folder)'
+        Usage = 'delete -Path <guest path> [-Recurse] [-Force]'
+        Example = 'delete -Path C:\V9XREMOTE\JOBS\old -Recurse -Json'
+        Required = @{ RemotePath = '-Path' }
+    }
+    'hash' = @{
+        Purpose = 'Size, CRC32 and SHA-256 of a guest file; with -Source, compare to a local file (agent 0.13.0+)'
+        Usage = 'hash -Path <guest file> [-Source <local file>]'
+        Example = 'hash -Path C:\WINDOWS\SYSTEM\V9X.DRV -Source .\build\V9X.DRV -Json'
+        Required = @{ RemotePath = '-Path' }
+    }
+    'wait-file' = @{
+        Purpose = 'Wait (one connection, no sleeps of yours) until a guest file exists, or with -Gone is removed; -StableMs: until its size settles'
+        Usage = 'wait-file -Path <guest path> [-WaitSeconds <n>] [-Gone] [-StableMs <ms>]'
+        Example = 'wait-file -Path C:\V9XREMOTE\JOBS\run1\DONE.TXT -WaitSeconds 300 -Json'
+        Required = @{ RemotePath = '-Path' }
+    }
+    'windows' = @{
+        Purpose = 'Visible top-level windows: title, class, position, size, pid (agent 0.13.0+)'
+        Usage = 'windows [-Title <part of title>]'
+        Example = 'windows -Json'
+    }
+    'wait-window' = @{
+        Purpose = 'Wait until a window whose title contains -Title is shown (or with -Gone, closed)'
+        Usage = 'wait-window -Title <part of title> [-WaitSeconds <n>] [-Gone]'
+        Example = 'wait-window -Title "Setup" -WaitSeconds 60 -Json'
+        Required = @{ Title = '-Title' }
+    }
+    'cat' = @{
+        Purpose = 'Print a guest text file inline: -Tail N lines, -Match text, bounded (agent 0.13.0+)'
+        Usage = 'cat -Path <guest file> [-Tail <n>] [-Match <text>] [-MaxBytes <n>]'
+        Example = 'cat -Path C:\V9XREMOTE\AGENT.LOG -Tail 40 -Match error'
+        Required = @{ RemotePath = '-Path' }
+    }
+    'ps' = @{
+        Purpose = 'List guest processes; marks the agent and its exec jobs (agent 0.13.0+)'
+        Usage = 'ps [-Name <image name>]'
+        Example = 'ps -Json'
+    }
+    'kill' = @{
+        Purpose = 'Terminate a guest process by -Pid or -Name (agent 0.13.0+; refuses the agent and Windows core processes)'
+        Usage = 'kill -Pid <id> | -Name <image name>'
+        Example = 'kill -Name NOTEPAD.EXE -Json'
+    }
+    'reg' = @{
+        Purpose = 'Read a registry key: subkeys and values (read-only; agent 0.13.0+)'
+        Usage = 'reg -Key <HKLM\path>'
+        Example = 'reg -Key HKLM\System\CurrentControlSet\Services\Class\Display -Json'
+        Required = @{ Key = '-Key' }
+    }
     'download' = @{
         Purpose = 'Guest fetches an http:// URL to a guest path'
         Usage = 'download -Url <http://...> -Destination <guest path>'
@@ -682,14 +947,14 @@ $script:V9xVerbs = [ordered]@{
     }
     'screenshot' = @{
         Purpose = 'Capture the guest screen (PNG/JPEG/GIF/TIFF/BMP by extension)'
-        Usage = 'screenshot -OutFile <local image>'
-        Example = 'screenshot -OutFile .\shot.png'
+        Usage = 'screenshot -OutFile <local image> [-Window <title part> | -Region x,y,w,h] [-Scale 0.5] [-Gray]'
+        Example = 'screenshot -OutFile .\dialog.png -Region 200,150,400,300 -Scale 0.75'
         Required = @{ Destination = '-OutFile' }
     }
     'input' = @{
-        Purpose = 'Inject mouse/keyboard actions'
-        Usage = 'input -Sequence "<verb args>; <verb args>; ..."'
-        Example = 'input -Sequence "move 100,200; click left; type Hello; key ENTER"'
+        Purpose = 'Inject mouse/keyboard actions; with -OutFile, settle and screenshot in the same call'
+        Usage = 'input -Sequence "<verb args>; <verb args>; ..." [-OutFile <local image> [-SettleMs 500] [-Region x,y,w,h] [-Scale 0.5] [-Gray]]'
+        Example = 'input -Sequence "click left; key ENTER" -OutFile .\after.png'
         Required = @{ Sequence = '-Sequence' }
     }
     'vnc' = @{
@@ -726,6 +991,8 @@ function Write-V9xUsage {
     $Writer.WriteLine('  -Host <address>             agent address; default 127.0.0.1 (emulator port forward)')
     $Writer.WriteLine('  -Port <n>                   agent TCP port; default 9869 (AGENT.INI "port")')
     $Writer.WriteLine('  -ConnectTimeoutSeconds <n>  connect/response timeout; default 10')
+    $Writer.WriteLine('  -WaitForAgent <n>           retry the connection for up to n s (guest booting); no Start-Sleep loops')
+    $Writer.WriteLine('  -Target <host:port>         same as -Host and -Port in one argument')
     $Writer.WriteLine('  -Id <install id>            find the agent by install ID over mDNS instead of -Host/-Port')
     $Writer.WriteLine('  -QueryAddress <ip[:port]>   send the mDNS query to one address, not multicast')
     $Writer.WriteLine('  -DiscoverSeconds <n>        how long discovery listens; default 3')
@@ -747,7 +1014,7 @@ function Write-V9xUsage {
     $Writer.WriteLine('  .\scripts\v9xctl.ps1 reboot -JobId myjob-reboot-1 -WaitSeconds 180 -Json')
     $Writer.WriteLine()
     $Writer.WriteLine('Exit codes: 0 ok, 10 usage, 20 agent unreachable, 22/23 protocol, 30-33 execution,')
-    $Writer.WriteLine('40 file transfer, 41-42 power control, 43 screenshot, 44 desktop not ready.')
+    $Writer.WriteLine('40 file transfer, 41-42 power control, 43 screenshot, 44 desktop not ready, 45 process, 46 registry, 47 wait-file, 48 window.')
     $Writer.WriteLine('Full reference: AGENTS.md and docs\host-cli.md.')
 }
 
@@ -766,18 +1033,53 @@ function Write-V9xVerbUsage {
     $Writer.WriteLine("Target: -Host $EndpointHost -Port $Port (defaults 127.0.0.1 and 9869). Run '.\scripts\v9xctl.ps1 help' for all verbs.")
 }
 
+# Names agents reach for that mean an existing verb.
+$script:V9xVerbAliases = @{
+    'ls' = 'list'; 'dir' = 'list'; 'pull' = 'get'; 'push' = 'put'; 'status' = 'info'
+    'rm' = 'delete'; 'del' = 'delete'; 'type' = 'cat'; 'tail' = 'cat'; 'read' = 'cat'
+    'sha256' = 'hash'; 'md5' = 'hash'; 'checksum' = 'hash'; 'tasklist' = 'ps'
+    'processes' = 'ps'; 'taskkill' = 'kill'; 'regquery' = 'reg'; 'wait-ready' = 'wait-desktop'; 'wait-for-window' = 'wait-window'
+    'wait-boot' = 'wait-desktop'; 'wait-for-file' = 'wait-file'; 'capture' = 'screenshot'
+}
+
 if ([string]::IsNullOrWhiteSpace($Action) -or $Action -in @('help', '-h', '--help', '/?')) {
     if ([string]::IsNullOrWhiteSpace($Action)) {
         Write-V9xUsage -Writer ([Console]::Error) -Problem 'no verb given.'
         exit 10
     }
+    # help <verb>: just that verb.
+    $helpVerb = $VncCommand.ToLowerInvariant()
+    if ($script:V9xVerbAliases.ContainsKey($helpVerb)) { $helpVerb = $script:V9xVerbAliases[$helpVerb] }
+    if ($helpVerb -and $script:V9xVerbs.Contains($helpVerb)) {
+        $entry = $script:V9xVerbs[$helpVerb]
+        [Console]::Out.WriteLine("$helpVerb - $($entry.Purpose)")
+        [Console]::Out.WriteLine("  .\scripts\v9xctl.ps1 $($entry.Usage) [-Host <address>] [-Port <n>] [-Json]")
+        [Console]::Out.WriteLine("  e.g. .\scripts\v9xctl.ps1 $($entry.Example)")
+        exit 0
+    }
     Write-V9xUsage -Writer ([Console]::Out)
     exit 0
 }
 $Action = $Action.ToLowerInvariant()
+if ($script:V9xVerbAliases.ContainsKey($Action)) { $Action = $script:V9xVerbAliases[$Action] }
 if (-not $script:V9xVerbs.Contains($Action)) {
-    Write-V9xUsage -Writer ([Console]::Error) -Problem "unknown verb '$Action'."
+    # One line, not the whole help: the verb list and where this copy lives
+    # (an old copy of v9xctl lacks newer verbs; that has bitten before).
+    [Console]::Error.WriteLine("Usage error: unknown verb '$Action'. Verbs: $(@($script:V9xVerbs.Keys) -join ', ').")
+    [Console]::Error.WriteLine("This is v9xctl $(Get-V9xToolVersion) at $PSCommandPath; '.\scripts\v9xctl.ps1 help <verb>' describes one.")
     exit 10
+}
+if ($Action -eq 'vnc' -and $VncCommand -and $VncCommand -notin @('status', 'start', 'stop')) {
+    Write-V9xVerbUsage -Writer ([Console]::Error) -Verb 'vnc' -Problem 'vnc takes status, start or stop.'
+    exit 10
+}
+if ($Target) {
+    if ($Target -notmatch '^\s*([^:\s]+)(?::(\d{1,5}))?\s*$') {
+        [Console]::Error.WriteLine("Usage error: -Target is host or host:port, not '$Target'.")
+        exit 10
+    }
+    $EndpointHost = $Matches[1]
+    if ($Matches[2]) { $Port = [int]$Matches[2] }
 }
 $verbEntry = $script:V9xVerbs[$Action]
 if ($verbEntry.ContainsKey('Required')) {
@@ -797,6 +1099,14 @@ if ($Action -eq 'put' -and -not (Test-Path -LiteralPath $Source -PathType Leaf))
 if ($Action -eq 'push-tree' -and -not (Test-Path -LiteralPath $Source -PathType Container)) {
     [Console]::Error.WriteLine("Local source directory not found: $Source")
     exit 11
+}
+if ($Action -eq 'hash' -and $Source -and -not (Test-Path -LiteralPath $Source -PathType Leaf)) {
+    [Console]::Error.WriteLine("Local file to compare not found: $Source")
+    exit 11
+}
+if ($Action -eq 'kill' -and $ProcessId -eq 0 -and [string]::IsNullOrWhiteSpace($Name)) {
+    Write-V9xVerbUsage -Writer ([Console]::Error) -Verb 'kill' -Problem 'kill requires -Pid or -Name.'
+    exit 10
 }
 
 if ($Action -eq 'discover') {
@@ -831,10 +1141,10 @@ if ($Id) {
 # positional value, not as a parameter name.
 function Invoke-V9xSelf {
     param([hashtable]$Arguments)
-    $target = @{ EndpointHost = $EndpointHost; Port = $Port
+    $selfArgs = @{ EndpointHost = $EndpointHost; Port = $Port
                  ConnectTimeoutSeconds = $ConnectTimeoutSeconds; Json = $true }
-    foreach ($key in $Arguments.Keys) { $target[$key] = $Arguments[$key] }
-    $output = @(& $PSCommandPath @target)
+    foreach ($key in $Arguments.Keys) { $selfArgs[$key] = $Arguments[$key] }
+    $output = @(& $PSCommandPath @selfArgs)
     $code = $LASTEXITCODE
     $parsed = $null
     try { $parsed = ($output -join "`n") | ConvertFrom-Json } catch { }
@@ -956,11 +1266,11 @@ if ($Action -eq 'update') {
     # verb's own connection opens, because 0.5.x serves one client at a time.
     # Hashtable splatting: an array splatted into a script passes '-Host' as
     # a positional value, not as a parameter name.
-    $target = @{ EndpointHost = $EndpointHost; Port = $Port
+    $selfTarget = @{ EndpointHost = $EndpointHost; Port = $Port
                  ConnectTimeoutSeconds = $ConnectTimeoutSeconds; Json = $true }
-    if ($Id) { $target['Id'] = $Id }
+    if ($Id) { $selfTarget['Id'] = $Id }
     $agentInfo = $null
-    try { $agentInfo = (& $PSCommandPath -Action info @target) -join "`n" | ConvertFrom-Json } catch { }
+    try { $agentInfo = (& $PSCommandPath -Action info @selfTarget) -join "`n" | ConvertFrom-Json } catch { }
     if ($null -ne $agentInfo) {
         $agentVersion = $null
         try { $agentVersion = [version]$agentInfo.AgentVersion } catch { }
@@ -1019,11 +1329,19 @@ $client = $null
 $downloadTemp = $null
 $exitCategory = 22
 try {
-    $session = Connect-V9xSession -HostName $EndpointHost -TcpPort $Port `
-        -TimeoutSeconds $ConnectTimeoutSeconds
+    # wait-desktop, and ping given -WaitSeconds, wait for the agent itself
+    # too: a guest that is still booting refuses before it is "not ready".
+    $agentWait = $WaitForAgent
+    if ($agentWait -eq 0 -and ($Action -eq 'wait-desktop' -or
+            ($Action -eq 'ping' -and $PSBoundParameters.ContainsKey('WaitSeconds')))) {
+        $agentWait = $WaitSeconds
+    }
+    $session = Connect-V9xSessionWithRetry -HostName $EndpointHost -TcpPort $Port `
+        -TimeoutSeconds $ConnectTimeoutSeconds -WaitSeconds $agentWait
     $client = $session.Client
     $stream = $session.Stream
     [uint32]$requestId = $session.RequestId
+    $captureAfterInput = $false
     $hello = $session.Hello
 
     ++$requestId
@@ -1238,7 +1556,44 @@ try {
         exit 0
     }
 
-    if ($Action -eq 'screenshot') {
+    if ($Action -eq 'input') {
+        if (($hello.Capabilities -band [uint32]0x00000400) -eq 0) {
+            $exitCategory = 23
+            throw "Agent build '$($hello.BuildId)' does not advertise input support."
+        }
+        if ([string]::IsNullOrWhiteSpace($Sequence)) {
+            $exitCategory = 10
+            throw 'input requires -Sequence, e.g. "move 100,200; click left; type Hello; key ENTER".'
+        }
+        # -OutFile: settle, then capture on this connection (the screenshot
+        # branch below), so one GUI step is one call.
+        $captureAfterInput = -not [string]::IsNullOrWhiteSpace($Destination)
+        if ($captureAfterInput -and ($hello.Capabilities -band [uint32]0x00000100) -eq 0) {
+            $exitCategory = 23
+            throw "Agent build '$($hello.BuildId)' does not advertise screenshot support."
+        }
+        $actions = ConvertTo-V9xInputActions -Sequence $Sequence
+        $payload = New-V9xInputPayload -Actions $actions
+        $bytes = New-V9xFrameBytes -Type 0x0060 -RequestId $requestId -Payload $payload
+        $stream.Write($bytes, 0, $bytes.Length)
+        $frame = Read-V9xOperationFrame -Stream $stream -RequestId $requestId `
+            -ExpectedTypes 0x8060 -GuestErrorExitCode 23
+        $inputResult = ConvertFrom-V9xInputPayload -Payload $frame.Payload
+        if (-not $captureAfterInput) {
+            $result = [pscustomobject]@{
+                Success = $true; RequestId = $requestId; AgentBuild = $hello.BuildId
+                ActionsPerformed = $inputResult.ActionsPerformed
+                CursorX = $inputResult.CursorX; CursorY = $inputResult.CursorY
+                Endpoint = "${EndpointHost}:$Port"
+            }
+            if ($Json) { $result | ConvertTo-Json -Depth 4 -Compress } else { $result | Format-List }
+            exit 0
+        }
+        ++$requestId
+        if ($SettleMs -gt 0) { Start-Sleep -Milliseconds $SettleMs }
+    }
+
+    if ($Action -eq 'screenshot' -or $captureAfterInput) {
         if (($hello.Capabilities -band [uint32]0x00000100) -eq 0) {
             $exitCategory = 23
             throw "Agent build '$($hello.BuildId)' does not advertise screenshot support."
@@ -1246,8 +1601,67 @@ try {
         $guestScreenshot = if ([string]::IsNullOrWhiteSpace($RemotePath)) {
             'C:\V9XREMOTE\TEMP\SCREEN.BMP'
         } else { $RemotePath }
+        # Region and scale, resolved the way the agent does (shotxf.c), so the
+        # result can say which screen rectangle the image covers.
+        # -Window: capture just that window (its rectangle becomes -Region),
+        # waiting for it to appear when -WaitSeconds was given.
+        $capturedWindow = $null
+        if ($Window) {
+            if ($PSBoundParameters.ContainsKey('WaitSeconds')) {
+                $capturedWindow = (Wait-V9xGuestWindow -Stream $stream -RequestId ([ref]$requestId) `
+                    -Title $Window -WaitSeconds $WaitSeconds).Window
+            } else {
+                $pattern = "*$([Management.Automation.WildcardPattern]::Escape($Window))*"
+                $capturedWindow = @(Get-V9xGuestWindows -Stream $stream -RequestId ([ref]$requestId) |
+                    Where-Object { $_.Title -like $pattern -and -not $_.Minimized }) | Select-Object -First 1
+            }
+            if ($null -eq $capturedWindow) {
+                $exitCategory = 48
+                throw "No visible window titled '*$Window*' (see the windows verb)."
+            }
+            $left = [Math]::Max(0, $capturedWindow.X); $top = [Math]::Max(0, $capturedWindow.Y)
+            $right = [Math]::Min([int]$hello.ScreenWidth, $capturedWindow.X + $capturedWindow.Width)
+            $bottom = [Math]::Min([int]$hello.ScreenHeight, $capturedWindow.Y + $capturedWindow.Height)
+            if ($right -le $left -or $bottom -le $top) {
+                $exitCategory = 48
+                throw "Window '$($capturedWindow.Title)' is off screen."
+            }
+            $Region = "$left,$top,$($right - $left),$($bottom - $top)"
+        }
+        $screenW = [uint32]$hello.ScreenWidth
+        $screenH = [uint32]$hello.ScreenHeight
+        $regionX = [uint32]0; $regionY = [uint32]0; $regionW = $screenW; $regionH = $screenH
+        if ($Region -ne '') {
+            $parts = @($Region.Split(',') | ForEach-Object { [uint32]$_.Trim() })
+            if ($parts[2] -eq 0 -or $parts[3] -eq 0) {
+                $exitCategory = 10
+                throw '-Region width and height must be at least 1.'
+            }
+            if ($screenW -gt 0 -and ($parts[0] -ge $screenW -or $parts[1] -ge $screenH)) {
+                $exitCategory = 10
+                throw "-Region $Region starts outside the ${screenW}x$screenH screen."
+            }
+            $regionX = $parts[0]; $regionY = $parts[1]
+            $regionW = [Math]::Min($parts[2], $screenW - $regionX)
+            $regionH = [Math]::Min($parts[3], $screenH - $regionY)
+        }
+        $scalePercent = [uint32][Math]::Max(1, [Math]::Round($Scale * 100))
+        $shaping = ($Region -ne '') -or $scalePercent -lt 100 -or $Gray
+        # Agents with V9X_CAP_SCREENSHOT_OPTIONS shape the image before it is
+        # sent, and always pack it losslessly (8-bit palette + RLE8 when the
+        # screen has <= 256 colours); older ones send the full 24-bit frame
+        # and v9xctl shapes it here.
+        $guestShapes = ($hello.Capabilities -band [uint32]0x00020000) -ne 0
+        $shotOptions = $null
+        if ($guestShapes) {
+            $flags = [uint32]1
+            if ($Gray) { $flags = $flags -bor [uint32]2 }
+            $optionW = if ($Region -ne '') { $regionW } else { [uint32]0 }
+            $optionH = if ($Region -ne '') { $regionH } else { [uint32]0 }
+            $shotOptions = [uint32[]]@($flags, $regionX, $regionY, $optionW, $optionH, $scalePercent)
+        }
         $bytes = New-V9xFrameBytes -Type 0x0050 -RequestId $requestId `
-            -Payload (New-V9xPathPayload -Path $guestScreenshot)
+            -Payload (New-V9xScreenshotPayload -Path $guestScreenshot -Options $shotOptions)
         $stream.Write($bytes, 0, $bytes.Length)
         $frame = Read-V9xOperationFrame -Stream $stream -RequestId $requestId `
             -ExpectedTypes 0x8050 -GuestErrorExitCode 43
@@ -1258,6 +1672,8 @@ try {
         }
         $outExtension = [IO.Path]::GetExtension($Destination).ToLowerInvariant()
         $convertTo = if ($formatMap.ContainsKey($outExtension)) { $formatMap[$outExtension] } else { $null }
+        $hostShapes = $shaping -and -not $guestShapes
+        if ($hostShapes -and -not $convertTo) { $convertTo = 'Bmp' }
         $localTarget = if ($convertTo) {
             Join-Path ([IO.Path]::GetTempPath()) ("v9x-screenshot-{0}.bmp" -f ([Guid]::NewGuid().ToString('N')))
         } else { $Destination }
@@ -1276,7 +1692,10 @@ try {
                     Add-Type -AssemblyName System.Drawing
                     $sourceImage = [Drawing.Image]::FromFile($localTarget)
                     try {
-                        $bitmap = [Drawing.Bitmap]::new($sourceImage)
+                        $bitmap = if ($hostShapes) {
+                            ConvertTo-V9xShapedBitmap -Image $sourceImage -X $regionX -Y $regionY `
+                                -Width $regionW -Height $regionH -ScalePercent $scalePercent -Gray:$Gray
+                        } else { [Drawing.Bitmap]::new($sourceImage) }
                         try {
                             $imageFormat = [Drawing.Imaging.ImageFormat]::$convertTo
                             $bitmap.Save($Destination, $imageFormat)
@@ -1303,31 +1722,26 @@ try {
             SourceBitsPerPixel = $capture.SourceBitsPerPixel; Bytes = $capture.FileBytes
             Crc32 = ('{0:X8}' -f $capture.Crc32)
         }
-        if ($Json) { $result | ConvertTo-Json -Depth 4 -Compress } else { $result | Format-List }
-        exit 0
-    }
-
-    if ($Action -eq 'input') {
-        if (($hello.Capabilities -band [uint32]0x00000400) -eq 0) {
-            $exitCategory = 23
-            throw "Agent build '$($hello.BuildId)' does not advertise input support."
+        if ($shaping) {
+            # Map an image point back to the screen for input:
+            #   screenX = RegionX + imageX * RegionWidth / Width (same for Y).
+            if ($hostShapes) {
+                $result.Width = [uint32][Math]::Max(1, [Math]::Floor(($regionW * $scalePercent + 99) / 100))
+                $result.Height = [uint32][Math]::Max(1, [Math]::Floor(($regionH * $scalePercent + 99) / 100))
+            }
+            $result | Add-Member -NotePropertyMembers ([ordered]@{
+                RegionX = $regionX; RegionY = $regionY
+                RegionWidth = $regionW; RegionHeight = $regionH
+                ScalePercent = $scalePercent; Gray = [bool]$Gray
+                ShapedBy = $(if ($hostShapes) { 'host' } else { 'guest' })
+            })
         }
-        if ([string]::IsNullOrWhiteSpace($Sequence)) {
-            $exitCategory = 10
-            throw 'input requires -Sequence, e.g. "move 100,200; click left; type Hello; key ENTER".'
-        }
-        $actions = ConvertTo-V9xInputActions -Sequence $Sequence
-        $payload = New-V9xInputPayload -Actions $actions
-        $bytes = New-V9xFrameBytes -Type 0x0060 -RequestId $requestId -Payload $payload
-        $stream.Write($bytes, 0, $bytes.Length)
-        $frame = Read-V9xOperationFrame -Stream $stream -RequestId $requestId `
-            -ExpectedTypes 0x8060 -GuestErrorExitCode 23
-        $inputResult = ConvertFrom-V9xInputPayload -Payload $frame.Payload
-        $result = [pscustomobject]@{
-            Success = $true; RequestId = $requestId; AgentBuild = $hello.BuildId
-            ActionsPerformed = $inputResult.ActionsPerformed
-            CursorX = $inputResult.CursorX; CursorY = $inputResult.CursorY
-            Endpoint = "${EndpointHost}:$Port"
+        if ($captureAfterInput) {
+            $result | Add-Member -NotePropertyMembers ([ordered]@{
+                ActionsPerformed = $inputResult.ActionsPerformed
+                CursorX = $inputResult.CursorX; CursorY = $inputResult.CursorY
+                SettleMs = $SettleMs
+            })
         }
         if ($Json) { $result | ConvertTo-Json -Depth 4 -Compress } else { $result | Format-List }
         exit 0
@@ -1388,7 +1802,7 @@ try {
         $client = $null
         $legacyPackage = 'C:\V9XPKG'
         function Invoke-V9xLegacyStep([string]$Step, [int]$FailExit, [hashtable]$StepArgs) {
-            $all = $target.Clone()
+            $all = $selfTarget.Clone()
             foreach ($key in $StepArgs.Keys) { $all[$key] = $StepArgs[$key] }
             $output = & $PSCommandPath @all
             $code = $LASTEXITCODE
@@ -1432,7 +1846,7 @@ try {
             throw $exception
         }
         # Best effort: the package copy is only scratch.
-        [void](& $PSCommandPath -Action shell -ShellCommand "DELTREE /Y $legacyPackage" @target)
+        [void](& $PSCommandPath -Action shell -ShellCommand "DELTREE /Y $legacyPackage" @selfTarget)
         $result = [pscustomobject]@{
             Success = $true; RequestId = $requestId; Mode = 'Staged'
             PreviousBuild = $oldBuild; PreviousBootCounter = $oldBootCounter
@@ -1504,6 +1918,136 @@ try {
             Endpoint = "${EndpointHost}:$Port"
         }
         if ($Json) { $result | ConvertTo-Json -Depth 4 -Compress } else { $result | Format-List }
+        exit 0
+    }
+
+    if ($Action -in 'windows', 'wait-window') {
+        if ($Action -eq 'windows') {
+            $windows = @(Get-V9xGuestWindows -Stream $stream -RequestId ([ref]$requestId))
+            if ($Title) { $windows = @($windows | Where-Object { $_.Title -like "*$([Management.Automation.WildcardPattern]::Escape($Title))*" }) }
+            if (-not $Json) {
+                $windows | Format-Table Title, Class, X, Y, Width, Height, Foreground, Minimized, Pid -AutoSize
+                exit 0
+            }
+            $result = [pscustomobject]@{ Success = $true; AgentBuild = $hello.BuildId
+                                         Count = $windows.Count; Windows = $windows }
+        } else {
+            $waited = Wait-V9xGuestWindow -Stream $stream -RequestId ([ref]$requestId) -Title $Title `
+                -WaitSeconds $WaitSeconds -Gone:$Gone
+            $result = [pscustomobject]@{ Success = $true; AgentBuild = $hello.BuildId; Title = $Title
+                                         Window = $waited.Window; WaitedMilliseconds = $waited.WaitedMilliseconds }
+        }
+        if ($Json) { $result | ConvertTo-Json -Depth 4 -Compress } else { $result | Format-List }
+        exit 0
+    }
+
+    if ($Action -eq 'wait-file') {
+        # Plain FILE_STAT polling: works with every agent.
+        $waited = Wait-V9xGuestFile -Stream $stream -RequestId ([ref]$requestId) -Path $RemotePath `
+            -WaitSeconds $WaitSeconds -Gone:$Gone -StableMs $StableMs
+        $result = [pscustomobject]@{
+            Success = $true; AgentBuild = $hello.BuildId; Path = $RemotePath
+            Exists = $waited.Stat.Exists; Size = $waited.Stat.Size
+            WaitedMilliseconds = $waited.WaitedMilliseconds
+        }
+        if ($Json) { $result | ConvertTo-Json -Depth 4 -Compress } else { $result | Format-List }
+        exit 0
+    }
+
+    if ($Action -in @('delete', 'hash', 'cat', 'ps', 'kill', 'reg')) {
+        $toolCapability = switch ($Action) {
+            { $_ -in 'delete', 'hash', 'cat' } { [uint32]0x00040000; break }
+            { $_ -in 'ps', 'kill' } { [uint32]0x00080000; break }
+            default { [uint32]0x00100000 }
+        }
+        if (($hello.Capabilities -band $toolCapability) -eq 0) {
+            $exitCategory = 23
+            throw "Agent build '$($hello.BuildId)' does not support $Action (needs agent 0.13.0+$(if ($Action -in 'ps', 'kill') { ' on Windows 9x or 2000' }))."
+        }
+        $guestExit = switch ($Action) { { $_ -in 'ps', 'kill' } { 45; break } 'reg' { 46; break } default { 40 } }
+        # One request, one answer, on this connection.
+        function Invoke-V9xToolRequest([uint16]$Type, [byte[]]$Payload, [uint16]$Expected) {
+            $frameBytes = New-V9xFrameBytes -Type $Type -RequestId $requestId -Payload $Payload
+            $stream.Write($frameBytes, 0, $frameBytes.Length)
+            $answer = Read-V9xOperationFrame -Stream $stream -RequestId $requestId `
+                -ExpectedTypes $Expected -GuestErrorExitCode $guestExit
+            $script:requestId = [uint32]($requestId + 1)
+            return $answer.Payload
+        }
+        $common = [ordered]@{ Success = $true; RequestId = $requestId; AgentBuild = $hello.BuildId }
+
+        if ($Action -eq 'delete') {
+            $deleted = ConvertFrom-V9xDeletePayload -Payload (Invoke-V9xToolRequest 0x0028 `
+                (New-V9xDeletePayload -Path $RemotePath -Recurse:$Recurse -Force:$Force) 0x8028)
+            $result = Join-V9xResult $common ([ordered]@{
+                Path = $RemotePath; FilesDeleted = $deleted.FilesDeleted
+                DirectoriesDeleted = $deleted.DirectoriesDeleted
+            })
+        } elseif ($Action -eq 'hash') {
+            $hash = ConvertFrom-V9xHashPayload -Payload (Invoke-V9xToolRequest 0x0029 `
+                (New-V9xPathPayload -Path $RemotePath) 0x8029)
+            $result = Join-V9xResult $common ([ordered]@{
+                Path = $RemotePath; Size = $hash.Size; Crc32 = $hash.Crc32; Sha256 = $hash.Sha256
+            })
+            if ($Source) {
+                $local = Get-FileHash -LiteralPath $Source -Algorithm SHA256
+                $result | Add-Member -NotePropertyMembers ([ordered]@{
+                    LocalFile = (Resolve-Path -LiteralPath $Source).Path
+                    LocalSha256 = $local.Hash; Matches = $local.Hash -eq $hash.Sha256
+                })
+            }
+        } elseif ($Action -eq 'cat') {
+            $text = ConvertFrom-V9xReadTextPayload -Payload (Invoke-V9xToolRequest 0x002A `
+                (New-V9xReadTextPayload -Path $RemotePath -Tail $Tail -MaxBytes $MaxBytes -Match $Match) 0x802A)
+            if (-not $Json) {
+                # Plain mode prints the text itself; the counts go to stderr
+                # only when something was left out.
+                [Console]::Out.Write($text.Text)
+                if ($text.Truncated) {
+                    [Console]::Error.WriteLine("[cat: output stopped at -MaxBytes $MaxBytes after $($text.Returned) of $($text.Matched) lines; use -Tail or -Match]")
+                }
+                exit 0
+            }
+            $result = Join-V9xResult $common ([ordered]@{
+                Path = $RemotePath; FileSize = $text.FileSize; Lines = $text.Lines
+                Matched = $text.Matched; Returned = $text.Returned
+                Truncated = $text.Truncated; LongLinesCut = $text.LongLinesCut; Text = $text.Text
+            })
+        } elseif ($Action -in 'ps', 'kill') {
+            $processes = @(ConvertFrom-V9xProcessListPayload -Payload (Invoke-V9xToolRequest 0x0080 ([byte[]]@()) 0x8080))
+            if ($Action -eq 'ps') {
+                if ($Name) { $processes = @($processes | Where-Object { $_.Name -like $Name }) }
+                if (-not $Json) {
+                    $processes | Format-Table @{ n = 'Pid'; e = { '{0:X8}' -f $_.Pid } }, Name, Threads,
+                        Agent, AgentJob, JobRequestId, Path -AutoSize
+                    exit 0
+                }
+                $result = Join-V9xResult $common ([ordered]@{ Count = $processes.Count; Processes = $processes })
+            } else {
+                $victims = @(if ($ProcessId -ne 0) {
+                    $processes | Where-Object { $_.Pid -eq $ProcessId }
+                } else { $processes | Where-Object { $_.Name -like $Name } })
+                if ($victims.Count -ne 1) {
+                    $exitCategory = 45
+                    throw $(if ($victims.Count -eq 0) { "No guest process matches $(if ($ProcessId) { "pid $ProcessId" } else { "'$Name'" })." }
+                            else { "'$Name' matches $($victims.Count) processes ($(($victims | ForEach-Object { $_.Pid }) -join ', ')); kill one by -Pid." })
+                }
+                $payload = [byte[]]([BitConverter]::GetBytes([uint32]$victims[0].Pid) + [BitConverter]::GetBytes([uint32]1))
+                $killed = Invoke-V9xToolRequest 0x0081 $payload 0x8081
+                $result = Join-V9xResult $common ([ordered]@{
+                    Pid = $victims[0].Pid; Name = $victims[0].Name
+                    WasAgentJob = [BitConverter]::ToUInt32($killed, 4) -ne 0
+                    JobRequestId = [BitConverter]::ToUInt32($killed, 4)
+                })
+            }
+        } else {
+            try { $regPayload = New-V9xRegQueryPayload -Key $Key } catch { $exitCategory = 10; throw }
+            $reg = ConvertFrom-V9xRegQueryPayload -Payload (Invoke-V9xToolRequest 0x0090 $regPayload 0x8090)
+            $result = Join-V9xResult $common ([ordered]@{
+                Key = $Key; Subkeys = $reg.Subkeys; Values = $reg.Values; Truncated = $reg.Truncated
+            })
+        }
+        if ($Json) { $result | ConvertTo-Json -Depth 5 -Compress } else { $result | Format-List }
         exit 0
     }
 
@@ -1686,6 +2230,28 @@ try {
         GuiWindow = $complete.GuiWindow
         Detached = $complete.Detached
         Orphaned = $complete.Orphaned
+    }
+    # -WaitForFile: the program (often -Detach'ed) signals completion by
+    # writing a file; wait for it here, on this connection, instead of the
+    # caller sleeping and polling.
+    if ($WaitForFile -and $outcomeExit -eq 0) {
+        $waitRequest = [uint32]($requestId + 1)
+        $waited = Wait-V9xGuestFile -Stream $stream -RequestId ([ref]$waitRequest) -Path $WaitForFile `
+            -WaitSeconds $WaitSeconds -Gone:$Gone -StableMs $StableMs
+        $result | Add-Member -NotePropertyMembers ([ordered]@{
+            WaitForFile = $WaitForFile; WaitedMilliseconds = $waited.WaitedMilliseconds
+            WaitedFileSize = $waited.Stat.Size
+        })
+    }
+    # -WaitForWindow: a GUI program is ready when its window is up.
+    if ($WaitForWindow -and $outcomeExit -eq 0) {
+        $waitRequest = [uint32]($requestId + 101)
+        $waited = Wait-V9xGuestWindow -Stream $stream -RequestId ([ref]$waitRequest) `
+            -Title $WaitForWindow -WaitSeconds $WaitSeconds
+        $result | Add-Member -NotePropertyMembers ([ordered]@{
+            WaitForWindow = $WaitForWindow; Window = $waited.Window
+            WindowWaitedMilliseconds = $waited.WaitedMilliseconds
+        })
     }
     if ($Json) { $result | ConvertTo-Json -Depth 4 -Compress } else { $result | Format-List }
     exit $outcomeExit

@@ -26,7 +26,7 @@ Nothing requires clicking inside the emulator.
 | `ping` | | Liveness; returns uptime and boot counter |
 | `info` | | Agent version, build ID, computer name, screen mode, pending job |
 | `inventory` | | OS build, CPU, memory, drives, display adapter, IPs, BIOS, PnP devices (agent 0.7.0+) |
-| `exec` | `-Application`, `-Arguments`, `-WorkingDirectory`, `-TimeoutSeconds`, `-ExpectedExitCode`, `-ShowWindow`, `-Detach` | Run a Win32 EXE directly, capture stdout/stderr |
+| `exec` | `-Application`, `-Arguments`, `-WorkingDirectory`, `-TimeoutSeconds`, `-ExpectedExitCode`, `-ShowWindow`, `-Detach`, `-WaitForFile`/`-WaitForWindow` | Run a Win32 EXE directly, capture stdout/stderr; then optionally wait for a file or window |
 | `shell` | `-Command`, `-TimeoutSeconds`, `-Detach` | Run through `COMMAND.COM /C` (`CMD.EXE /C` on Windows 2000; built-ins, batch files) |
 | `stat` | `-Path` | Existence, size, attributes |
 | `list` | `-Path` | Directory listing (bounded to 16 KiB) |
@@ -34,22 +34,32 @@ Nothing requires clicking inside the emulator.
 | `put` | `-Source`, `-Destination` | Upload one file, CRC32-verified, transactional |
 | `get` | `-Source`, `-Destination` | Download one file, CRC32-verified |
 | `push-tree` | `-Source`, `-Destination` | Recursive directory upload |
+| `cat` | `-Path`, `-Tail`, `-Match`, `-MaxBytes` | A guest text file printed inline: last N lines, lines containing text, bounded (agent 0.13.0+) |
+| `hash` | `-Path`, optional `-Source` | Size, CRC32, SHA-256 in the guest; with `-Source`, `Matches` against a local file (0.13.0+) |
+| `delete` | `-Path`, `-Recurse`, `-Force` | Delete a file or directory; refuses roots, WINDOWS, SYSTEM, `C:\V9XREMOTE` (0.13.0+) |
+| `ps` | optional `-Name` | Processes; marks the agent and its exec jobs with their request id (0.13.0+) |
+| `kill` | `-Pid` or `-Name` | Terminate a process (e.g. a stuck exec job); refuses the agent and Windows core processes (0.13.0+) |
+| `reg` | `-Key HKLM\...` | Subkeys and values of one registry key, read-only (0.13.0+) |
+| `wait-file` | `-Path`, `-WaitSeconds`, `-Gone`, `-StableMs` | Wait until a guest file exists (or is gone, or stops growing); any agent |
+| `windows` | optional `-Title` | Visible top-level windows: title, class, position, size, pid (0.13.0+) |
+| `wait-window` | `-Title`, `-WaitSeconds`, `-Gone` | Wait until a window whose title contains the text is shown (or closed) (0.13.0+) |
 | `download` | `-Url`, `-Destination` | Guest fetches an `http://` URL to a guest path (http only, CRC32-verified) |
 | `update` | `-Source`, `-WaitSeconds` | Upgrade the agent from an install-package folder: hot, no reboot; agents before 0.6.0 get the staged route with one reboot (`Mode = Staged`, v9xctl 0.9.1+) |
 | `reboot` | `-JobId`, `-WaitSeconds` | Reboot with proof (see below) |
 | `reset` | `-JobId`, `-WaitSeconds` | Win9x guest whose restart hangs: flush, hardware reset (CF9h), same proof as `reboot` (agent 0.10.0+) |
 | `shutdown` | `-JobId` | Controlled shutdown |
 | `wait-desktop` | `-WaitSeconds` | Block until Explorer's desktop is ready |
-| `screenshot` | `-OutFile` (alias of `-Destination`), `-Path` | Guest screen capture; saved as PNG/JPEG/GIF/TIFF/BMP by the output file extension |
-| `input` | `-Sequence` | Inject mouse/keyboard: move, click, drag, wheel, key/hotkey, type, delay |
+| `screenshot` | `-OutFile` (alias of `-Destination`), `-Path`, `-Window <title>` or `-Region x,y,w,h`, `-Scale`, `-Gray` | Guest screen capture; saved as PNG/JPEG/GIF/TIFF/BMP by the output file extension; window/region/scale/gray keep it small |
+| `input` | `-Sequence`, optional `-OutFile`/`-SettleMs` (+ `-Region`/`-Scale`/`-Gray`) | Inject mouse/keyboard: move, click, drag, wheel, key/hotkey, type, delay; with `-OutFile`, settle and screenshot in the same call |
 | `vnc` | `status`, `start` or `stop` | The guest's VNC server for a person (only where SETUP.EXE enabled it; agent package 0.11.0+) |
 
 Any verb but `discover` and `vnc` also takes `-Relay M-XXXXXX` to drive a
 remote-help machine (an owner's real hardware, lent over the Internet)
 through the update server instead of `-Host`/`-Port`; MCP tools take
-`relay`. Those machines belong to other people: chat first (`v9x_chat`), stay
-within what was agreed, and expect the owner to pause you. See
-[docs/remote-help.md](docs/remote-help.md).
+`relay`. Turning remote help on is the owner's consent to testing, so do not
+wait for a reply before starting. A short `v9x_chat` heads-up that you are
+starting is welcome. Those machines still belong to other people: expect the
+owner to pause you. See [docs/remote-help.md](docs/remote-help.md).
 
 ## Host scripts beyond v9xctl
 
@@ -82,10 +92,31 @@ agent, keep using `screenshot` and `input`.
 | 42 | Reboot reconnect proof failed |
 | 43 | Screenshot capture failure |
 | 44 | Desktop-ready timeout |
+| 45 | `ps`/`kill` failure: no such process, ambiguous `-Name`, or a refused target |
+| 46 | `reg` failure (key not found) |
+| 47 | `wait-file` / `-WaitForFile` deadline passed |
+| 48 | `wait-window` / `-WaitForWindow` / `screenshot -Window`: no such window, or the deadline passed |
 
-Treat 20 as "the VM is off, still booting, or the forward is missing"; retry
-with backoff before concluding failure. Treat everything else as
-deterministic.
+Treat 20 as "the VM is off, still booting, or the forward is missing". Do not
+retry it in a loop of your own: add `-WaitForAgent <seconds>` and v9xctl
+retries the connection with backoff (a connection dropped before HELLO is
+retried twice even without it). Treat everything else as deterministic.
+
+## Never sleep and poll
+
+Every wait has a verb or option that returns the moment the condition holds.
+A `Start-Sleep` between v9xctl calls is a bug: it is either too short (flaky)
+or too long (slow), and each extra call costs a connection.
+
+| You want to wait for... | Use |
+|---|---|
+| the agent to answer (guest booting) | `ping -WaitSeconds 120`, or `-WaitForAgent N` on any verb |
+| a reboot or reset to finish | `reboot`/`reset -JobId <token> -WaitSeconds N` (proves it; no BootCounter loops) |
+| the desktop after boot | `wait-desktop -WaitSeconds N` (also waits for the agent) |
+| a program's window, then to look at it | `exec -Detach -WaitForWindow <title>`, then `screenshot -Window <title>` |
+| a dialog to close | `wait-window -Title <text> -Gone` |
+| a program to write its result file | `exec ... -WaitForFile <path>` or `wait-file -Path <path> [-StableMs 1000]` |
+| a GUI step to repaint | `input -Sequence ... -OutFile shot.png` (`-SettleMs`, default 500) |
 
 ## The golden loop
 
@@ -133,7 +164,16 @@ A fully annotated version with sample outputs is in
 - The guest serves up to four connections and four concurrent executions;
   `ping` and cancel stay responsive during a running execution. Reboot,
   shutdown, screenshot and update are refused with BUSY while any execution
-  runs.
+  runs. When that BUSY is a job you no longer want, `ps` shows it
+  (`AgentJob`, `JobRequestId`) and `kill -Pid` ends it; its `exec` then
+  completes normally.
+- Use the verb, not a workaround (agent 0.13.0+): `cat -Tail 40 -Match error`
+  rather than `get` + reading the file, `hash -Source` rather than a
+  download to verify a push, `delete` rather than `shell DEL`, `reg` rather
+  than `REGEDIT /E` + `get`. `stat`, `get`, `hash` and `cat` flush Windows
+  9x's INI write cache first, so an INI another program just wrote with
+  `WritePrivateProfileString` reads as it is now; never use `shell TYPE` for
+  that (it starts a DOS VM).
 
 ## Failure handling rules
 
@@ -157,7 +197,19 @@ A fully annotated version with sample outputs is in
 - Driving the GUI: prefer `exec`/`shell` when a program can be launched
   headless. Use `input` (mouse/keyboard) when you must click a dialog, drive
   an installer, or reach something only the UI exposes. Screenshot first to
-  read coordinates, act, then screenshot again to confirm. Input goes to the
+  read coordinates, then act and confirm in one call: `input -OutFile
+  after.png` (MCP: `screenshot: true` on any input tool) settles for
+  `-SettleMs`/`settle_ms` (default 500) and captures. Do not write your own
+  input-wait-screenshot helper. Input goes to the
+  focused window (see below).
+- Keep screenshots small: an image costs tokens in proportion to its pixels,
+  and a full 1024x768 frame is the most expensive thing you can look at. Add
+  `-Region x,y,w,h` to look at one dialog, `-Scale 0.5` when layout is enough,
+  `-Gray` to read text (MCP: `region`, `scale`, `gray`). Do not crop or
+  convert with your own System.Drawing code. With a region or scale, map an
+  image point back with `screenX = RegionX + imageX * RegionWidth / Width`.
+  Agents 0.13.0+ shape and losslessly pack the image before sending it, which
+  is what makes screenshots over `-Relay` fast. Input goes to the
   focused window, so bring it forward (click its title bar) before typing, and
   avoid `ALT+F4` on the bare desktop (it raises the Shut Down dialog).
 - A GUI program that only exits from its paint path needs a visible desktop;

@@ -1,6 +1,7 @@
 #include "agent.h"
 #include "v9xremote/crc32.h"
 #include "v9xremote/protocol.h"
+#include "v9xremote/shotxf.h"
 #include "v9xremote/status.h"
 
 #define V9X_SCREEN_MAX_BYTES 16777216ul
@@ -10,14 +11,27 @@ static const char v9x_screen_helper[] = "C:\\V9XREMOTE\\V9XSHOT.EXE";
 static const char v9x_screen_capture[] = "C:\\V9XREMOTE\\TEMP\\CAPTURE.$$$";
 static const char v9x_screen_metadata[] = "C:\\V9XREMOTE\\TEMP\\CAPTURE.DAT";
 
+/* The payload is the path string, optionally followed by a V9xShotOptions
+   block (V9X_CAP_SCREENSHOT_OPTIONS). Without one, options are all zero:
+   the capture goes out untouched, as before 0.13.0. */
 static int v9x_screen_path(const unsigned char *payload, unsigned long length,
-                           char *path)
+                           char *path, V9xShotOptions *options)
 {
     unsigned long path_length;
     unsigned long index;
+    options->flags = 0ul;
+    options->x = 0ul;
+    options->y = 0ul;
+    options->width = 0ul;
+    options->height = 0ul;
+    options->scale_percent = 0ul;
     if (length < 3ul) return 0;
     path_length = (unsigned long)v9x_read_u16(payload);
-    if (path_length == 0ul || path_length > 259ul || path_length + 2ul != length) {
+    if (path_length == 0ul || path_length > 259ul) return 0;
+    if (path_length + 2ul + V9X_SHOT_OPTIONS_SIZE == length) {
+        if (!v9x_shot_options_decode(payload + 2ul + path_length,
+                                     V9X_SHOT_OPTIONS_SIZE, options)) return 0;
+    } else if (path_length + 2ul != length) {
         return 0;
     }
     for (index = 0ul; index < path_length; ++index) {
@@ -165,6 +179,10 @@ int v9x_capture_screenshot(V9xConnection *conn, unsigned long request_id,
     unsigned char metadata[20];
     unsigned char *image = 0;
     HGLOBAL allocation = 0;
+    HGLOBAL shaped_allocation = 0;
+    HGLOBAL work_allocation = 0;
+    V9xShotOptions options;
+    v9x_u16 shaped_status = V9X_SHOTXF_OK;
     HANDLE file = INVALID_HANDLE_VALUE;
     DWORD width;
     DWORD height;
@@ -177,7 +195,7 @@ int v9x_capture_screenshot(V9xConnection *conn, unsigned long request_id,
     int success = 0;
     int locked = 0;
 
-    if (!v9x_screen_path(payload, length, path)) {
+    if (!v9x_screen_path(payload, length, path, &options)) {
         return v9x_screen_error(conn, request_id, V9X_STATUS_INVALID_PAYLOAD,
                                 ERROR_INVALID_PARAMETER,
                                 "invalid screenshot path");
@@ -242,6 +260,41 @@ int v9x_capture_screenshot(V9xConnection *conn, unsigned long request_id,
         native_error = ERROR_INVALID_DATA; goto cleanup;
     }
 
+    if (v9x_shot_options_active(&options)) {
+        /* Crop/scale/repack before anything is written or sent. The plan
+           fixes the output size, and with it both buffer sizes. */
+        v9x_u32 region_x, region_y, region_width, region_height;
+        v9x_u32 output_width, output_height, output_bits, output_bytes;
+        v9x_u32 output_capacity;
+        v9x_u32 work_capacity;
+        shaped_status = v9x_shotxf_plan(&options, width, height,
+                                        &region_x, &region_y,
+                                        &region_width, &region_height,
+                                        &output_width, &output_height);
+        if (shaped_status != V9X_SHOTXF_OK) {
+            native_error = ERROR_INVALID_PARAMETER; goto cleanup;
+        }
+        output_capacity = v9x_shotxf_output_capacity(output_width, output_height);
+        work_capacity = v9x_shotxf_work_capacity(output_width, output_height);
+        shaped_allocation = GlobalAlloc(GMEM_FIXED, output_capacity);
+        work_allocation = GlobalAlloc(GMEM_FIXED, work_capacity);
+        if (shaped_allocation == 0 || work_allocation == 0) {
+            native_error = ERROR_NOT_ENOUGH_MEMORY; goto cleanup;
+        }
+        shaped_status = v9x_shotxf_apply(image, file_bytes, &options,
+                                         (v9x_u8 *)shaped_allocation, output_capacity,
+                                         (v9x_u8 *)work_allocation, work_capacity,
+                                         &output_bytes, &output_width,
+                                         &output_height, &output_bits);
+        if (shaped_status != V9X_SHOTXF_OK) {
+            native_error = ERROR_INVALID_DATA; goto cleanup;
+        }
+        image = (unsigned char *)shaped_allocation;
+        file_bytes = output_bytes;
+        width = output_width;
+        height = output_height;
+    }
+
     file = CreateFileA(path, GENERIC_WRITE, 0, 0, CREATE_ALWAYS,
                        FILE_ATTRIBUTE_NORMAL, 0);
     if (file == INVALID_HANDLE_VALUE) { native_error = GetLastError(); goto cleanup; }
@@ -268,9 +321,17 @@ cleanup:
     if (file != INVALID_HANDLE_VALUE) CloseHandle(file);
     if (!success) (void)DeleteFileA(path);
     if (allocation != 0) (void)GlobalFree(allocation);
+    if (shaped_allocation != 0) (void)GlobalFree(shaped_allocation);
+    if (work_allocation != 0) (void)GlobalFree(work_allocation);
     (void)DeleteFileA(v9x_screen_capture);
     (void)DeleteFileA(v9x_screen_metadata);
     if (locked) LeaveCriticalSection(&conn->machine->screenshot_lock);
+    if (!success && shaped_status == V9X_SHOTXF_BAD_OPTIONS) {
+        return v9x_screen_error(conn, request_id, V9X_STATUS_INVALID_PAYLOAD,
+                                ERROR_INVALID_PARAMETER,
+                                "invalid screenshot options (unknown flag, "
+                                "scale over 100 or region off screen)");
+    }
     if (!success) {
         return v9x_screen_error(conn, request_id, V9X_STATUS_IO_FAILED,
                                 native_error, "screenshot helper failed");

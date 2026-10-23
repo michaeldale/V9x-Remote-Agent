@@ -77,6 +77,17 @@ When output alone is not enough, look at the screen:
 The BMP is CRC-verified like any download. Via the MCP server the same
 operation returns a PNG image block the model can see directly.
 
+An image costs the model tokens in proportion to its pixels, so look at as
+little as answers the question: `-Region x,y,w,h` for one dialog, `-Scale 0.5`
+for layout, `-Gray` for text (MCP: `region`, `scale`, `gray`):
+
+```powershell
+.\scripts\v9xctl.ps1 screenshot -OutFile .\dialog.png -Region 200,150,400,300 -Json
+```
+
+Use a full-resolution, full-colour frame only when the pixels themselves are
+under test (driver output, visual regressions).
+
 ## Proven reboots
 
 Driver and system-file changes need a reboot, and "the VM seems back" is not

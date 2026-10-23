@@ -120,6 +120,9 @@ $server = Start-Job -ArgumentList $port, $protocolScript, $resumeToken -ScriptBl
             if ($screen.Type -ne 0x0050) { throw 'Expected SCREENSHOT_REQUEST.' }
             $pathOffset = 0
             $guestPath = Read-V9xString -Bytes $screen.Payload -Offset ([ref]$pathOffset)
+            if ($pathOffset -ne $screen.Payload.Length) {
+                throw 'Screenshot options sent to an agent without V9X_CAP_SCREENSHOT_OPTIONS.'
+            }
             $screenResponse = [Collections.Generic.List[byte]]::new()
             $screenResponse.AddRange([BitConverter]::GetBytes([uint32]800))
             $screenResponse.AddRange([BitConverter]::GetBytes([uint32]600))
@@ -133,6 +136,47 @@ $server = Start-Job -ArgumentList $port, $protocolScript, $resumeToken -ScriptBl
             if ($read.Type -ne 0x0026) { throw 'Expected screenshot FILE_OPEN_READ.' }
             $chunk = [byte[]]::new($bitmap.Length + 4)
             [Array]::Copy([BitConverter]::GetBytes([uint32]0), 0, $chunk, 0, 4)
+            [Array]::Copy($bitmap, 0, $chunk, 4, $bitmap.Length)
+            $frame = New-V9xFrameBytes -Type 0x9026 -RequestId $read.RequestId -Payload $chunk
+            $stream.Write($frame, 0, $frame.Length)
+            $complete = [byte[]]::new(8)
+            [Array]::Copy([BitConverter]::GetBytes([uint32]$bitmap.Length), 0, $complete, 0, 4)
+            [Array]::Copy([BitConverter]::GetBytes($crc), 0, $complete, 4, 4)
+            $frame = New-V9xFrameBytes -Type 0x8026 -RequestId $read.RequestId -Payload $complete
+            $stream.Write($frame, 0, $frame.Length)
+            Start-Sleep -Milliseconds 500
+        } finally { $client.Dispose() }
+
+        # screenshot -Region/-Scale/-Gray against an agent with
+        # V9X_CAP_SCREENSHOT_OPTIONS: the options block follows the path and
+        # the guest's (already shaped) image is saved as is.
+        $client = $listener.AcceptTcpClient()
+        try {
+            $stream = $client.GetStream()
+            $hello = Read-V9xFrame -Stream $stream
+            Send-Hello $stream $hello.RequestId 21 $ResumeToken $true (1023 -bor 0x20000)
+            $screen = Read-V9xFrame -Stream $stream
+            if ($screen.Type -ne 0x0050) { throw 'Expected shaped SCREENSHOT_REQUEST.' }
+            $pathOffset = 0
+            $guestPath = Read-V9xString -Bytes $screen.Payload -Offset ([ref]$pathOffset)
+            if ($screen.Payload.Length - $pathOffset -ne 24) { throw 'Expected a 24-byte options block.' }
+            $options = @(0..5 | ForEach-Object { [BitConverter]::ToUInt32($screen.Payload, $pathOffset + 4 * $_) })
+            # flags compact|gray, region 790,20,100,50 clipped to 10 wide, 50 percent.
+            if (($options -join ',') -ne '3,790,20,10,50,50') {
+                throw "Unexpected screenshot options $($options -join ',')."
+            }
+            $screenResponse = [Collections.Generic.List[byte]]::new()
+            $screenResponse.AddRange([BitConverter]::GetBytes([uint32]5))
+            $screenResponse.AddRange([BitConverter]::GetBytes([uint32]25))
+            $screenResponse.AddRange([BitConverter]::GetBytes([uint32]16))
+            $screenResponse.AddRange([BitConverter]::GetBytes([uint32]$bitmap.Length))
+            $screenResponse.AddRange([BitConverter]::GetBytes($crc))
+            Add-V9xString -Bytes $screenResponse -Value $guestPath
+            $frame = New-V9xFrameBytes -Type 0x8050 -RequestId $screen.RequestId -Payload $screenResponse.ToArray()
+            $stream.Write($frame, 0, $frame.Length)
+            $read = Read-V9xFrame -Stream $stream
+            if ($read.Type -ne 0x0026) { throw 'Expected shaped screenshot FILE_OPEN_READ.' }
+            $chunk = [byte[]]::new($bitmap.Length + 4)
             [Array]::Copy($bitmap, 0, $chunk, 4, $bitmap.Length)
             $frame = New-V9xFrameBytes -Type 0x9026 -RequestId $read.RequestId -Payload $chunk
             $stream.Write($frame, 0, $frame.Length)
@@ -226,6 +270,13 @@ try {
     if ($screenBytes.Length -ne 64 -or $screenBytes[0] -ne [byte][char]'B' -or
         $screenBytes[1] -ne [byte][char]'M') {
         throw 'Screenshot download bytes mismatch.'
+    }
+    $shaped = Invoke-FixtureClient @('screenshot','-Destination',$screenshotPath,
+        '-Region','790,20,100,50','-Scale','0.5','-Gray')
+    if (-not $shaped.Success -or $shaped.ShapedBy -ne 'guest' -or $shaped.Width -ne 5 -or
+        $shaped.RegionX -ne 790 -or $shaped.RegionWidth -ne 10 -or $shaped.RegionHeight -ne 50 -or
+        $shaped.ScalePercent -ne 50 -or -not $shaped.Gray) {
+        throw "Shaped screenshot result mismatch: $($shaped | ConvertTo-Json -Compress)"
     }
     $savedPreference = $ErrorActionPreference
     $ErrorActionPreference = 'Continue'

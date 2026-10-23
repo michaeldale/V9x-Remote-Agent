@@ -38,6 +38,27 @@ try {
         if ($announce -ne $fixture) {
             throw 'tests\host\mdns-announce.hex no longer matches the C mDNS encoder; regenerate it with test_protocol.exe dump-mdns.'
         }
+        # READ_TEXT line filtering (tail, match, bounded output).
+        & $compilerDriver '-bt=nt' '-zq' '-wx' '-s' '-fe=test_textscan.exe' `
+            (Join-Path $repoRoot 'tests\host\test_textscan.c') `
+            (Join-Path $repoRoot 'src\common\textscan.c')
+        if ($LASTEXITCODE -ne 0) { throw 'Open Watcom failed to build the text scan tests.' }
+        & (Join-Path $outputDir 'test_textscan.exe')
+        if ($LASTEXITCODE -ne 0) { throw "Text scan tests failed with exit code $LASTEXITCODE." }
+        # Screenshot shaping (crop, scale, exact palette, RLE8). Its fixtures
+        # are decoded by System.Drawing here and by the MCP's BMP reader in
+        # mcp\test_v9x_mcp.py, so all three readers agree on the format.
+        & $compilerDriver '-bt=nt' '-zq' '-wx' '-s' '-fe=test_shotxf.exe' `
+            (Join-Path $repoRoot 'tests\host\test_shotxf.c') `
+            (Join-Path $repoRoot 'src\common\shotxf.c')
+        if ($LASTEXITCODE -ne 0) { throw 'Open Watcom failed to build the screenshot shaping tests.' }
+        & (Join-Path $outputDir 'test_shotxf.exe')
+        if ($LASTEXITCODE -ne 0) { throw "Screenshot shaping tests failed with exit code $LASTEXITCODE." }
+        $shotFixtures = Join-Path $outputDir 'shotxf'
+        New-Item -ItemType Directory -Force -Path $shotFixtures | Out-Null
+        & (Join-Path $outputDir 'test_shotxf.exe') 'dump' $shotFixtures
+        if ($LASTEXITCODE -ne 0) { throw 'test_shotxf.exe dump failed.' }
+        & (Join-Path $repoRoot 'tests\host\Test-ShotXf.ps1') -FixtureDir $shotFixtures
         # Update and remote-help modules (not named test_update.exe: Windows'
         # installer detection wants elevation for any exe called *update*):
         # Ed25519/SHA-256/SHA-512, inflate
@@ -99,4 +120,5 @@ Write-Output 'PASS: native C frame, bounds, and encoding tests'
 & (Join-Path $repoRoot 'tests\host\Test-V9xCtl.ps1')
 & (Join-Path $repoRoot 'tests\host\Test-V9xFileCtl.ps1')
 & (Join-Path $repoRoot 'tests\host\Test-V9xM4Ctl.ps1')
+& (Join-Path $repoRoot 'tests\host\Test-V9xToolsCtl.ps1')
 & (Join-Path $repoRoot 'tests\host\Test-V9xDiscovery.ps1')

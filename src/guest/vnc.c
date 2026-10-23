@@ -54,6 +54,9 @@ static const char vnc_config_path[] = "C:\\V9XREMOTE\\AGENT.INI";
 static const char vnc_log_path[] = "C:\\V9XREMOTE\\VNC.LOG";
 static const char vnc_stop_name[] = "V9XVNC.STOP";
 static const char vnc_mutex_name[] = "V9XVNC.INSTANCE";
+/* Exists only while a viewer is connected; the agent's tray icon turns
+   yellow while it does (tray.c). */
+static const char vnc_session_name[] = "V9XVNC.SESSION";
 static const char vnc_stall_path[] = "C:\\V9XREMOTE\\TEMP\\VNCSTALL.DAT";
 
 /* GetCursorInfo is Windows 98 and later; loaded at run time so the server
@@ -2290,6 +2293,7 @@ static void vnc_serve(DWORD poll_ms)
     DWORD last_capture = 0ul;
     int ready;
     LONG captured;
+    HANDLE session;
     vnc_default_format();
     vnc_use_hextile = 0;
     vnc_use_desktop_size = 0;
@@ -2320,6 +2324,7 @@ static void vnc_serve(DWORD poll_ms)
         return;
     }
     vnc_log("session-start", 0ul);
+    session = CreateEventA(0, TRUE, TRUE, vnc_session_name);
     vnc_perf_reset();
     while (!vnc_stop_requested()) {
         DWORD wait = 500ul;
@@ -2396,6 +2401,7 @@ static void vnc_serve(DWORD poll_ms)
     vnc_clip_session = 0l;
     vnc_release_all();
     vnc_perf_report();
+    if (session != 0) CloseHandle(session);
     vnc_log("session-end", 0ul);
 }
 

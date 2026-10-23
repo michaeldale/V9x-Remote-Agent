@@ -237,6 +237,78 @@ may intentionally leave part/backup evidence for recovery.
 `FILE_READ_COMPLETE` (`0x8026`) with total size and CRC32. The host must verify
 both before publishing its local temporary file.
 
+## File tools, processes and registry (agent 0.13.0+)
+
+Each is one request and one response; failures are `ERROR_RESPONSE` with a
+status and the Win32 error. Hosts check the capability first: older agents
+answer `UNSUPPORTED_OPERATION`.
+
+Capability `V9X_CAP_FILE_TOOLS` (`0x00040000`):
+
+- `FILE_DELETE_REQUEST` (`0x0028`): u32 flags (`0x1` recursive, `0x2` force:
+  clear read-only/hidden/system first), path. `FILE_DELETE_RESPONSE`
+  (`0x8028`): u32 files deleted, u32 directories deleted. A directory without
+  the recursive flag is removed only when empty. The guest resolves the full
+  path and refuses (`ACCESS_DENIED`) a drive or UNC root, the Windows and
+  system directories, `C:\V9XREMOTE`, and any directory containing one of
+  them; single files inside them may be deleted. A recursive delete is not
+  transactional: on failure the error detail says whether entries were
+  already removed.
+- `FILE_HASH_REQUEST` (`0x0029`): path. `FILE_HASH_RESPONSE` (`0x8029`): u32
+  size, u32 CRC32, 32-byte SHA-256.
+- `FILE_READ_TEXT_REQUEST` (`0x002A`): u32 tail (0 = all lines), u32 maximum
+  text bytes (0 or more than 65512 = 65512), match string (may be empty; an
+  ASCII substring, case-insensitive, at most 128 bytes), path.
+  `FILE_READ_TEXT_RESPONSE` (`0x802A`): u32 file size, u32 lines, u32 matching
+  lines, u32 lines returned, u32 flags (`0x1` output full, later lines left
+  out; `0x2` a line longer than 1024 bytes was cut), u32 text length, then
+  the text: the matching lines (all, or the last `tail`), each ending in LF,
+  CRs before LF removed, bytes as stored (ANSI). The guest reads the file
+  twice when a tail is asked for. `src\common\textscan.c` holds the filter.
+
+`FILE_STAT`, `FILE_OPEN_READ` and the two reads above first call
+`WritePrivateProfileStringA(NULL, NULL, NULL, path)` on Windows 9x. Windows
+9x keeps the last INI written through the profile API in memory and writes it
+to disk lazily, so a raw read could return stale or uninitialised bytes (a
+17-byte garbage file for a five-key INI, measured on 98 SE) until something,
+such as starting a DOS VM, flushed it. The call flushes only that file and is
+harmless for anything else.
+
+Capability `V9X_CAP_PROCESS` (`0x00080000`; withheld where toolhelp is
+missing, i.e. NT 4):
+
+- `PROCESS_LIST_REQUEST` (`0x0080`, empty). `PROCESS_LIST_RESPONSE`
+  (`0x8080`): u32 count, then per process u32 pid, u32 parent pid, u32
+  threads, u32 flags (`0x1` started by an EXEC request, `0x2` the agent), u32
+  EXEC request id (0 if none), image string (full path on 9x, name on NT;
+  ANSI). Windows 9x pids are large obfuscated values; treat them as opaque.
+- `PROCESS_KILL_REQUEST` (`0x0081`): u32 pid, u32 exit code.
+  `PROCESS_KILL_RESPONSE` (`0x8081`): u32 pid, u32 EXEC request id (0 if the
+  process was not an agent job). Refused: the agent itself and processes
+  Windows cannot run without (`KERNEL32.DLL`, `MSGSRV32.EXE`, `MPREXE.EXE`,
+  `MMTASK.TSK`; on NT `System`, `SMSS`, `CSRSS`, `WINLOGON`, `SERVICES`,
+  `LSASS`). Killing an exec job's process makes that job complete as usual.
+
+Capability `V9X_CAP_REGISTRY` (`0x00100000`):
+
+- `REG_QUERY_REQUEST` (`0x0090`): u32 hive (`0x80000000` HKCR, `...01` HKCU,
+  `...02` HKLM, `...03` HKU, `...05` HKCC, `...06` HKDD), subkey string (empty
+  for the hive itself). `REG_QUERY_RESPONSE` (`0x8090`): u32 subkey count, u32
+  value count, u32 flags (`0x1` truncated: the 16 KiB answer filled), the
+  subkey names, then per value: name string (empty = default value), u32
+  type, u32 data length, data. Read-only; there is no registry write.
+
+Capability `V9X_CAP_WINDOWS` (`0x00200000`):
+
+- `WINDOW_LIST_REQUEST` (`0x0062`, empty). `WINDOW_LIST_RESPONSE` (`0x8062`):
+  u32 count, u32 truncated (the 16 KiB answer filled), then per visible
+  top-level window: u32 handle, u32 owning pid, u32 flags (`0x1` foreground,
+  `0x2` minimized), i32 left, top, right, bottom (screen pixels), class
+  string, title string (ANSI; up to 159 bytes). Titles are read with
+  `WM_GETTEXT` through `SendMessageTimeout` (500 ms, abort if hung), so a hung
+  program yields an empty title instead of hanging the agent. Hosts poll it
+  for `wait-window`, `exec -WaitForWindow` and `screenshot -Window`.
+
 ## HTTP download
 
 `DOWNLOAD_REQUEST` (`0x0027`, capability `V9X_CAP_HTTP_DOWNLOAD` `0x1000`) carries
@@ -304,6 +376,25 @@ it to disk, and returns `SCREENSHOT_RESPONSE` (`0x8050`) with width, height,
 source bits-per-pixel, file size, CRC32, and guest path. The host then downloads
 that BMP through the normal file-read protocol and verifies both metadata sets.
 Capture is bounded to 4096 by 4096 pixels and 16 MiB of pixel storage.
+
+From agent 0.13.0 (capability `V9X_CAP_SCREENSHOT_OPTIONS` `0x00020000`) the
+path may be followed by a 24-byte options block, six u32s: flags, region x,
+y, width, height, scale percent. Flags: `0x1` compact (if the shaped image
+has at most 256 distinct colours, store it as 8-bit with an exact palette;
+lossless), `0x2` gray (8-bit greyscale, luma `(77R + 150G + 29B + 128) >> 8`;
+lossy). Any 8-bit result is `BI_RLE8` when that is smaller than the raw rows.
+A region with width or height 0 means the whole screen; otherwise it is
+clipped to the screen, and one that starts off screen is refused with
+`INVALID_PAYLOAD`, as are unknown flags and a scale over 100. Scale 0 means
+100; each output pixel is the rounded mean of the source box it covers, and
+the output is `ceil(region * scale / 100)` (at least 1) in each direction.
+The response is unchanged in layout but describes the shaped file: width and
+height are the output's, file size and CRC are of the file written. Source
+bits-per-pixel is still the screen's. Hosts send the block only when the
+capability is present (older agents reject trailing bytes), and agents
+shape only when it is present, so every combination works. The transform is
+`src\common\shotxf.c`; `tests\host\test_shotxf.c` dumps fixtures that the
+PowerShell (System.Drawing) and Python readers are tested against.
 
 ## Input injection
 

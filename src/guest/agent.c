@@ -84,6 +84,7 @@ unsigned long v9x_capabilities(const V9xAgentState *machine)
     unsigned long caps = V9X_CAPABILITIES;
     if (!machine->allow_dos_vm && !v9x_platform_is_nt()) caps &= ~V9X_CAP_EXEC_SHELL;
     if (v9x_platform_is_nt()) caps &= ~V9X_CAP_HARD_RESET;
+    if (!v9x_process_supported()) caps &= ~V9X_CAP_PROCESS;
     return caps;
 }
 
@@ -260,7 +261,6 @@ void v9x_agent_run(void)
     state.activity = 0l;
     state.tray_window = 0;
     state.tray_icon = 0;
-    state.tray_icon_busy = 0;
     state.remote_on = 0;
     state.remote_paused = 0l;
     state.remote_status = V9X_REMOTE_OFF;

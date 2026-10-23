@@ -39,6 +39,30 @@
 #define V9X_MSG_DOWNLOAD_REQUEST     0x0027u
 #define V9X_MSG_DOWNLOAD_PROGRESS    0x9027u
 #define V9X_MSG_DOWNLOAD_COMPLETE    0x8027u
+/* File tools (V9X_CAP_FILE_TOOLS, agent 0.13.0+). */
+#define V9X_MSG_FILE_DELETE_REQUEST  0x0028u
+#define V9X_MSG_FILE_DELETE_RESPONSE 0x8028u
+#define V9X_MSG_FILE_HASH_REQUEST    0x0029u
+#define V9X_MSG_FILE_HASH_RESPONSE   0x8029u
+#define V9X_MSG_FILE_READ_TEXT_REQUEST  0x002Au
+#define V9X_MSG_FILE_READ_TEXT_RESPONSE 0x802Au
+#define V9X_DELETE_RECURSIVE 0x00000001ul
+#define V9X_DELETE_FORCE     0x00000002ul  /* clear read-only/hidden/system first */
+/* Processes (V9X_CAP_PROCESS) and registry (V9X_CAP_REGISTRY), 0.13.0+. */
+#define V9X_MSG_PROCESS_LIST_REQUEST  0x0080u
+#define V9X_MSG_PROCESS_LIST_RESPONSE 0x8080u
+#define V9X_MSG_PROCESS_KILL_REQUEST  0x0081u
+#define V9X_MSG_PROCESS_KILL_RESPONSE 0x8081u
+#define V9X_PROCESS_AGENT_JOB 0x00000001ul  /* started by an EXEC request */
+#define V9X_PROCESS_AGENT     0x00000002ul  /* the agent itself */
+/* Top-level windows (V9X_CAP_WINDOWS, 0.13.0+). */
+#define V9X_MSG_WINDOW_LIST_REQUEST  0x0062u
+#define V9X_MSG_WINDOW_LIST_RESPONSE 0x8062u
+#define V9X_WINDOW_FOREGROUND 0x00000001ul
+#define V9X_WINDOW_MINIMIZED  0x00000002ul
+#define V9X_MSG_REG_QUERY_REQUEST  0x0090u
+#define V9X_MSG_REG_QUERY_RESPONSE 0x8090u
+#define V9X_REG_TRUNCATED 0x00000001ul
 #define V9X_MSG_INFO_REQUEST   0x0030u
 #define V9X_MSG_INFO_RESPONSE  0x8030u
 #define V9X_MSG_REBOOT_REQUEST   0x0040u
@@ -81,6 +105,22 @@
 /* RESET_REQUEST (agent 0.10.0+): flush, then a hardware reset without
    Windows' real-mode restart path. Win9x only; withheld on NT. */
 #define V9X_CAP_HARD_RESET     0x00010000ul
+/* SCREENSHOT_REQUEST accepts a V9xShotOptions block after the path (agent
+   0.13.0+): region, scale, lossless 8-bit/RLE8 or greyscale (shotxf.h).
+   Older agents reject the trailing bytes, so hosts check this bit first. */
+#define V9X_CAP_SCREENSHOT_OPTIONS 0x00020000ul
+/* FILE_DELETE, FILE_HASH and FILE_READ_TEXT (0.13.0+); reads also flush
+   Windows 9x's INI write cache first, so a file written with
+   WritePrivateProfileString is read as it is now, not as last flushed. */
+#define V9X_CAP_FILE_TOOLS     0x00040000ul
+/* PROCESS_LIST and PROCESS_KILL (0.13.0+). */
+#define V9X_CAP_PROCESS        0x00080000ul
+/* REG_QUERY, read-only (0.13.0+). */
+#define V9X_CAP_REGISTRY       0x00100000ul
+/* WINDOW_LIST: visible top-level windows with title, class, rect, pid
+   (0.13.0+); what wait-window, exec -WaitForWindow and screenshot -Window
+   poll instead of a caller's fixed sleep. */
+#define V9X_CAP_WINDOWS        0x00200000ul
 #define V9X_INFO_FLAG_EXTENDED 0x00000001ul
 #define V9X_CAPABILITIES (V9X_CAP_INFO | V9X_CAP_PING | \
                           V9X_CAP_EXEC_DIRECT | V9X_CAP_EXEC_SHELL | \
@@ -90,7 +130,9 @@
                           V9X_CAP_INPUT_INJECT | V9X_CAP_EXEC_DETACH | \
                           V9X_CAP_HTTP_DOWNLOAD | V9X_CAP_INVENTORY | \
                           V9X_CAP_INSTALL_ID | V9X_CAP_INPUT_RELATIVE | \
-                          V9X_CAP_HARD_RESET)
+                          V9X_CAP_HARD_RESET | V9X_CAP_SCREENSHOT_OPTIONS | \
+                          V9X_CAP_FILE_TOOLS | V9X_CAP_PROCESS | \
+                          V9X_CAP_REGISTRY | V9X_CAP_WINDOWS)
 
 /* PUT/GET (0.11.0+, 256 MiB before) and DOWNLOAD all stream 32 KiB chunks
  * straight to disk. 2 GiB - 1 keeps every size inside the u32 wire fields
