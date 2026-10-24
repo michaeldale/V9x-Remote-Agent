@@ -215,6 +215,16 @@ stages the new agent exactly like a manual upgrade (it takes over at the
 next restart; AGENT.INI and the install ID are kept), then offers to
 restart. Any mismatch stops with "Nothing was changed".
 
+`SETUP.EXE /update /S` (0.13.1+) does the same with nobody at the machine,
+for a host that runs it over EXEC: no windows, no questions (yes is
+assumed), never a reboot. The installed copy waits for its child, so the
+exit code is the outcome (0 staged, 1 failed, 3 nothing newer or nothing
+published), and `C:\V9XREMOTE\TEMP\UPDATE.INI` holds `[result]` `status=`
+(staged, current, none, failed), `installed=`, `latest=` and `message=`. A
+staged update is the usual `V9XNEW.EXE` / `V9XSNEW.EXE`, which the host can
+apply at once with `UPDATE_REQUEST` (the hot swap) rather than a restart.
+Every signature and hash check is the same as the interactive flow's.
+
 With `[update] check_on_startup=1` (a tickbox on the `/remote` page) the
 agent checks quietly a minute after starting; when a newer version exists
 the tray menu item reads "Install update x.y.z...".

@@ -14,8 +14,17 @@
    it exactly as a manual upgrade does (the new agent takes over at the next
    restart), keeping AGENT.INI and the install ID.
 
-   Exit code: 0 an update was staged, 1 nothing to do or failed, 2 cancelled.
-   None of them makes the agent restart. */
+   Exit code: 0 an update was staged, 1 failed, 2 cancelled, 3 nothing newer
+   (or nothing published) for this agent. None of them makes the agent restart.
+
+   SETUP.EXE /update /S (0.13.1+) is the same flow with nobody at the machine,
+   for hosts that trigger it over the protocol (EXEC): no windows and no
+   questions (yes is assumed), never a reboot, and the installed copy waits
+   for the child so the exit code reaches the caller. Every outcome is also
+   written to C:\V9XREMOTE\TEMP\UPDATE.INI, [result] status= (staged,
+   current, none or failed), installed=, latest= and message=. The host then
+   applies the staged V9XNEW.EXE / V9XSNEW.EXE with UPDATE_REQUEST or reboots;
+   the signature and hash checks are exactly the same. */
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -35,12 +44,27 @@ static const char v9x_su_temp[] = "C:\\V9XREMOTE\\TEMP";
 static const char v9x_su_child[] = "C:\\V9XREMOTE\\TEMP\\SETUPUPD.EXE";
 static const char v9x_su_unpack_dir[] = "C:\\V9XREMOTE\\UPDATE";
 static const char v9x_su_title[] = "V9x Remote Agent " V9X_AGENT_VERSION " - Update";
+static const char v9x_su_result[] = "C:\\V9XREMOTE\\TEMP\\UPDATE.INI";
 
 #define V9X_SU_TIMEOUT_MS 30000ul
 #define V9X_SU_TEXT_MAX 65536ul
 #define V9X_SU_ZIP_MAX (16ul * 1024ul * 1024ul)
 
 static HWND v9x_su_status;
+static int v9x_su_quiet;
+static char v9x_su_latest[24];
+
+/* /S: record the outcome for the host instead of showing it. */
+static void v9x_su_record(const char *status, const char *message)
+{
+    (void)CreateDirectoryA(v9x_su_temp, 0);
+    (void)WritePrivateProfileStringA("result", "status", status, v9x_su_result);
+    (void)WritePrivateProfileStringA("result", "installed", V9X_AGENT_VERSION, v9x_su_result);
+    (void)WritePrivateProfileStringA("result", "latest", v9x_su_latest, v9x_su_result);
+    (void)WritePrivateProfileStringA("result", "message", message, v9x_su_result);
+    /* Windows 9x caches the last INI written; flush it so a read sees it now. */
+    (void)WritePrivateProfileStringA(0, 0, 0, v9x_su_result);
+}
 
 static void v9x_su_copy(char *target, const char *source, unsigned long capacity)
 {
@@ -59,6 +83,7 @@ static void v9x_su_append(char *target, const char *source, unsigned long capaci
 static void v9x_su_show(const char *text)
 {
     MSG message;
+    if (v9x_su_quiet) return;
     if (v9x_su_status == 0) {
         int width = 360;
         int height = 60;
@@ -83,6 +108,10 @@ static void v9x_su_hide(void)
 static int v9x_su_fail(const char *text)
 {
     v9x_su_hide();
+    if (v9x_su_quiet) {
+        v9x_su_record("failed", text);
+        return 1;
+    }
     MessageBoxA(0, text, v9x_su_title, MB_OK | MB_ICONEXCLAMATION);
     return 1;
 }
@@ -249,11 +278,15 @@ static int v9x_su_work(void)
         return v9x_su_fail("The update server sent a reply this version does not understand.");
     }
     if (lstrcmpA(status, "update") != 0) {
+        int current = lstrcmpA(status, "current") == 0;
+        const char *text = current ? "This is the newest version of the V9x Remote Agent." :
+                                     "No update is available for this agent right now.";
         v9x_su_hide();
-        MessageBoxA(0, lstrcmpA(status, "current") == 0 ?
-                        "This is the newest version of the V9x Remote Agent." :
-                        "No update is available for this agent right now.",
-                    v9x_su_title, MB_OK | MB_ICONINFORMATION);
+        if (v9x_su_quiet) {
+            v9x_su_record(current ? "current" : "none", text);
+            return 3;
+        }
+        MessageBoxA(0, text, v9x_su_title, MB_OK | MB_ICONINFORMATION);
         return 1;
     }
     if (!v9x_update_ini_value((const char *)body, body_length, "update", "latest",
@@ -273,6 +306,7 @@ static int v9x_su_work(void)
                               notes_url, sizeof(notes_url))) {
         notes_url[0] = '\0';
     }
+    v9x_su_copy(v9x_su_latest, latest, sizeof(v9x_su_latest));
 
     /* 2. The signed release file decides everything that follows. */
     v9x_su_show("Checking the release signature...");
@@ -313,7 +347,8 @@ static int v9x_su_work(void)
     v9x_su_append(question, "Download and install it now? The new version takes over "
                             "when Windows next restarts; settings and the install ID "
                             "are kept.", sizeof(question));
-    if (MessageBoxA(0, question, v9x_su_title, MB_YESNO | MB_ICONQUESTION) != IDYES) {
+    if (!v9x_su_quiet &&
+        MessageBoxA(0, question, v9x_su_title, MB_YESNO | MB_ICONQUESTION) != IDYES) {
         return 2;
     }
 
@@ -350,6 +385,11 @@ static int v9x_su_work(void)
         }
     }
     v9x_su_hide();
+    if (v9x_su_quiet) {
+        v9x_su_record("staged", "The update is staged (V9XNEW.EXE, V9XSNEW.EXE) and takes over "
+                                "at the next restart or hot update.");
+        return 0;
+    }
     if (MessageBoxA(0, "The update is installed and takes over when Windows restarts.\r\n\r\n"
                        "Restart Windows now?", v9x_su_title,
                     MB_YESNO | MB_ICONQUESTION) == IDYES &&
@@ -359,13 +399,16 @@ static int v9x_su_work(void)
     return 0;
 }
 
-int v9x_self_update(int child)
+int v9x_self_update(int child, int quiet)
 {
     STARTUPINFOA startup;
     PROCESS_INFORMATION process;
     char self[MAX_PATH];
     char command[MAX_PATH + 32];
+    DWORD code;
+    v9x_su_quiet = quiet;
     if (child) return v9x_su_work();
+    if (quiet) (void)DeleteFileA(v9x_su_result);
     /* The installed copy hands over to a temporary one (see the top) and
        exits at once, so nothing holds C:\V9XREMOTE\SETUP.EXE open. */
     if (GetModuleFileNameA(0, self, sizeof(self)) == 0ul) return 1;
@@ -374,13 +417,20 @@ int v9x_self_update(int child)
     if (!CopyFileA(self, v9x_su_child, FALSE)) return v9x_su_work();
     v9x_su_copy(command, "\"", sizeof(command));
     v9x_su_append(command, v9x_su_child, sizeof(command));
-    v9x_su_append(command, "\" /update /child", sizeof(command));
+    v9x_su_append(command, quiet ? "\" /update /child /S" : "\" /update /child", sizeof(command));
     GetStartupInfoA(&startup);
     if (!CreateProcessA(v9x_su_child, command, 0, 0, FALSE, 0ul, 0, v9x_su_root,
                         &startup, &process)) {
         return v9x_su_work();
     }
     CloseHandle(process.hThread);
+    /* Interactive: hand over and exit, as before. /S: the caller (an EXEC
+       request) is waiting for the outcome, so wait and pass it on. */
+    code = 1ul;
+    if (quiet) {
+        (void)WaitForSingleObject(process.hProcess, INFINITE);
+        (void)GetExitCodeProcess(process.hProcess, &code);
+    }
     CloseHandle(process.hProcess);
-    return 1;
+    return (int)code;
 }

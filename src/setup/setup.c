@@ -27,7 +27,8 @@
                            lending this machine to the developer (installed
                            copy only); exit 0 means saved, as /settings
      SETUP.EXE /update     check for, verify and stage a newer version
-                           (selfupdate.c)
+                           (selfupdate.c); with /S unattended, for a host
+                           that runs it over EXEC (0.13.1+)
 
    VNC remote control (V9XVNC.EXE) is off unless the VNC option is ticked:
    then [vnc] enabled=1 is written and the server starts from Run at each
@@ -74,7 +75,7 @@
 #define V9X_ID_REMOTE_STATUS 126
 #define V9X_ID_UPDATE_STARTUP 127
 
-int v9x_self_update(int child);
+int v9x_self_update(int child, int quiet);
 
 static const char v9x_root[] = "C:\\V9XREMOTE";
 static const char v9x_ini[] = "C:\\V9XREMOTE\\AGENT.INI";
@@ -1184,7 +1185,7 @@ void WINAPI V9xSetupEntry(void)
     v9x_from_tray = v9x_settings_only && v9x_has_switch(line, "settings");
     if (v9x_from_tray) v9x_title = v9x_settings_title;
     if (v9x_has_switch(line, "update")) {
-        ExitProcess((UINT)v9x_self_update(v9x_has_switch(line, "child")));
+        ExitProcess((UINT)v9x_self_update(v9x_has_switch(line, "child"), silent));
     }
     v9x_remote_page = v9x_settings_only && v9x_has_switch(line, "remote");
     if (v9x_remote_page) {

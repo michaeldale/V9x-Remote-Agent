@@ -2,6 +2,24 @@
 
 All notable changes to the V9x Remote Agent. Dates are in YYYY-MM-DD.
 
+## 0.13.1 (2026-10-24)
+
+### Added
+- **Unattended self-update for hosts.** `SETUP.EXE /update /S` runs the
+  same check, signature, version and SHA-256 checks as `/update`, with no
+  windows or questions and never a reboot, so a host can trigger it over
+  EXEC (V9 Retro Controller does, from the update server directly). The
+  installed copy waits for its child, so the exit code is the result: 0
+  staged, 1 failed, 3 nothing newer or nothing published. The outcome is
+  also written to `C:\V9XREMOTE\TEMP\UPDATE.INI` (`[result]` `status=`
+  staged/current/none/failed, `installed=`, `latest=`, `message=`). A staged
+  update is the usual `V9XNEW.EXE` / `V9XSNEW.EXE`, so the host can apply it
+  at once with `UPDATE_REQUEST` instead of waiting for a restart.
+
+### Changed
+- `SETUP.EXE /update` without `/S` is unchanged, except that "nothing newer"
+  still exits 1 there (3 is the unattended mode's code).
+
 ## 0.13.0 (2026-10-23)
 
 ### Added
