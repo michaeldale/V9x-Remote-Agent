@@ -232,13 +232,16 @@ function New-V9xExecPayload {
         [ValidateRange(0, 1048576)][uint32]$StdoutLimit = 262144,
         [ValidateRange(0, 1048576)][uint32]$StderrLimit = 262144,
         [switch]$ShowWindow,
-        [switch]$Detach
+        [switch]$Detach,
+        # Option 0x0002: EXEC_COMPLETE carries the child's pid (agents with
+        # capability 0x00400000, 0.14.0+; older ones reject the bit).
+        [switch]$ReportPid
     )
     $bytes = [Collections.Generic.List[byte]]::new()
     [byte]$modeByte = if ($Mode -eq 'Shell') { 1 } else { 0 }
     $bytes.Add($modeByte)
     $bytes.Add([byte][bool]$ShowWindow)
-    [uint16]$optionBits = if ($Detach) { 1 } else { 0 }
+    [uint16]$optionBits = $(if ($Detach) { 1 } else { 0 }) -bor $(if ($ReportPid) { 2 } else { 0 })
     $bytes.AddRange([BitConverter]::GetBytes($optionBits))
     $bytes.AddRange([BitConverter]::GetBytes($TimeoutMilliseconds))
     $bytes.AddRange([BitConverter]::GetBytes($StdoutLimit))
@@ -251,9 +254,11 @@ function New-V9xExecPayload {
 
 function ConvertFrom-V9xExecComplete {
     param([byte[]]$Payload)
-    if ($Payload.Length -ne 28) { throw 'Invalid EXEC_COMPLETE payload length.' }
+    # 32 bytes when the request asked for the pid (option 0x0002).
+    if ($Payload.Length -ne 28 -and $Payload.Length -ne 32) { throw 'Invalid EXEC_COMPLETE payload length.' }
     $flags = [BitConverter]::ToUInt32($Payload, 24)
     [pscustomobject]@{
+        Pid = if ($Payload.Length -eq 32) { [BitConverter]::ToUInt32($Payload, 28) } else { $null }
         ResultCategory = [BitConverter]::ToUInt32($Payload, 0)
         ExitCode = [BitConverter]::ToUInt32($Payload, 4)
         NativeError = [BitConverter]::ToUInt32($Payload, 8)
@@ -454,6 +459,27 @@ function ConvertFrom-V9xListPayload {
 # 0x0029 (path), FILE_READ_TEXT 0x002A (u32 tail, u32 max bytes, match, path)
 # need V9X_CAP_FILE_TOOLS 0x00040000; PROCESS_LIST 0x0080 / PROCESS_KILL
 # 0x0081 need 0x00080000; REG_QUERY 0x0090 needs 0x00100000.
+
+# ---- Activity log (agent 0.15.0+) --------------------------------------
+# EVENT_NOTE 0x00A0 (one string, 1-200 ASCII characters) -> 0x80A0, empty;
+# needs V9X_CAP_EVENT_LOG 0x00800000. The guest writes "Developer: <text>"
+# to C:\V9XREMOTE\EVENTS.LOG, the tester's activity log.
+function ConvertTo-V9xNoteText {
+    # Non-ASCII and control characters become '?' / spaces, so a pasted
+    # en dash does not fail the whole call.
+    param([Parameter(Mandatory = $true)][string]$Text)
+    $clean = (($Text -replace '[\x00-\x1f]', ' ') -replace '[^\x20-\x7e]', '?').Trim()
+    if ($clean.Length -eq 0) { throw 'note text is empty.' }
+    if ($clean.Length -gt 200) { throw "note text is $($clean.Length) characters; the limit is 200." }
+    return $clean
+}
+
+function New-V9xNotePayload {
+    param([Parameter(Mandatory = $true)][string]$Text)
+    $bytes = [Collections.Generic.List[byte]]::new()
+    Add-V9xString -Bytes $bytes -Value (ConvertTo-V9xNoteText -Text $Text)
+    return $bytes.ToArray()
+}
 
 # Names and text from the guest are in the Windows ANSI code page, not ASCII.
 $script:V9xAnsi = [Text.Encoding]::GetEncoding(1252)
@@ -971,7 +997,8 @@ function ConvertTo-V9xDiscoveredAgents {
 # opted-in machine through the update server. Server, operator key, signer
 # and signing key default as in mcp\v9x_relay.py.
 function New-V9xRelayStream {
-    param([string]$Machine, [string]$Server, [int]$OpenWaitSeconds = 150)
+    param([string]$Machine, [string]$Server, [int]$OpenWaitSeconds = 150,
+          [string]$Label = '', [switch]$TakeOver)
     if (-not ('V9xRelayStream' -as [type])) {
         Add-Type -Path (Join-Path $PSScriptRoot 'V9xRelayStream.cs') `
             -ReferencedAssemblies 'System.Web.Extensions'
@@ -995,5 +1022,13 @@ function New-V9xRelayStream {
     if (-not (Test-Path -LiteralPath $signingKey)) {
         throw "No relay signing key at $signingKey (v9xsign keygen)."
     }
-    return [V9xRelayStream]::new($Server, $operatorKey, $signer, $signingKey, $Machine, $OpenWaitSeconds)
+    try {
+        return [V9xRelayStream]::new($Server, $operatorKey, $signer, $signingKey, $Machine,
+            $OpenWaitSeconds, $Label, [bool]$TakeOver)
+    } catch [Management.Automation.MethodInvocationException] {
+        # Surface a busy refusal itself, so its V9xExitCode (21) decides the exit.
+        $inner = $_.Exception.InnerException
+        if ($null -ne $inner -and $inner.Data.Contains('V9xExitCode')) { throw $inner }
+        throw
+    }
 }

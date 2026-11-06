@@ -2,6 +2,98 @@
 
 All notable changes to the V9x Remote Agent. Dates are in YYYY-MM-DD.
 
+## 0.15.0 (2026-11-06)
+
+What a tester at the machine can see: a chat that survives a reboot, and a
+plain-English activity log of what the developer and the agent are doing.
+Asked for by a remote-help tester.
+
+### Added
+- **Activity log, `C:\V9XREMOTE\EVENTS.LOG`**, opened from the tray's new
+  **Activity log...** item (Notepad). One dated line per event a person at
+  the machine cares about: agent started (with version), developer connected
+  (LAN address or remote help), **"Idle: no developer activity for 2 minutes
+  (safe to reboot or shut down)"**, reboot / shutdown / hard reset / agent
+  update requested by the developer, remote help connected, unreachable,
+  back in touch after a long silence, paused or resumed at the machine.
+  Rotates to `EVENTS.OLD` at 64 KiB. `AGENT.LOG` stays the technical log.
+- **`note -Text "..."`**: the developer adds a line to that log
+  ("Developer: attempting driver test 12") before doing it, so the record
+  is written as things happen rather than after. New `EVENT_NOTE_REQUEST`
+  `0x00A0` / `EVENT_NOTE_RESPONSE` `0x80A0`, capability
+  `V9X_CAP_EVENT_LOG` `0x00800000`, 1-200 ASCII characters. MCP:
+  `v9x_note`. Older agents: exit 23.
+- **Chat history kept across reboots** in `C:\V9XREMOTE\CHAT.LOG`
+  (`CHAT.OLD` past 64 KiB); the chat window reloads the newest 8 KiB when
+  the agent starts. Chat lines now carry the date.
+- `remote-poll-gap` in `AGENT.LOG` when a remote-help check-in comes more
+  than 30 s after it was due, with how long the agent was silent: the
+  measurement the "silent guest during 3D" issue asked for.
+
+### Changed
+- **A busy remote-help machine is refused, not taken over.** A second
+  `-Relay` call (or MCP `relay`) while another caller is still using the
+  machine's relay session (a long `wait-window`, say) used to end that
+  call's session. The update server (plugin DB version 4) now refuses it,
+  saying which verb holds the session and for how long, and v9xctl exits
+  **21**. A caller's own reconnects still replace its session (each v9xctl
+  process and each MCP tool call sends an owner id), a session nobody has
+  touched for 60 s is replaced as before, and `-RelayTakeOver` (MCP
+  `relay_take_over`) takes a live one on purpose.
+- **Several relay calls at once.** The agent runs up to three relay sessions
+  side by side, each on its own thread and loopback connection, and says
+  `max_sessions=3` / `sessions=a,b` in its check-in; the server (plugin DB
+  version 5) lets that many in, so a `screenshot`, `windows` or `cat` works
+  while a long `wait-window` holds the first session. Check-ins keep their
+  normal pace during a session (they used to drop to one every 15 s), and a
+  session whose server vanished ends after 5 minutes. Agents before 0.15.0
+  still get one session (and the busy refusal above); a 0.15.0 agent on an
+  older server gets the single session it offers.
+- `GET machines` reports `busy` as `null` once the machine is offline (its
+  last poll is too old to say), and its `session` row names the verb, age
+  and whether it is in use.
+
+## 0.14.0 (2026-10-29)
+
+Waiting for long jobs (benchmarks, installers, test runs) without sleeping,
+polling by hand or guessing how long they take.
+
+### Added
+- **`wait-process -Pid <id> | -Name <image>`**: returns when no such guest
+  process runs (exit 49 at the deadline; `WasRunning = false` when nothing
+  matched on the first look). MCP: `v9x_wait_process`. Works with 0.13.0
+  agents (PROCESS_LIST).
+- **`exec -WaitForExit`**: launch detached, then wait until that process
+  has exited: no 1-hour exec cap, no execution slot held (no output or exit
+  code). MCP: `wait_for_exit` on `v9x_exec`.
+- **The child's pid in exec results** (`Pid`; MCP `pid`). New capability
+  `V9X_CAP_EXEC_PID` `0x00400000` and EXEC option `0x0002` make
+  `EXEC_COMPLETE` 32 bytes with the pid; hosts ask only when it is
+  advertised. Against 0.13 agents `-WaitForExit` waits on the image name.
+- **`wait-file -Match <text>`** (and `exec -WaitForFile ... -Match`): until
+  the file has a line containing the text, for reports that exist from the
+  start and are marked finished later (`Complete=yes`). MCP: `match` on
+  `v9x_wait_file` and on exec/shell. Agent 0.13.0+.
+- **`cat -Follow [-Until <text>]`**: print lines as the guest appends them,
+  one flushed stdout line each, for a line-streaming monitor (Claude Code's
+  Monitor tool). Waits for a missing file, restarts when the file shrinks,
+  never prints a half-written last line, and `-Until` stops on the first
+  line containing the text, including one already in the file.
+- AGENTS.md: **"Long jobs"** (run the blocking wait as a background command
+  and be woken when it exits, instead of sleeping or holding the
+  conversation) and **"Old agents: update first"**.
+
+### Changed
+- Every v9xctl wait (wait-file, wait-window, wait-process, cat -Follow, the
+  exec waits) polls every 250 ms for the first 10 s, then once a second, so
+  a long wait barely loads a guest that is benchmarking; the MCP waits do
+  the same.
+- A connection that drops in the middle of a v9xctl wait is reopened for
+  the time the wait has left (`[connection lost ...; reconnecting]` on
+  stderr) instead of failing with exit 20.
+- `-WaitSeconds` accepts up to 86400 (was 600); `wait-process`,
+  `exec -WaitForExit` and `cat -Follow` default to 3600.
+
 ## 0.13.1 (2026-10-24)
 
 ### Added

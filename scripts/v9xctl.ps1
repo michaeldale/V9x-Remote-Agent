@@ -90,7 +90,7 @@ param(
         param($commandName, $parameterName, $wordToComplete)
         @('discover', 'ping', 'info', 'inventory', 'exec', 'shell', 'stat', 'list', 'mkdir',
           'put', 'get', 'push-tree', 'wait-file', 'delete', 'hash', 'cat', 'ps', 'kill', 'reg',
-          'windows', 'wait-window',
+          'windows', 'wait-window', 'wait-process', 'note',
           'download', 'update', 'reboot', 'reset', 'shutdown',
           'wait-desktop', 'screenshot', 'input', 'vnc', 'help') |
             Where-Object { $_ -like "$wordToComplete*" }
@@ -125,6 +125,16 @@ param(
     [switch]$Gone,
     [ValidateRange(0, 600000)]
     [int]$StableMs = 0,
+    # exec -WaitForExit: launch detached, then wait until that process ends
+    # (wait-process on its pid), with no 3600 s exec cap and no slot held.
+    [switch]$WaitForExit,
+    # cat -Follow: keep printing lines as they are appended; -Until <text>
+    # stops at the first line containing it.
+    [switch]$Follow,
+    [string]$Until = '',
+    # note: one line for the tester's activity log (EVENTS.LOG, 0.15.0+).
+    [Alias('Text', 'Message')]
+    [string]$NoteText = '',
     [string]$Application,
     [string]$Arguments = '',
     [Alias('Command')]
@@ -137,7 +147,10 @@ param(
     [string]$RemotePath,
     [string]$Url,
     [string]$JobId,
-    [ValidateRange(5, 600)]
+    # Up to a day: a benchmark wait runs as a background command, so its
+    # length is not limited by any foreground timeout. wait-process and
+    # cat -Follow default to 3600 when it is not given.
+    [ValidateRange(5, 86400)]
     [int]$WaitSeconds = 120,
     [ValidateRange(1, 3600)]
     [int]$TimeoutSeconds = 60,
@@ -169,12 +182,14 @@ param(
     # cat: only the last N lines (after -Match filtering); 0 = all.
     [ValidateRange(0, 1000000)]
     [int]$Tail = 0,
-    # cat: only lines containing this text (case-insensitive).
+    # cat: only lines containing this text (case-insensitive); wait-file:
+    # wait until the file has such a line.
     [string]$Match = '',
     # cat: most bytes of text to return (the agent caps it near 64 KiB).
     [ValidateRange(1, 65512)]
     [int]$MaxBytes = 16384,
-    # kill: process id (from ps), or -Name for an image name.
+    # kill / wait-process: process id (from ps or exec's Pid), or -Name for
+    # an image name.
     [Alias('Pid')]
     [uint32]$ProcessId = 0,
     [string]$Name = '',
@@ -190,6 +205,9 @@ param(
     [ValidatePattern('^$|^[Mm]-[0-9A-HJKMNP-TV-Za-hjkmnp-tv-z]{6}$')]
     [string]$Relay,
     [string]$RelayServer,
+    # Take the machine's relay session from another caller that is still
+    # using it (the server otherwise refuses with exit 21). Their call fails.
+    [switch]$RelayTakeOver,
     [switch]$Json
 )
 
@@ -289,7 +307,8 @@ function Connect-V9xSession {
     if ($Relay) {
         # The relay stream is its own client; disposing it ends the session.
         $sessionClient = New-V9xRelayStream -Machine $Relay -Server $RelayServer `
-            -OpenWaitSeconds ([Math]::Max($TimeoutSeconds, 150))
+            -OpenWaitSeconds ([Math]::Max($TimeoutSeconds, 150)) -Label $Action `
+            -TakeOver:$RelayTakeOver
         $sessionStream = $sessionClient
     } else {
         $sessionClient = [Net.Sockets.TcpClient]::new()
@@ -366,81 +385,295 @@ function Connect-V9xSessionWithRetry {
     }
 }
 
-# Poll FILE_STAT on an open connection until -Path exists (or with -Gone,
-# does not), and with -StableMs until its size has not changed for that
-# long. Returns the last stat plus how long it waited, or throws with exit
-# code 47 at the deadline.
-function Wait-V9xGuestFile {
-    param($Stream, [ref]$RequestId, [string]$Path, [int]$WaitSeconds, [switch]$Gone, [int]$StableMs)
-    $started = [Diagnostics.Stopwatch]::StartNew()
-    $lastSize = -1
-    $stableSince = $null
+# What to check after a transport failure, for a LAN target or a relay one.
+function Write-V9xTargetHint {
+    if ($Relay) {
+        [Console]::Error.WriteLine("Target was remote-help machine $Relay through the relay. Is it online (v9x_relay_machines), or was its session closed by the server, its owner or another caller?")
+    } else {
+        [Console]::Error.WriteLine("Target was ${EndpointHost}:$Port. Is the guest up and the agent's port forwarded? Choose another target with -Host <address> -Port <n>.")
+    }
+}
+
+# A failure of the connection itself (not of the guest's answer).
+function Test-V9xTransportFailure {
+    param([Exception]$Failure)
+    while ($Failure -is [Management.Automation.MethodInvocationException] -and $Failure.InnerException) {
+        $Failure = $Failure.InnerException
+    }
+    return $Failure -is [IO.IOException] -or $Failure -is [Net.Sockets.SocketException] -or
+        $Failure -is [TimeoutException]
+}
+
+# A long wait outlives a dropped connection (relay hiccup, guest NIC reset,
+# guest reboot): reconnect for whatever time the wait has left instead of
+# failing with exit 20. The script's $client, $stream and $hello follow the
+# new session; returns its stream.
+function Restore-V9xSession {
+    param([ref]$RequestId, [double]$SecondsLeft, [Exception]$Failure)
+    if ($SecondsLeft -lt 1) { throw $Failure }
+    [Console]::Error.WriteLine("[connection lost ($($Failure.Message)); reconnecting]")
+    $session = Connect-V9xSessionWithRetry -HostName $EndpointHost -TcpPort $Port `
+        -TimeoutSeconds $ConnectTimeoutSeconds -WaitSeconds ([int][Math]::Ceiling($SecondsLeft))
+    if ($null -ne $script:client) { try { $script:client.Dispose() } catch { } }
+    $script:client = $session.Client
+    $script:stream = $session.Stream
+    $script:hello = $session.Hello
+    $RequestId.Value = [uint32]($session.RequestId + 1)
+    return $session.Stream
+}
+
+# The loop under every wait: run $Probe (given the stream and the request-id
+# [ref]; it returns $null to keep waiting) until it returns a result, which
+# gets WaitedMilliseconds. At the deadline: throw $OnTimeout's message with
+# exit $ExitCode, or with -EndQuietly return @{ TimedOut = $true }.
+# Probes run every 250 ms for the first 10 s, then every second, so a wait
+# of hours costs the guest (often mid-benchmark) almost nothing and still
+# returns within a second. A relay round trip is slow enough on its own.
+function Invoke-V9xWaitLoop {
+    param($Stream, [ref]$RequestId, [int]$WaitSeconds, [scriptblock]$Probe,
+          [scriptblock]$OnTimeout, [int]$ExitCode, [switch]$EndQuietly)
+    $clock = [Diagnostics.Stopwatch]::StartNew()
     for (;;) {
-        $payload = New-V9xPathPayload -Path $Path
-        $bytes = New-V9xFrameBytes -Type 0x0020 -RequestId $RequestId.Value -Payload $payload
-        $Stream.Write($bytes, 0, $bytes.Length)
-        $frame = Read-V9xOperationFrame -Stream $Stream -RequestId $RequestId.Value `
-            -ExpectedTypes 0x8020 -GuestErrorExitCode 40
-        $RequestId.Value = [uint32]($RequestId.Value + 1)
-        $stat = ConvertFrom-V9xStatPayload -Payload $frame.Payload
-        $done = if ($Gone) { -not $stat.Exists } elseif (-not $stat.Exists) { $false } elseif ($StableMs -le 0) { $true } else {
-            if ($stat.Size -ne $lastSize) { $lastSize = $stat.Size; $stableSince = $started.ElapsedMilliseconds }
-            $started.ElapsedMilliseconds - $stableSince -ge $StableMs
+        try {
+            $outcome = & $Probe $Stream $RequestId
+        } catch {
+            if (-not (Test-V9xTransportFailure $_.Exception)) { throw }
+            $Stream = Restore-V9xSession -RequestId $RequestId -Failure $_.Exception `
+                -SecondsLeft ($WaitSeconds - $clock.Elapsed.TotalSeconds)
+            continue
         }
-        if ($done) {
-            return [pscustomobject]@{ Stat = $stat; WaitedMilliseconds = $started.ElapsedMilliseconds }
+        if ($null -ne $outcome) {
+            $outcome | Add-Member -NotePropertyName WaitedMilliseconds -NotePropertyValue $clock.ElapsedMilliseconds -Force
+            return $outcome
         }
-        if ($started.Elapsed.TotalSeconds -ge $WaitSeconds) {
+        if ($clock.Elapsed.TotalSeconds -ge $WaitSeconds) {
+            if ($EndQuietly) {
+                return [pscustomobject]@{ TimedOut = $true; WaitedMilliseconds = $clock.ElapsedMilliseconds }
+            }
             # Not a TimeoutException: that type means "transport" (exit 20).
-            $exception = [InvalidOperationException]::new(
-                "$Path $(if ($Gone) { 'still exists' } elseif ($stat.Exists) { 'kept changing size' } else { 'did not appear' }) within $WaitSeconds s.")
-            $exception.Data['V9xExitCode'] = 47
+            $exception = [InvalidOperationException]::new([string](& $OnTimeout))
+            $exception.Data['V9xExitCode'] = $ExitCode
             throw $exception
         }
-        # 250 ms on the LAN; a relay round trip is slow enough on its own.
-        if (-not $Relay) { Start-Sleep -Milliseconds 250 }
+        if (-not $Relay) {
+            Start-Sleep -Milliseconds $(if ($clock.ElapsedMilliseconds -lt 10000) { 250 } else { 1000 })
+        }
+    }
+}
+
+# Exit 23 with a pointer to the fix when the agent lacks a capability.
+function Assert-V9xCapability {
+    param([uint32]$Capability, [string]$What, [string]$Since = '0.13.0')
+    if (($script:hello.Capabilities -band $Capability) -eq 0) {
+        $exception = [InvalidOperationException]::new(
+            "Agent build '$($script:hello.BuildId)' cannot $What (needs agent $Since+). Update it first: .\scripts\v9xctl.ps1 update -Source .\build\install")
+        $exception.Data['V9xExitCode'] = 23
+        throw $exception
+    }
+}
+
+# One request and its one answer on an open connection; advances RequestId.
+function Invoke-V9xRequest {
+    param($Stream, [ref]$RequestId, [uint16]$Type, [byte[]]$Payload, [uint16]$Expected,
+          [int]$GuestErrorExitCode = 23)
+    $bytes = New-V9xFrameBytes -Type $Type -RequestId $RequestId.Value -Payload $Payload
+    $Stream.Write($bytes, 0, $bytes.Length)
+    $frame = Read-V9xOperationFrame -Stream $Stream -RequestId $RequestId.Value `
+        -ExpectedTypes $Expected -GuestErrorExitCode $GuestErrorExitCode
+    $RequestId.Value = [uint32]($RequestId.Value + 1)
+    return ,$frame.Payload
+}
+
+function Get-V9xGuestStat {
+    param($Stream, [ref]$RequestId, [string]$Path)
+    ConvertFrom-V9xStatPayload -Payload (Invoke-V9xRequest -Stream $Stream -RequestId $RequestId `
+        -Type 0x0020 -Payload (New-V9xPathPayload -Path $Path) -Expected 0x8020 -GuestErrorExitCode 40)
+}
+
+# FILE_READ_TEXT (V9X_CAP_FILE_TOOLS 0x00040000).
+function Read-V9xGuestText {
+    param($Stream, [ref]$RequestId, [string]$Path, [uint32]$Tail, [uint32]$MaxBytes, [string]$Match = '')
+    ConvertFrom-V9xReadTextPayload -Payload (Invoke-V9xRequest -Stream $Stream -RequestId $RequestId `
+        -Type 0x002A -Payload (New-V9xReadTextPayload -Path $Path -Tail $Tail -MaxBytes $MaxBytes -Match $Match) `
+        -Expected 0x802A -GuestErrorExitCode 40)
+}
+
+# PROCESS_LIST (V9X_CAP_PROCESS 0x00080000).
+function Get-V9xGuestProcesses {
+    param($Stream, [ref]$RequestId)
+    @(ConvertFrom-V9xProcessListPayload -Payload (Invoke-V9xRequest -Stream $Stream -RequestId $RequestId `
+        -Type 0x0080 -Payload ([byte[]]@()) -Expected 0x8080 -GuestErrorExitCode 45))
+}
+
+# Wait until -Path exists (or with -Gone, does not); with -StableMs until its
+# size has not changed for that long; with -Match until it has a line
+# containing that text (case-insensitive), returned as Line. Exit 47 at the
+# deadline. FILE_STAT works with every agent; -Match needs 0.13.0+.
+function Wait-V9xGuestFile {
+    param($Stream, [ref]$RequestId, [string]$Path, [int]$WaitSeconds, [switch]$Gone, [int]$StableMs,
+          [string]$Match = '')
+    if ($Match) { Assert-V9xCapability 0x00040000 'wait for a line in a file (-Match)' }
+    $probeState = @{ Stat = $null; LastSize = -1; StableSince = 0; Clock = [Diagnostics.Stopwatch]::StartNew() }
+    Invoke-V9xWaitLoop -Stream $Stream -RequestId $RequestId -WaitSeconds $WaitSeconds -ExitCode 47 -Probe {
+        param($s, $r)
+        $stat = Get-V9xGuestStat -Stream $s -RequestId $r -Path $Path
+        $probeState.Stat = $stat
+        if ($Gone) {
+            if (-not $stat.Exists) { return [pscustomobject]@{ Stat = $stat; Line = $null } }
+            return $null
+        }
+        if (-not $stat.Exists) { return $null }
+        if ($Match) {
+            $text = Read-V9xGuestText -Stream $s -RequestId $r -Path $Path -Tail 1 -MaxBytes 4096 -Match $Match
+            if ($text.Matched -gt 0) { return [pscustomobject]@{ Stat = $stat; Line = $text.Text.TrimEnd("`r", "`n") } }
+            return $null
+        }
+        if ($StableMs -gt 0) {
+            if ($stat.Size -ne $probeState.LastSize) {
+                $probeState.LastSize = $stat.Size
+                $probeState.StableSince = $probeState.Clock.ElapsedMilliseconds
+            }
+            if ($probeState.Clock.ElapsedMilliseconds - $probeState.StableSince -lt $StableMs) { return $null }
+        }
+        return [pscustomobject]@{ Stat = $stat; Line = $null }
+    } -OnTimeout {
+        $exists = $null -ne $probeState.Stat -and $probeState.Stat.Exists
+        "$Path $(if ($Gone) { 'still exists' } elseif (-not $exists) { 'did not appear' } elseif ($Match) { "has no line containing '$Match'" } else { 'kept changing size' }) within $WaitSeconds s."
     }
 }
 
 # WINDOW_LIST on an open connection (needs V9X_CAP_WINDOWS 0x00200000).
 function Get-V9xGuestWindows {
     param($Stream, [ref]$RequestId)
-    if (($hello.Capabilities -band [uint32]0x00200000) -eq 0) {
-        $exception = [InvalidOperationException]::new(
-            "Agent build '$($hello.BuildId)' cannot list windows (needs agent 0.13.0+).")
-        $exception.Data['V9xExitCode'] = 23
-        throw $exception
-    }
-    $bytes = New-V9xFrameBytes -Type 0x0062 -RequestId $RequestId.Value -Payload ([byte[]]@())
-    $Stream.Write($bytes, 0, $bytes.Length)
-    $frame = Read-V9xOperationFrame -Stream $Stream -RequestId $RequestId.Value `
-        -ExpectedTypes 0x8062 -GuestErrorExitCode 48
-    $RequestId.Value = [uint32]($RequestId.Value + 1)
-    return @(ConvertFrom-V9xWindowListPayload -Payload $frame.Payload)
+    Assert-V9xCapability 0x00200000 'list windows'
+    @(ConvertFrom-V9xWindowListPayload -Payload (Invoke-V9xRequest -Stream $Stream -RequestId $RequestId `
+        -Type 0x0062 -Payload ([byte[]]@()) -Expected 0x8062 -GuestErrorExitCode 48))
 }
 
-# Poll WINDOW_LIST until a window whose title contains -Title is visible (not
+# Wait until a window whose title contains -Title is visible (not
 # minimized), or with -Gone until none is. Exit 48 at the deadline.
 function Wait-V9xGuestWindow {
     param($Stream, [ref]$RequestId, [string]$Title, [int]$WaitSeconds, [switch]$Gone)
-    $started = [Diagnostics.Stopwatch]::StartNew()
-    for (;;) {
-        $windows = @(Get-V9xGuestWindows -Stream $Stream -RequestId $RequestId)
-        $found = @($windows | Where-Object { $_.Title -like "*$([Management.Automation.WildcardPattern]::Escape($Title))*" -and -not $_.Minimized })
-        if (($Gone -and $found.Count -eq 0) -or (-not $Gone -and $found.Count -gt 0)) {
-            return [pscustomobject]@{
-                Window = $(if ($found.Count) { $found[0] } else { $null })
-                WaitedMilliseconds = $started.ElapsedMilliseconds
-            }
+    $pattern = "*$([Management.Automation.WildcardPattern]::Escape($Title))*"
+    Invoke-V9xWaitLoop -Stream $Stream -RequestId $RequestId -WaitSeconds $WaitSeconds -ExitCode 48 -Probe {
+        param($s, $r)
+        $found = @(Get-V9xGuestWindows -Stream $s -RequestId $r |
+            Where-Object { $_.Title -like $pattern -and -not $_.Minimized })
+        if ([bool]$Gone -eq ($found.Count -eq 0)) {
+            return [pscustomobject]@{ Window = $(if ($found.Count) { $found[0] } else { $null }) }
         }
-        if ($started.Elapsed.TotalSeconds -ge $WaitSeconds) {
-            $exception = [InvalidOperationException]::new(
-                "No window titled '*$Title*' $(if ($Gone) { 'closed' } else { 'appeared' }) within $WaitSeconds s.")
-            $exception.Data['V9xExitCode'] = 48
-            throw $exception
+        return $null
+    } -OnTimeout { "No window titled '*$Title*' $(if ($Gone) { 'closed' } else { 'appeared' }) within $WaitSeconds s." }
+}
+
+# Wait until no guest process matches -ProcessId (from exec's Pid or ps) or
+# -Name (image name, wildcards as in ps): the way to wait for a detached
+# benchmark or installer to finish. WasRunning is false when nothing matched
+# on the first look (already finished, or a wrong name). Exit 49 at the
+# deadline. Needs agent 0.13.0+ (PROCESS_LIST).
+function Wait-V9xGuestProcessExit {
+    param($Stream, [ref]$RequestId, [uint32]$ProcessId, [string]$Name, [int]$WaitSeconds)
+    Assert-V9xCapability 0x00080000 'list processes to wait on one (Windows 9x/2000)'
+    $what = if ($ProcessId) { 'pid {0} ({0:X8})' -f $ProcessId } else { "'$Name'" }
+    $probeState = @{ First = $true; WasRunning = $false; Initial = @(); Running = @() }
+    Invoke-V9xWaitLoop -Stream $Stream -RequestId $RequestId -WaitSeconds $WaitSeconds -ExitCode 49 -Probe {
+        param($s, $r)
+        $running = @(Get-V9xGuestProcesses -Stream $s -RequestId $r | Where-Object {
+            if ($ProcessId) { $_.Pid -eq $ProcessId } else { $_.Name -like $Name } })
+        if ($probeState.First) {
+            $probeState.First = $false
+            $probeState.WasRunning = $running.Count -gt 0
+            $probeState.Initial = $running
         }
-        if (-not $Relay) { Start-Sleep -Milliseconds 250 }
+        $probeState.Running = $running
+        if ($running.Count -eq 0) {
+            return [pscustomobject]@{ WasRunning = $probeState.WasRunning; Processes = $probeState.Initial }
+        }
+        return $null
+    } -OnTimeout { "$what still running after $WaitSeconds s ($($probeState.Running.Count) process(es))." }
+}
+
+# cat -Follow: print lines as the guest appends them (with -Match only those
+# lines), one per stdout line, flushed, so Claude Code's Monitor tool or any
+# pipe sees each as it lands. Starts after the last -Tail lines already in
+# the file (default: only new ones), waits for a file that does not exist
+# yet, and starts over when it shrinks (rewritten). A line is printed once a
+# newer one follows or the file has been quiet for 1 s, so a half-written
+# last line is not printed half. -Until: stop at the first line containing
+# that text (exit 0; a line already in the file counts, so a finish that
+# happened before the follow started is not missed). Without -Until the
+# follow simply ends at -WaitSeconds (exit 0); with it, the deadline is exit 47.
+function Invoke-V9xFollow {
+    param($Stream, [ref]$RequestId, [string]$Path, [int]$WaitSeconds, [int]$Tail, [string]$Match, [string]$Until)
+    Assert-V9xCapability 0x00040000 'follow a file (cat -Follow)'
+    $probeState = @{ Seen = -1; LastSize = -1; QuietSince = 0; Pending = $false; Printed = 0
+                     Clock = [Diagnostics.Stopwatch]::StartNew() }
+    $emit = {
+        param([string]$Line)
+        [Console]::Out.WriteLine($Line)
+        [Console]::Out.Flush()
+        $probeState.Printed++
+        if ($Until -and $Line.IndexOf($Until, [StringComparison]::OrdinalIgnoreCase) -ge 0) {
+            return [pscustomobject]@{ Path = $Path; Until = $Until; Line = $Line; LinesPrinted = $probeState.Printed }
+        }
+        return $null
     }
+    Invoke-V9xWaitLoop -Stream $Stream -RequestId $RequestId -WaitSeconds $WaitSeconds -ExitCode 47 `
+        -EndQuietly:(-not $Until) -Probe {
+        param($s, $r)
+        $stat = Get-V9xGuestStat -Stream $s -RequestId $r -Path $Path
+        $now = $probeState.Clock.ElapsedMilliseconds
+        if (-not $stat.Exists) {
+            if ($probeState.Seen -gt 0) { [Console]::Error.WriteLine("[cat -Follow: $Path was removed; waiting for it]") }
+            if ($probeState.Seen -ge 0) { $probeState.Seen = 0 }
+            $probeState.LastSize = -1
+            return $null
+        }
+        if ($probeState.Seen -lt 0) {
+            if ($Until) {
+                $done = Read-V9xGuestText -Stream $s -RequestId $r -Path $Path -Tail 1 -MaxBytes 4096 -Match $Until
+                if ($done.Matched -gt 0) { return (& $emit $done.Text.TrimEnd("`r", "`n")) }
+            }
+            $head = Read-V9xGuestText -Stream $s -RequestId $r -Path $Path -Tail ([Math]::Max($Tail, 1)) `
+                -MaxBytes 65512 -Match $Match
+            if ($Tail -gt 0) {
+                foreach ($line in @($head.Text.Split("`n") | Select-Object -SkipLast 1)) { [void](& $emit $line) }
+            }
+            $probeState.Seen = [int]$head.Matched
+            $probeState.LastSize = $stat.Size
+            $probeState.QuietSince = $now
+            return $null
+        }
+        if ($stat.Size -lt $probeState.LastSize) {
+            [Console]::Error.WriteLine("[cat -Follow: $Path shrank; reading it from the start]")
+            $probeState.Seen = 0
+        }
+        if ($stat.Size -eq $probeState.LastSize -and -not $probeState.Pending) { return $null }
+        if ($stat.Size -ne $probeState.LastSize) { $probeState.LastSize = $stat.Size; $probeState.QuietSince = $now }
+        $quiet = $now - $probeState.QuietSince -ge 1000
+        $want = 64
+        for (;;) {
+            $text = Read-V9xGuestText -Stream $s -RequestId $r -Path $Path -Tail $want -MaxBytes 65512 -Match $Match
+            if ($text.Matched -lt $probeState.Seen) { $probeState.Seen = 0; continue }
+            # The answer holds lines first+1 .. first+Returned (a full buffer
+            # drops the later ones). Ask again, wider, if new lines fell
+            # before the window.
+            $first = [Math]::Max(0, [int]$text.Matched - $want)
+            if ($first -gt $probeState.Seen) { $want = [int]$text.Matched - $probeState.Seen; continue }
+            $lines = @($text.Text.Split("`n") | Select-Object -SkipLast 1)
+            $probeState.Pending = $false
+            for ($i = 0; $i -lt $lines.Count; ++$i) {
+                $index = $first + $i + 1
+                if ($index -le $probeState.Seen) { continue }
+                if ($index -eq $text.Matched -and -not $quiet) { $probeState.Pending = $true; break }
+                $probeState.Seen = $index
+                $done = & $emit $lines[$i]
+                if ($null -ne $done) { return $done }
+            }
+            if ($text.Truncated -and -not $probeState.Pending -and $probeState.Seen -lt $text.Matched) { continue }
+            return $null
+        }
+    } -OnTimeout { "No line containing '$Until' appeared in $Path within $WaitSeconds s." }
 }
 
 function Get-V9xLocalIPv4 {
@@ -816,7 +1049,7 @@ $script:V9xVerbs = [ordered]@{
     }
     'exec' = @{
         Purpose = 'Run a Win32 EXE directly and capture stdout/stderr'
-        Usage = 'exec -Application <guest EXE> [-Arguments <text>] [-WorkingDirectory <guest dir>] [-TimeoutSeconds <n>] [-ExpectedExitCode <n>] [-ShowWindow] [-Detach] [-WaitForFile <guest path> | -WaitForWindow <title part>] [-WaitSeconds <n>]'
+        Usage = 'exec -Application <guest EXE> [-Arguments <text>] [-WorkingDirectory <guest dir>] [-TimeoutSeconds <n>] [-ExpectedExitCode <n>] [-ShowWindow] [-Detach] [-WaitForExit | -WaitForFile <guest path> [-Match <text>] | -WaitForWindow <title part>] [-WaitSeconds <n>]'
         Example = 'exec -Application C:\WINDOWS\NOTEPAD.EXE -Arguments C:\README.TXT -TimeoutSeconds 30 -Json'
         Required = @{ Application = '-Application' }
     }
@@ -875,10 +1108,15 @@ $script:V9xVerbs = [ordered]@{
         Required = @{ RemotePath = '-Path' }
     }
     'wait-file' = @{
-        Purpose = 'Wait (one connection, no sleeps of yours) until a guest file exists, or with -Gone is removed; -StableMs: until its size settles'
-        Usage = 'wait-file -Path <guest path> [-WaitSeconds <n>] [-Gone] [-StableMs <ms>]'
-        Example = 'wait-file -Path C:\V9XREMOTE\JOBS\run1\DONE.TXT -WaitSeconds 300 -Json'
+        Purpose = 'Wait (no sleeps of yours) until a guest file exists, or with -Gone is removed; -StableMs: its size settles; -Match: it has a line containing the text'
+        Usage = 'wait-file -Path <guest path> [-WaitSeconds <n>] [-Gone | -StableMs <ms> | -Match <text>]'
+        Example = 'wait-file -Path C:\BENCH\REPORT.INI -Match Complete=yes -WaitSeconds 3600 -Json'
         Required = @{ RemotePath = '-Path' }
+    }
+    'wait-process' = @{
+        Purpose = 'Wait until a guest process has exited, by -Pid (exec''s Pid, ps) or -Name; for detached benchmarks and installers (agent 0.13.0+)'
+        Usage = 'wait-process -Pid <id> | -Name <image name> [-WaitSeconds <n>]   (default 3600)'
+        Example = 'wait-process -Name 3DMARK.EXE -WaitSeconds 7200 -Json'
     }
     'windows' = @{
         Purpose = 'Visible top-level windows: title, class, position, size, pid (agent 0.13.0+)'
@@ -892,8 +1130,8 @@ $script:V9xVerbs = [ordered]@{
         Required = @{ Title = '-Title' }
     }
     'cat' = @{
-        Purpose = 'Print a guest text file inline: -Tail N lines, -Match text, bounded (agent 0.13.0+)'
-        Usage = 'cat -Path <guest file> [-Tail <n>] [-Match <text>] [-MaxBytes <n>]'
+        Purpose = 'Print a guest text file inline: -Tail N lines, -Match text, bounded; -Follow streams new lines (-Until <text> stops) (agent 0.13.0+)'
+        Usage = 'cat -Path <guest file> [-Tail <n>] [-Match <text>] [-MaxBytes <n>] [-Follow [-Until <text>] [-WaitSeconds <n>]]'
         Example = 'cat -Path C:\V9XREMOTE\AGENT.LOG -Tail 40 -Match error'
         Required = @{ RemotePath = '-Path' }
     }
@@ -906,6 +1144,12 @@ $script:V9xVerbs = [ordered]@{
         Purpose = 'Terminate a guest process by -Pid or -Name (agent 0.13.0+; refuses the agent and Windows core processes)'
         Usage = 'kill -Pid <id> | -Name <image name>'
         Example = 'kill -Name NOTEPAD.EXE -Json'
+    }
+    'note' = @{
+        Purpose = 'Add a line to the tester''s activity log (C:\V9XREMOTE\EVENTS.LOG, tray > Activity log): say what you are about to do (agent 0.15.0+)'
+        Usage = 'note -Text "<what you are doing, up to 200 characters>"'
+        Example = 'note -Text "Attempting driver test 12: Velocity9x 0.31 with VBE fallback"'
+        Required = @{ NoteText = '-Text' }
     }
     'reg' = @{
         Purpose = 'Read a registry key: subkeys and values (read-only; agent 0.13.0+)'
@@ -1014,7 +1258,8 @@ function Write-V9xUsage {
     $Writer.WriteLine('  .\scripts\v9xctl.ps1 reboot -JobId myjob-reboot-1 -WaitSeconds 180 -Json')
     $Writer.WriteLine()
     $Writer.WriteLine('Exit codes: 0 ok, 10 usage, 20 agent unreachable, 22/23 protocol, 30-33 execution,')
-    $Writer.WriteLine('40 file transfer, 41-42 power control, 43 screenshot, 44 desktop not ready, 45 process, 46 registry, 47 wait-file, 48 window.')
+    $Writer.WriteLine('40 file transfer, 41-42 power control, 43 screenshot, 44 desktop not ready, 45 process, 46 registry, 47 wait-file, 48 window,')
+    $Writer.WriteLine('49 wait-process. Waits longer than a minute: run them as a background command (AGENTS.md, "Long jobs").')
     $Writer.WriteLine('Full reference: AGENTS.md and docs\host-cli.md.')
 }
 
@@ -1040,6 +1285,8 @@ $script:V9xVerbAliases = @{
     'sha256' = 'hash'; 'md5' = 'hash'; 'checksum' = 'hash'; 'tasklist' = 'ps'
     'processes' = 'ps'; 'taskkill' = 'kill'; 'regquery' = 'reg'; 'wait-ready' = 'wait-desktop'; 'wait-for-window' = 'wait-window'
     'wait-boot' = 'wait-desktop'; 'wait-for-file' = 'wait-file'; 'capture' = 'screenshot'
+    'wait-exit' = 'wait-process'; 'wait-pid' = 'wait-process'; 'wait-for-process' = 'wait-process'
+    'follow' = 'cat'
 }
 
 if ([string]::IsNullOrWhiteSpace($Action) -or $Action -in @('help', '-h', '--help', '/?')) {
@@ -1061,6 +1308,7 @@ if ([string]::IsNullOrWhiteSpace($Action) -or $Action -in @('help', '-h', '--hel
     exit 0
 }
 $Action = $Action.ToLowerInvariant()
+if ($Action -eq 'follow') { $Follow = [switch]$true }
 if ($script:V9xVerbAliases.ContainsKey($Action)) { $Action = $script:V9xVerbAliases[$Action] }
 if (-not $script:V9xVerbs.Contains($Action)) {
     # One line, not the whole help: the verb list and where this copy lives
@@ -1092,6 +1340,12 @@ if ($verbEntry.ContainsKey('Required')) {
         exit 10
     }
 }
+if ($Action -eq 'note') {
+    try { $null = ConvertTo-V9xNoteText -Text $NoteText } catch {
+        Write-V9xVerbUsage -Writer ([Console]::Error) -Verb $Action -Problem $_.Exception.Message
+        exit 10
+    }
+}
 if ($Action -eq 'put' -and -not (Test-Path -LiteralPath $Source -PathType Leaf)) {
     [Console]::Error.WriteLine("Local source file not found: $Source")
     exit 11
@@ -1104,10 +1358,31 @@ if ($Action -eq 'hash' -and $Source -and -not (Test-Path -LiteralPath $Source -P
     [Console]::Error.WriteLine("Local file to compare not found: $Source")
     exit 11
 }
-if ($Action -eq 'kill' -and $ProcessId -eq 0 -and [string]::IsNullOrWhiteSpace($Name)) {
-    Write-V9xVerbUsage -Writer ([Console]::Error) -Verb 'kill' -Problem 'kill requires -Pid or -Name.'
+if (($Action -in @('kill', 'wait-process')) -and $ProcessId -eq 0 -and [string]::IsNullOrWhiteSpace($Name)) {
+    Write-V9xVerbUsage -Writer ([Console]::Error) -Verb $Action -Problem "$Action requires -Pid or -Name."
     exit 10
 }
+if ($WaitForExit -and $Action -ne 'exec') {
+    Write-V9xVerbUsage -Writer ([Console]::Error) -Verb 'exec' -Problem '-WaitForExit is an exec option (a shell -Detach pid is only the COMMAND.COM wrapper).'
+    exit 10
+}
+$waitFileMatch = if ($Action -eq 'exec') { $WaitForFile -and $Match } else { $Action -eq 'wait-file' -and $Match }
+if ($waitFileMatch -and ($Gone -or $StableMs -gt 0)) {
+    Write-V9xVerbUsage -Writer ([Console]::Error) -Verb $Action -Problem '-Match cannot be combined with -Gone or -StableMs.'
+    exit 10
+}
+if ($Until -and -not ($Action -eq 'cat' -and $Follow)) {
+    Write-V9xVerbUsage -Writer ([Console]::Error) -Verb 'cat' -Problem '-Until goes with cat -Follow (for a one-shot wait use wait-file -Match).'
+    exit 10
+}
+# Waits that are about a program finishing default to an hour, not 120 s.
+if (-not $PSBoundParameters.ContainsKey('WaitSeconds') -and
+    ($Action -eq 'wait-process' -or $WaitForExit -or ($Action -eq 'cat' -and $Follow))) {
+    $WaitSeconds = 3600
+}
+# The program's own exit is what -WaitForExit waits on, so it runs detached:
+# no exec timeout, no execution slot held, nothing captured.
+if ($WaitForExit) { $Detach = $true }
 
 if ($Action -eq 'discover') {
     try {
@@ -1942,15 +2217,60 @@ try {
     }
 
     if ($Action -eq 'wait-file') {
-        # Plain FILE_STAT polling: works with every agent.
+        # FILE_STAT polling works with every agent; -Match needs 0.13.0+.
         $waited = Wait-V9xGuestFile -Stream $stream -RequestId ([ref]$requestId) -Path $RemotePath `
-            -WaitSeconds $WaitSeconds -Gone:$Gone -StableMs $StableMs
+            -WaitSeconds $WaitSeconds -Gone:$Gone -StableMs $StableMs -Match $Match
         $result = [pscustomobject]@{
             Success = $true; AgentBuild = $hello.BuildId; Path = $RemotePath
             Exists = $waited.Stat.Exists; Size = $waited.Stat.Size
             WaitedMilliseconds = $waited.WaitedMilliseconds
         }
+        if ($Match) { $result | Add-Member -NotePropertyMembers ([ordered]@{ Match = $Match; Line = $waited.Line }) }
         if ($Json) { $result | ConvertTo-Json -Depth 4 -Compress } else { $result | Format-List }
+        exit 0
+    }
+
+    if ($Action -eq 'wait-process') {
+        $waited = Wait-V9xGuestProcessExit -Stream $stream -RequestId ([ref]$requestId) `
+            -ProcessId $ProcessId -Name $Name -WaitSeconds $WaitSeconds
+        if (-not $waited.WasRunning) {
+            [Console]::Error.WriteLine("Note: no process matched $(if ($ProcessId) { "pid $ProcessId" } else { "'$Name'" }) on the first look: it had already exited, or the name is wrong (see ps).")
+        }
+        $result = [pscustomobject]@{
+            Success = $true; AgentBuild = $hello.BuildId
+            Pid = $(if ($ProcessId) { $ProcessId } else { $null }); Name = $Name
+            WasRunning = $waited.WasRunning; Exited = @($waited.Processes | ForEach-Object { $_.Name })
+            WaitedMilliseconds = $waited.WaitedMilliseconds
+        }
+        if ($Json) { $result | ConvertTo-Json -Depth 4 -Compress } else { $result | Format-List }
+        exit 0
+    }
+
+    if ($Action -eq 'cat' -and $Follow) {
+        # Lines only on stdout (one per line, for Monitor or a pipe); -Json
+        # does not apply. How it ended goes to stderr.
+        $followed = Invoke-V9xFollow -Stream $stream -RequestId ([ref]$requestId) -Path $RemotePath `
+            -WaitSeconds $WaitSeconds -Tail $Tail -Match $Match -Until $Until
+        if ($followed.PSObject.Properties['TimedOut']) {
+            [Console]::Error.WriteLine("[cat -Follow: stopped after $WaitSeconds s]")
+        } else {
+            [Console]::Error.WriteLine("[cat -Follow: found '$Until' after $([int]($followed.WaitedMilliseconds / 1000)) s]")
+        }
+        exit 0
+    }
+
+    if ($Action -eq 'note') {
+        if (($hello.Capabilities -band [uint32]0x00800000) -eq 0) {
+            $exitCategory = 23
+            throw "Agent build '$($hello.BuildId)' does not support note (needs agent 0.15.0+; update it first)."
+        }
+        $cleanNote = ConvertTo-V9xNoteText -Text $NoteText
+        $frameBytes = New-V9xFrameBytes -Type 0x00A0 -RequestId $requestId -Payload (New-V9xNotePayload -Text $cleanNote)
+        $stream.Write($frameBytes, 0, $frameBytes.Length)
+        $null = Read-V9xOperationFrame -Stream $stream -RequestId $requestId `
+            -ExpectedTypes 0x80A0 -GuestErrorExitCode 40
+        $result = [ordered]@{ Success = $true; RequestId = $requestId; AgentBuild = $hello.BuildId; Text = $cleanNote }
+        if ($Json) { $result | ConvertTo-Json -Compress } else { [pscustomobject]$result | Format-List }
         exit 0
     }
 
@@ -2165,7 +2485,8 @@ try {
         -CommandLine $execCommand -WorkingDirectory $WorkingDirectory `
         -TimeoutMilliseconds ([uint32]($TimeoutSeconds * 1000)) `
         -StdoutLimit ([uint32]$StdoutLimit) -StderrLimit ([uint32]$StderrLimit) `
-        -ShowWindow:$ShowWindow -Detach:$Detach
+        -ShowWindow:$ShowWindow -Detach:$Detach `
+        -ReportPid:(($hello.Capabilities -band [uint32]0x00400000) -ne 0)
     $requestBytes = New-V9xFrameBytes -Type 0x0010 -RequestId $requestId -Payload $execPayload
     $stream.ReadTimeout = ($TimeoutSeconds + 15) * 1000
     $stream.Write($requestBytes, 0, $requestBytes.Length)
@@ -2230,18 +2551,40 @@ try {
         GuiWindow = $complete.GuiWindow
         Detached = $complete.Detached
         Orphaned = $complete.Orphaned
+        # The child's pid (agent 0.14.0+): wait-process -Pid / kill -Pid.
+        Pid = $complete.Pid
+    }
+    # -WaitForExit: the detached program is done when its process is gone.
+    # Its exit code is not known (nothing waits on the handle in the guest).
+    if ($WaitForExit -and $outcomeExit -eq 0) {
+        $exitRequest = [uint32]($requestId + 201)
+        $exitName = ''
+        if ($null -eq $complete.Pid) {
+            # Agents before 0.14.0 do not report the pid: wait on the image
+            # name instead, which also waits on any other copy running.
+            $exitName = Split-Path -Leaf $Application
+            [Console]::Error.WriteLine("Note: agent $($hello.BuildId) does not report the pid (0.14.0+); waiting until no '$exitName' runs.")
+        }
+        $waited = Wait-V9xGuestProcessExit -Stream $stream -RequestId ([ref]$exitRequest) `
+            -ProcessId $(if ($null -ne $complete.Pid) { $complete.Pid } else { 0 }) -Name $exitName `
+            -WaitSeconds $WaitSeconds
+        $result | Add-Member -NotePropertyMembers ([ordered]@{
+            WaitedForExit = $true; ExitWaitedMilliseconds = $waited.WaitedMilliseconds
+            WasRunning = $waited.WasRunning
+        })
     }
     # -WaitForFile: the program (often -Detach'ed) signals completion by
-    # writing a file; wait for it here, on this connection, instead of the
-    # caller sleeping and polling.
+    # writing a file (with -Match: a line in it); wait for it here, on this
+    # connection, instead of the caller sleeping and polling.
     if ($WaitForFile -and $outcomeExit -eq 0) {
         $waitRequest = [uint32]($requestId + 1)
         $waited = Wait-V9xGuestFile -Stream $stream -RequestId ([ref]$waitRequest) -Path $WaitForFile `
-            -WaitSeconds $WaitSeconds -Gone:$Gone -StableMs $StableMs
+            -WaitSeconds $WaitSeconds -Gone:$Gone -StableMs $StableMs -Match $Match
         $result | Add-Member -NotePropertyMembers ([ordered]@{
             WaitForFile = $WaitForFile; WaitedMilliseconds = $waited.WaitedMilliseconds
             WaitedFileSize = $waited.Stat.Size
         })
+        if ($Match) { $result | Add-Member -NotePropertyMembers ([ordered]@{ Match = $Match; Line = $waited.Line }) }
     }
     # -WaitForWindow: a GUI program is ready when its window is up.
     if ($WaitForWindow -and $outcomeExit -eq 0) {
@@ -2257,17 +2600,21 @@ try {
     exit $outcomeExit
 } catch [Net.Sockets.SocketException] {
     [Console]::Error.WriteLine("Transport error: $($_.Exception.Message)")
-    [Console]::Error.WriteLine("Target was ${EndpointHost}:$Port. Is the guest up and the agent's port forwarded? Choose another target with -Host <address> -Port <n>.")
+    Write-V9xTargetHint
     exit 20
 } catch [IO.IOException] {
     [Console]::Error.WriteLine("Transport error: $($_.Exception.Message)")
-    [Console]::Error.WriteLine("Target was ${EndpointHost}:$Port. Is the guest up and the agent's port forwarded? Choose another target with -Host <address> -Port <n>.")
+    Write-V9xTargetHint
     exit 20
 } catch [TimeoutException] {
     [Console]::Error.WriteLine("Transport error: $($_.Exception.Message)")
-    [Console]::Error.WriteLine("Target was ${EndpointHost}:$Port. Is the guest up and the agent's port forwarded? Choose another target with -Host <address> -Port <n>.")
+    Write-V9xTargetHint
     exit 20
 } catch {
+    if ($_.Exception.Data.Contains('V9xExitCode') -and [int]$_.Exception.Data['V9xExitCode'] -eq 21) {
+        [Console]::Error.WriteLine("Relay busy: $($_.Exception.Message)")
+        exit 21
+    }
     [Console]::Error.WriteLine("Protocol error: $($_.Exception.Message)")
     if ($_.Exception.Data.Contains('V9xExitCode')) {
         exit [int]$_.Exception.Data['V9xExitCode']

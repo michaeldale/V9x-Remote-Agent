@@ -26,7 +26,7 @@ Nothing requires clicking inside the emulator.
 | `ping` | | Liveness; returns uptime and boot counter |
 | `info` | | Agent version, build ID, computer name, screen mode, pending job |
 | `inventory` | | OS build, CPU, memory, drives, display adapter, IPs, BIOS, PnP devices (agent 0.7.0+) |
-| `exec` | `-Application`, `-Arguments`, `-WorkingDirectory`, `-TimeoutSeconds`, `-ExpectedExitCode`, `-ShowWindow`, `-Detach`, `-WaitForFile`/`-WaitForWindow` | Run a Win32 EXE directly, capture stdout/stderr; then optionally wait for a file or window |
+| `exec` | `-Application`, `-Arguments`, `-WorkingDirectory`, `-TimeoutSeconds`, `-ExpectedExitCode`, `-ShowWindow`, `-Detach`, `-WaitForExit`, `-WaitForFile [-Match]`/`-WaitForWindow` | Run a Win32 EXE directly, capture stdout/stderr; or detached and wait for it to exit (`-WaitForExit`); then optionally wait for a file, a line in it, or a window. Results carry `Pid` (0.14.0+) |
 | `shell` | `-Command`, `-TimeoutSeconds`, `-Detach` | Run through `COMMAND.COM /C` (`CMD.EXE /C` on Windows 2000; built-ins, batch files) |
 | `stat` | `-Path` | Existence, size, attributes |
 | `list` | `-Path` | Directory listing (bounded to 16 KiB) |
@@ -34,13 +34,15 @@ Nothing requires clicking inside the emulator.
 | `put` | `-Source`, `-Destination` | Upload one file, CRC32-verified, transactional |
 | `get` | `-Source`, `-Destination` | Download one file, CRC32-verified |
 | `push-tree` | `-Source`, `-Destination` | Recursive directory upload |
-| `cat` | `-Path`, `-Tail`, `-Match`, `-MaxBytes` | A guest text file printed inline: last N lines, lines containing text, bounded (agent 0.13.0+) |
+| `cat` | `-Path`, `-Tail`, `-Match`, `-MaxBytes`, `-Follow`, `-Until` | A guest text file printed inline: last N lines, lines containing text, bounded; `-Follow` streams new lines as they land, `-Until <text>` stops (agent 0.13.0+) |
 | `hash` | `-Path`, optional `-Source` | Size, CRC32, SHA-256 in the guest; with `-Source`, `Matches` against a local file (0.13.0+) |
 | `delete` | `-Path`, `-Recurse`, `-Force` | Delete a file or directory; refuses roots, WINDOWS, SYSTEM, `C:\V9XREMOTE` (0.13.0+) |
 | `ps` | optional `-Name` | Processes; marks the agent and its exec jobs with their request id (0.13.0+) |
 | `kill` | `-Pid` or `-Name` | Terminate a process (e.g. a stuck exec job); refuses the agent and Windows core processes (0.13.0+) |
 | `reg` | `-Key HKLM\...` | Subkeys and values of one registry key, read-only (0.13.0+) |
-| `wait-file` | `-Path`, `-WaitSeconds`, `-Gone`, `-StableMs` | Wait until a guest file exists (or is gone, or stops growing); any agent |
+| `wait-file` | `-Path`, `-WaitSeconds`, `-Gone`, `-StableMs`, `-Match` | Wait until a guest file exists (or is gone, or stops growing; any agent), or has a line containing `-Match` text (0.13.0+) |
+| `wait-process` | `-Pid` or `-Name`, `-WaitSeconds` (default 3600) | Wait until a guest process has exited: a detached benchmark or installer is done (0.13.0+) |
+| `note` | `-Text` | Add `Developer: <text>` to the tester's activity log (`C:\V9XREMOTE\EVENTS.LOG`, tray > Activity log) before a step they should know about (0.15.0+) |
 | `windows` | optional `-Title` | Visible top-level windows: title, class, position, size, pid (0.13.0+) |
 | `wait-window` | `-Title`, `-WaitSeconds`, `-Gone` | Wait until a window whose title contains the text is shown (or closed) (0.13.0+) |
 | `download` | `-Url`, `-Destination` | Guest fetches an `http://` URL to a guest path (http only, CRC32-verified) |
@@ -59,7 +61,27 @@ through the update server instead of `-Host`/`-Port`; MCP tools take
 `relay`. Turning remote help on is the owner's consent to testing, so do not
 wait for a reply before starting. A short `v9x_chat` heads-up that you are
 starting is welcome. Those machines still belong to other people: expect the
-owner to pause you. See [docs/remote-help.md](docs/remote-help.md).
+owner to pause you. An agent 0.15.0+ takes up to three relay calls at
+once, so a `screenshot`, `windows` or `cat` works while a long wait runs
+(a screenshot still waits for any running `exec`/`shell` to finish:
+exit 43, "execution active"). Older agents take one: a second `-Relay`
+call exits 21 ("busy") instead of ending the first. Recover a stuck call
+with `-RelayTakeOver` (MCP `relay_take_over`). See [docs/remote-help.md](docs/remote-help.md).
+
+**Tell the person at the machine what you are doing (agent 0.15.0+).** The
+agent keeps a plain-English activity log the owner opens from the tray
+(`C:\V9XREMOTE\EVENTS.LOG`). It already records when you connect, when you
+have been idle for 2 minutes ("safe to reboot or shut down"), and every
+reboot, shutdown, reset or update you request. Add the why with `note`
+(MCP `v9x_note`) as you go, one line per step, before you do it:
+
+```powershell
+.\scripts\v9xctl.ps1 note -Text "Probing the display adapter (read-only)" -Relay M-XXXXXX
+.\scripts\v9xctl.ps1 note -Text "Driver test 12: installing Velocity9x 0.31, reboot follows" -Relay M-XXXXXX
+```
+
+Write it for a tester, not for yourself: what is happening and whether they
+should keep their hands off. On an older agent `note` exits 23; skip it.
 
 ## Host scripts beyond v9xctl
 
@@ -81,6 +103,7 @@ agent, keep using `screenshot` and `input`.
 |---|---|
 | 0 | Success |
 | 20 | Connection or transport timeout failure |
+| 21 | Remote-help machine busy: other callers hold all its relay sessions |
 | 22 | Handshake or protocol violation |
 | 23 | Guest protocol error or missing capability |
 | 30 | Guest process could not start |
@@ -96,6 +119,7 @@ agent, keep using `screenshot` and `input`.
 | 46 | `reg` failure (key not found) |
 | 47 | `wait-file` / `-WaitForFile` deadline passed |
 | 48 | `wait-window` / `-WaitForWindow` / `screenshot -Window`: no such window, or the deadline passed |
+| 49 | `wait-process` / `exec -WaitForExit`: the process still runs at the deadline |
 
 Treat 20 as "the VM is off, still booting, or the forward is missing". Do not
 retry it in a loop of your own: add `-WaitForAgent <seconds>` and v9xctl
@@ -116,7 +140,65 @@ or too long (slow), and each extra call costs a connection.
 | a program's window, then to look at it | `exec -Detach -WaitForWindow <title>`, then `screenshot -Window <title>` |
 | a dialog to close | `wait-window -Title <text> -Gone` |
 | a program to write its result file | `exec ... -WaitForFile <path>` or `wait-file -Path <path> [-StableMs 1000]` |
+| a report file to say it is finished (the file exists from the start) | `wait-file -Path <path> -Match "Complete=yes"` |
+| a program (benchmark, installer) to exit | `exec -Application <exe> -WaitForExit`, or `wait-process -Pid <exec's Pid>` / `-Name <image>` |
+| each progress line of a log as it is written | `cat -Path <log> -Follow [-Match <text>] [-Until <text>]` |
 | a GUI step to repaint | `input -Sequence ... -OutFile shot.png` (`-SettleMs`, default 500) |
+
+A hand-written loop of `Start-Sleep` and `get`/`cat`/`ps`/`screenshot` is
+always one of these. If none fits, say what is missing rather than writing
+the loop.
+
+## Long jobs: wait in the background, get woken when it ends
+
+A benchmark, an install or a test run can take ten minutes or two hours.
+Do not guess its length with a sleep or a scheduled wake-up, and do not
+hold the conversation on a long blocking call: foreground commands and MCP
+tool calls time out (often at 2 to 10 minutes), and a guessed delay is
+either too short (you poll again) or too long (you sit idle after it
+finished).
+
+Instead, start the blocking v9xctl wait **as a background command**. Its
+exit is the event: if your harness runs commands in the background and
+notifies you when they exit (Claude Code: `run_in_background`), you are
+woken the moment the guest finishes, with the result as the command's
+output. Waits survive a dropped connection (they reconnect), poll gently
+(once a second after the first 10 s), and take `-WaitSeconds` up to 86400.
+
+```powershell
+# Start the benchmark and wait for its process to end: ONE background command.
+.\scripts\v9xctl.ps1 exec -Application C:\BENCH\BENCH.EXE -Arguments /auto -WaitForExit -WaitSeconds 7200 -Json
+# The program marks a report finished instead of exiting:
+.\scripts\v9xctl.ps1 wait-file -Path C:\BENCH\REPORT.INI -Match Complete=yes -WaitSeconds 7200 -Json
+# Already running (started by hand, by a batch file, by a previous step):
+.\scripts\v9xctl.ps1 wait-process -Name BENCH.EXE -WaitSeconds 7200 -Json
+```
+
+From the Bash tool, run it through `powershell.exe -NoProfile
+-ExecutionPolicy Bypass -File scripts/v9xctl.ps1 ...` with the same
+arguments. Exit 0 means the condition holds; 47/49 mean the deadline
+passed (the job is still running: wait again, do not assume it failed).
+
+To watch progress rather than only the end, stream the log: `cat -Path
+<log> -Follow -Until "<final line text>"` prints each new line as it is
+written (one stdout line each, flushed), so a line-streaming monitor
+(Claude Code's Monitor tool) turns every progress line into an event, and
+the command exits on the final line. Keep `-Match` narrow so you are not
+woken for noise.
+
+While a background wait runs, do other work or end your turn; do not poll
+it. The MCP server has the same waits (`v9x_wait_process`, `v9x_wait_file`
+with `match`, `wait_for_exit` on `v9x_exec`), but an MCP call blocks the
+conversation, so use them only for waits of a minute or two.
+
+## Old agents: update first
+
+The waits above, `ps`, `cat`, `windows` and the rest need agent 0.13.0+, and
+`exec`'s `Pid` needs 0.14.0+. When a verb exits 23 because the agent is
+older, update the agent (`update -Source .\build\install`, hot, no reboot)
+and carry on with the proper verb. Do not write a sleep-and-poll workaround
+for a feature an update provides. The exception is a machine you were told
+not to change.
 
 ## The golden loop
 

@@ -63,6 +63,11 @@
 #define V9X_MSG_REG_QUERY_REQUEST  0x0090u
 #define V9X_MSG_REG_QUERY_RESPONSE 0x8090u
 #define V9X_REG_TRUNCATED 0x00000001ul
+/* A line for the tester's activity log, EVENTS.LOG (V9X_CAP_EVENT_LOG,
+   0.15.0+): "attempting driver test 12", "rebooting to try VBE". */
+#define V9X_MSG_EVENT_NOTE_REQUEST  0x00A0u
+#define V9X_MSG_EVENT_NOTE_RESPONSE 0x80A0u
+#define V9X_EVENT_NOTE_MAX 200ul
 #define V9X_MSG_INFO_REQUEST   0x0030u
 #define V9X_MSG_INFO_RESPONSE  0x8030u
 #define V9X_MSG_REBOOT_REQUEST   0x0040u
@@ -121,6 +126,15 @@
    (0.13.0+); what wait-window, exec -WaitForWindow and screenshot -Window
    poll instead of a caller's fixed sleep. */
 #define V9X_CAP_WINDOWS        0x00200000ul
+/* EXEC_REQUEST accepts V9X_EXEC_OPTION_PID (0.14.0+): EXEC_COMPLETE grows to
+   32 bytes with the child's pid, so a detached launch can be waited on
+   (PROCESS_LIST) or killed. Older agents reject the option bit, so hosts
+   check this capability first. */
+#define V9X_CAP_EXEC_PID       0x00400000ul
+/* EVENT_NOTE (0.15.0+). The agent also writes its own plain-English lines
+   to C:\V9XREMOTE\EVENTS.LOG (connected, idle, reboot requested) and keeps
+   the remote-help chat in CHAT.LOG across reboots. */
+#define V9X_CAP_EVENT_LOG      0x00800000ul
 #define V9X_INFO_FLAG_EXTENDED 0x00000001ul
 #define V9X_CAPABILITIES (V9X_CAP_INFO | V9X_CAP_PING | \
                           V9X_CAP_EXEC_DIRECT | V9X_CAP_EXEC_SHELL | \
@@ -132,7 +146,8 @@
                           V9X_CAP_INSTALL_ID | V9X_CAP_INPUT_RELATIVE | \
                           V9X_CAP_HARD_RESET | V9X_CAP_SCREENSHOT_OPTIONS | \
                           V9X_CAP_FILE_TOOLS | V9X_CAP_PROCESS | \
-                          V9X_CAP_REGISTRY | V9X_CAP_WINDOWS)
+                          V9X_CAP_REGISTRY | V9X_CAP_WINDOWS | \
+                          V9X_CAP_EXEC_PID | V9X_CAP_EVENT_LOG)
 
 /* PUT/GET (0.11.0+, 256 MiB before) and DOWNLOAD all stream 32 KiB chunks
  * straight to disk. 2 GiB - 1 keeps every size inside the u32 wire fields
@@ -144,7 +159,8 @@
 #define V9X_EXEC_MODE_DIRECT 0u
 #define V9X_EXEC_MODE_SHELL  1u
 #define V9X_EXEC_OPTION_DETACH 0x0001u
-#define V9X_EXEC_OPTION_MASK   0x0001u
+#define V9X_EXEC_OPTION_PID    0x0002u  /* append the child pid to EXEC_COMPLETE */
+#define V9X_EXEC_OPTION_MASK   0x0003u
 #define V9X_EXEC_RESULT_OK            0ul
 #define V9X_EXEC_RESULT_CREATE_FAILED 1ul
 #define V9X_EXEC_RESULT_TIMEOUT       2ul

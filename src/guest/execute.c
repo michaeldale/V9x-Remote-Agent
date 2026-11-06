@@ -248,7 +248,8 @@ static DWORD WINAPI v9x_execution_worker(LPVOID parameter)
     int stderr_broken = 0;
     int eof_seen = 0;
     int detach;
-    unsigned char complete[28];
+    DWORD child_pid = 0ul;
+    unsigned char complete[32];
     char command_line[2320];
     BOOL created = FALSE;
 
@@ -321,7 +322,8 @@ static DWORD WINAPI v9x_execution_worker(LPVOID parameter)
         goto complete_job;
     }
     CloseHandle(process.hThread); process.hThread = 0;
-    if (!detach) job->process_id = process.dwProcessId;
+    child_pid = process.dwProcessId;
+    if (!detach) job->process_id = child_pid;
 
     result = V9X_EXEC_RESULT_OK;
     if (detach) {
@@ -414,8 +416,10 @@ complete_job:
     v9x_write_u32(complete + 16, stdout_total);
     v9x_write_u32(complete + 20, stderr_total);
     v9x_write_u32(complete + 24, flags);
+    v9x_write_u32(complete + 28, child_pid);
     (void)v9x_send_frame(job->owner, V9X_MSG_EXEC_COMPLETE, job->request_id,
-                         complete, sizeof(complete));
+                         complete,
+                         (job->options & V9X_EXEC_OPTION_PID) != 0u ? 32ul : 28ul);
     {
         char detail[160];
         unsigned long at = 0ul;

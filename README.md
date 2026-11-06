@@ -340,6 +340,13 @@ isolated development network. Details in [SECURITY.md](SECURITY.md).
 
 Working notes, newest first:
 
+- [docs/issues/2026-11-05-relay-silent-guest-during-3d.md](docs/issues/2026-11-05-relay-silent-guest-during-3d.md):
+  a remote-help guest running full-screen 3D stops checking in; 0.15.0 logs
+  the silence (`remote-poll-gap`) and reports it once a minute while a
+  session waits.
+- [docs/issues/2026-11-05-relay-one-session-per-machine.md](docs/issues/2026-11-05-relay-one-session-per-machine.md):
+  the relay runs one session per machine, so a long wait blocks every other
+  call; needs a server change.
 - [docs/decisions/2026-10-20-remote-help-relay.md](docs/decisions/2026-10-20-remote-help-relay.md):
   remote help as an opaque byte relay through the update server, with every
   command chunk Ed25519-signed on the developer's PC; why not server-side

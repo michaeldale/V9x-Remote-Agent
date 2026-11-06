@@ -20,6 +20,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 
 DEFAULT_SERVER = "https://michaeldale.com.au"
 CHUNK_MAX = 1048576
@@ -28,6 +29,12 @@ WAIT_MAX = 20
 
 class RelayError(Exception):
     pass
+
+
+class RelayBusyError(RelayError):
+    """Another caller is using the machine's relay session; the server
+    refused to replace it. Wait for that call to finish, or open with
+    take_over=True."""
 
 
 def _home_file(name):
@@ -108,6 +115,8 @@ class RelayConfig:
         except (ValueError, UnicodeDecodeError):
             raise RelayError("relay server answered %d with something other than JSON" % status)
         if status != 200 or not value.get("success", False):
+            if value.get("busy") is True:
+                raise RelayBusyError(value.get("message") or "machine is busy")
             raise RelayError(value.get("message") or "relay server error %d" % status)
         return value
 
@@ -135,7 +144,12 @@ class RelaySession:
     # V9xClient.put_stream keeps this many 32 KiB chunks in flight (1 MiB).
     pipeline_window = 32
 
-    def __init__(self, config, machine, open_wait=150.0, timeout=60.0):
+    def __init__(self, config, machine, open_wait=150.0, timeout=60.0,
+                 owner=None, label="", take_over=False):
+        """owner (32 hex) names the caller: a session it opened earlier is
+        replaced (a reconnect), anyone else's live session makes the server
+        refuse with RelayBusyError unless take_over is set. label (a tool or
+        verb name) is shown to whoever finds the machine busy."""
         config.check()
         self.config = config
         self.machine = machine.upper()
@@ -145,7 +159,13 @@ class RelaySession:
         self.down_seq = 1
         self.up_after = 0
         self.closed = False
-        opened = config.json("open", {"machine": self.machine}, method="POST")
+        self.owner = owner or uuid.uuid4().hex
+        params = {"machine": self.machine, "owner": self.owner}
+        if label:
+            params["label"] = label
+        if take_over:
+            params["replace"] = "1"
+        opened = config.json("open", params, method="POST")
         self.session = opened["session"]
         self.install_id = opened["install_id"]
         deadline = time.monotonic() + open_wait

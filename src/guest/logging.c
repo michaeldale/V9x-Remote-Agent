@@ -3,6 +3,9 @@
 
 static const char v9x_log_path[] = "C:\\V9XREMOTE\\AGENT.LOG";
 static const char v9x_log_old_path[] = "C:\\V9XREMOTE\\AGENT.OLD";
+static const char v9x_events_path[] = "C:\\V9XREMOTE\\EVENTS.LOG";
+static const char v9x_events_old_path[] = "C:\\V9XREMOTE\\EVENTS.OLD";
+#define V9X_EVENTS_ROTATE_BYTES 65536ul
 #define V9X_LOG_ROTATE_BYTES 262144ul
 #define V9X_LOG_EVENT_MAX 160ul
 #define V9X_LOG_DETAIL_MAX 240ul
@@ -53,50 +56,85 @@ static unsigned long v9x_log_copy(char *target, unsigned long offset,
     return offset + length;
 }
 
-/* Rotate AGENT.LOG to AGENT.OLD once it passes the size cap so the log never
-   grows without bound (design section 8.8). The move needs no open handle, so
-   this runs before the append opens the file. */
-static void v9x_log_rotate(void)
+/* Rotate a log to its .OLD once it passes `cap` bytes so it never grows
+   without bound (design section 8.8). The move needs no open handle, so this
+   runs before the append opens the file. */
+static void v9x_log_rotate_file(const char *path, const char *old_path,
+                                unsigned long cap)
 {
     HANDLE file;
     DWORD size;
     DWORD high = 0ul;
-    file = CreateFileA(v9x_log_path, GENERIC_READ,
+    file = CreateFileA(path, GENERIC_READ,
                        FILE_SHARE_READ | FILE_SHARE_WRITE, 0, OPEN_EXISTING,
                        FILE_ATTRIBUTE_NORMAL, 0);
     if (file == INVALID_HANDLE_VALUE) return;
     size = GetFileSize(file, &high);
     CloseHandle(file);
-    if (high == 0ul && size != 0xfffffffful && size < V9X_LOG_ROTATE_BYTES) {
+    if (high == 0ul && size != 0xfffffffful && size < cap) {
         return;
     }
-    (void)DeleteFileA(v9x_log_old_path);
-    (void)MoveFileA(v9x_log_path, v9x_log_old_path);
+    (void)DeleteFileA(old_path);
+    (void)MoveFileA(path, old_path);
+}
+
+/* "YYYY-MM-DD HH:MM" (and ":SS" when `seconds`) at target[0]; returns the
+   length. */
+unsigned long v9x_log_stamp(char *target, int seconds)
+{
+    SYSTEMTIME now;
+    unsigned long offset = 0ul;
+    GetLocalTime(&now);
+    offset = v9x_log_pad(target, offset, now.wYear, 4ul);
+    target[offset++] = '-';
+    offset = v9x_log_pad(target, offset, now.wMonth, 2ul);
+    target[offset++] = '-';
+    offset = v9x_log_pad(target, offset, now.wDay, 2ul);
+    target[offset++] = ' ';
+    offset = v9x_log_pad(target, offset, now.wHour, 2ul);
+    target[offset++] = ':';
+    offset = v9x_log_pad(target, offset, now.wMinute, 2ul);
+    if (seconds) {
+        target[offset++] = ':';
+        offset = v9x_log_pad(target, offset, now.wSecond, 2ul);
+    }
+    target[offset] = '\0';
+    return offset;
+}
+
+/* Append bytes to a log, rotating it first. Two agent threads can append at
+   once and the file is opened without write sharing, so a sharing
+   violation is retried briefly instead of losing the line. */
+int v9x_log_append_file(const char *path, const char *old_path,
+                        unsigned long cap, const char *data,
+                        unsigned long length)
+{
+    HANDLE file = INVALID_HANDLE_VALUE;
+    DWORD written = 0ul;
+    int attempt;
+    if (v9x_log_frozen) return 0;
+    v9x_log_rotate_file(path, old_path, cap);
+    for (attempt = 0; attempt < 20; ++attempt) {
+        file = CreateFileA(path, GENERIC_WRITE, FILE_SHARE_READ, 0,
+                           OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, 0);
+        if (file != INVALID_HANDLE_VALUE) break;
+        if (GetLastError() != ERROR_SHARING_VIOLATION) return 0;
+        Sleep(10ul);
+    }
+    if (file == INVALID_HANDLE_VALUE) return 0;
+    (void)SetFilePointer(file, 0l, 0, FILE_END);
+    (void)WriteFile(file, data, (DWORD)length, &written, 0);
+    CloseHandle(file);
+    return written == (DWORD)length;
 }
 
 void v9x_log_event(const char *event_name, const char *detail)
 {
-    HANDLE file;
-    DWORD written;
-    SYSTEMTIME now;
     char line[V9X_LOG_LINE_MAX];
     unsigned long offset = 0ul;
 
     if (v9x_log_frozen) return;
-    v9x_log_rotate();
-
-    GetLocalTime(&now);
-    offset = v9x_log_pad(line, offset, now.wYear, 4ul);
-    line[offset++] = '-';
-    offset = v9x_log_pad(line, offset, now.wMonth, 2ul);
-    line[offset++] = '-';
-    offset = v9x_log_pad(line, offset, now.wDay, 2ul);
-    line[offset++] = ' ';
-    offset = v9x_log_pad(line, offset, now.wHour, 2ul);
-    line[offset++] = ':';
-    offset = v9x_log_pad(line, offset, now.wMinute, 2ul);
-    line[offset++] = ':';
-    offset = v9x_log_pad(line, offset, now.wSecond, 2ul);
+    offset = v9x_log_stamp(line, 1);
     line[offset++] = ' ';
     line[offset++] = 'b';
     offset = v9x_log_pad(line, offset, v9x_log_boot, 1ul);
@@ -108,18 +146,41 @@ void v9x_log_event(const char *event_name, const char *detail)
     }
     line[offset++] = '\r';
     line[offset++] = '\n';
-
-    file = CreateFileA(v9x_log_path, GENERIC_WRITE, FILE_SHARE_READ, 0,
-                       OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, 0);
-    if (file == INVALID_HANDLE_VALUE) {
-        return;
-    }
-    (void)SetFilePointer(file, 0l, 0, FILE_END);
-    (void)WriteFile(file, line, (DWORD)offset, &written, 0);
-    CloseHandle(file);
+    (void)v9x_log_append_file(v9x_log_path, v9x_log_old_path,
+                              V9X_LOG_ROTATE_BYTES, line, offset);
 }
 
 void v9x_log_line(const char *event_name)
 {
     v9x_log_event(event_name, 0);
+}
+
+/* The tester-facing activity log, EVENTS.LOG: one plain-English line per
+   thing a person at the machine may want to know ("Developer connected",
+   "Idle: safe to reboot", the developer's own NOTE lines), opened from the
+   tray. AGENT.LOG stays the technical record. `text` and `detail` are
+   joined as given; control characters become spaces. */
+void v9x_event(const char *text, const char *detail)
+{
+    char line[V9X_LOG_LINE_MAX];
+    unsigned long offset;
+    const char *part[2];
+    int which;
+    if (v9x_log_frozen) return;
+    offset = v9x_log_stamp(line, 1);
+    line[offset++] = ' ';
+    part[0] = text;
+    part[1] = detail;
+    for (which = 0; which < 2; ++which) {
+        const char *at = part[which];
+        if (at == 0) continue;
+        while (*at != '\0' && offset < V9X_LOG_LINE_MAX - 3ul) {
+            unsigned char ch = (unsigned char)*at++;
+            line[offset++] = ch < 0x20u ? ' ' : (char)ch;
+        }
+    }
+    line[offset++] = '\r';
+    line[offset++] = '\n';
+    (void)v9x_log_append_file(v9x_events_path, v9x_events_old_path,
+                              V9X_EVENTS_ROTATE_BYTES, line, offset);
 }

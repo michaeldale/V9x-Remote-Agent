@@ -769,6 +769,27 @@ static int v9x_handle_window_list(V9xConnection *conn, DWORD request_id)
                           conn->file_response, walk.offset);
 }
 
+/* ---- EVENT_NOTE ----------------------------------------------------- */
+
+/* The developer says what they are about to do, for the person at the
+   machine: "Developer: attempting driver test 12" in EVENTS.LOG. */
+static int v9x_handle_event_note(V9xConnection *conn, DWORD request_id,
+                                 const unsigned char *payload, unsigned long length)
+{
+    char text[V9X_EVENT_NOTE_MAX + 1ul];
+    unsigned long offset = 0ul;
+    if (!v9x_tools_string(payload, length, &offset, text, V9X_EVENT_NOTE_MAX, 0) ||
+        offset != length) {
+        return v9x_tools_error(conn, request_id, V9X_STATUS_INVALID_PAYLOAD,
+                               ERROR_INVALID_PARAMETER,
+                               "invalid note (1-200 ASCII characters)");
+    }
+    v9x_log_event("event-note", text);
+    v9x_event("Developer: ", text);
+    return v9x_send_frame(conn, V9X_MSG_EVENT_NOTE_RESPONSE, request_id,
+                          conn->response, 0ul);
+}
+
 /* ---- dispatch ------------------------------------------------------- */
 
 int v9x_is_tools_message(unsigned short type)
@@ -776,7 +797,8 @@ int v9x_is_tools_message(unsigned short type)
     return type == V9X_MSG_FILE_DELETE_REQUEST || type == V9X_MSG_FILE_HASH_REQUEST ||
            type == V9X_MSG_FILE_READ_TEXT_REQUEST ||
            type == V9X_MSG_PROCESS_LIST_REQUEST || type == V9X_MSG_PROCESS_KILL_REQUEST ||
-           type == V9X_MSG_REG_QUERY_REQUEST || type == V9X_MSG_WINDOW_LIST_REQUEST;
+           type == V9X_MSG_REG_QUERY_REQUEST || type == V9X_MSG_WINDOW_LIST_REQUEST ||
+           type == V9X_MSG_EVENT_NOTE_REQUEST;
 }
 
 int v9x_handle_tools_message(V9xConnection *conn, unsigned short type,
@@ -797,6 +819,8 @@ int v9x_handle_tools_message(V9xConnection *conn, unsigned short type,
         return v9x_handle_reg_query(conn, request_id, payload, length);
     if (type == V9X_MSG_WINDOW_LIST_REQUEST && length == 0ul)
         return v9x_handle_window_list(conn, request_id);
+    if (type == V9X_MSG_EVENT_NOTE_REQUEST)
+        return v9x_handle_event_note(conn, request_id, payload, length);
     return v9x_tools_error(conn, request_id, V9X_STATUS_INVALID_PAYLOAD,
                            ERROR_INVALID_PARAMETER, "invalid request");
 }

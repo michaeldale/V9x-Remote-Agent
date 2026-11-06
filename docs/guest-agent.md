@@ -97,7 +97,30 @@ the same way and restarting the agent), **Check for updates...**
 "Install update x.y.z..." once a quiet startup check found one), and, while
 remote help is on, **Pause remote help** / **Resume remote help** and **Chat
 with developer...**. A message from the developer opens the chat window by
-itself, with a beep. The tooltip reads "In use: last command N s ago from
+itself, with a beep. Since 0.15.0 the conversation is also kept in
+`C:\V9XREMOTE\CHAT.LOG` (dated lines, `CHAT.OLD` past 64 KiB) and the newest
+8 KiB is reloaded when the agent starts, so a reply that arrived just
+before a reboot is still there afterwards.
+
+**Activity log...** (0.15.0+, always in the menu) opens
+`C:\V9XREMOTE\EVENTS.LOG` in Notepad: a dated plain-English line for each
+thing a tester may want to know, written as it happens:
+
+```text
+2026-11-06 13:39:22 Agent started, version 0.15.0
+2026-11-06 13:39:22 Remote help: connected to the server
+2026-11-06 13:39:23 Developer connected (remote help)
+2026-11-06 13:39:31 Developer: Driver test 12: installing Velocity9x 0.31, reboot follows
+2026-11-06 13:40:02 Developer requested a reboot
+2026-11-06 13:41:10 Agent started, version 0.15.0
+2026-11-06 13:44:12 Idle: no developer activity for 2 minutes (safe to reboot or shut down)
+```
+
+"Developer connected" is written at the first command after an idle spell;
+"Idle" once no command has arrived for 2 minutes and no connection is open
+(a running exec keeps it open). `Developer: ...` lines are the developer's
+own `note` calls. Rotates to `EVENTS.OLD` at 64 KiB; `AGENT.LOG` remains the
+technical record. The tooltip reads "In use: last command N s ago from
 <address or relay>" for a minute after any command other than HELLO and
 PING, and with remote help on it switches to a shorter form ending in
 "Remote help: on|paused|in session|offline". Remote help itself, its

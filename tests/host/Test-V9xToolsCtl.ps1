@@ -21,7 +21,7 @@ $server = Start-Job -ArgumentList $port, $protocolScript, $localSha -ScriptBlock
     param($Port, $ProtocolScript, [byte[]]$Sha)
     $ErrorActionPreference = 'Stop'
     . $ProtocolScript
-    $allTools = [uint32](0x7f -bor 0x40000 -bor 0x80000 -bor 0x100000 -bor 0x200000)
+    $allTools = [uint32](0x7f -bor 0x40000 -bor 0x80000 -bor 0x100000 -bor 0x200000 -bor 0x800000)
     function Send-Hello($Stream, $RequestId, [uint32]$Capabilities) {
         $payload = [Collections.Generic.List[byte]]::new()
         $payload.AddRange([BitConverter]::GetBytes([uint16]0x0100))
@@ -83,7 +83,10 @@ $server = Start-Job -ArgumentList $port, $protocolScript, $localSha -ScriptBlock
               Reply $s $r 0x8090 ([byte[]]((U32 1) + (U32 4) + (U32 0) + (Str 'Sub') + $values)) },
             { param($s)  # delete -Recurse -Force
               $r = Expect-Request $s 0x0028 (Hex ((U32 3) + (Str 'C:\JOBS\OLD')))
-              Reply $s $r 0x8028 ([byte[]]((U32 5) + (U32 2))) }
+              Reply $s $r 0x8028 ([byte[]]((U32 5) + (U32 2))) },
+            { param($s)  # note: the en dash arrives as '?', the tab as a space
+              $r = Expect-Request $s 0x00A0 (Hex (Str 'Driver test 12 ? VBE fallback'))
+              Reply $s $r 0x80A0 ([byte[]]@()) }
         )
         foreach ($step in $steps) {
             $client = $listener.AcceptTcpClient()
@@ -192,6 +195,10 @@ try {
     if ($delete.FilesDeleted -ne 5 -or $delete.DirectoriesDeleted -ne 2) {
         throw "delete result mismatch: $($delete | ConvertTo-Json -Compress)"
     }
+    $note = Invoke-FixtureClient @('note', '-Text', ("Driver test 12 " + [char]0x2013 + "`tVBE fallback"))
+    if ($note.Text -ne 'Driver test 12 ? VBE fallback') { throw "note result mismatch: $($note | ConvertTo-Json -Compress)" }
+    # Usage errors never connect: empty after cleaning, and over 200 characters.
+    Invoke-FixtureClient @('note', '-Text', ('x' * 201)) 10 | Out-Null
     Invoke-FixtureClient @('delete', '-Path', 'C:\X') 23 | Out-Null
     $waited = Invoke-FixtureClient @('wait-file', '-Path', 'C:\JOBS\DONE.TXT', '-WaitSeconds', '10')
     if (-not $waited.Exists -or $waited.Size -ne 12) { throw "wait-file result mismatch: $($waited | ConvertTo-Json -Compress)" }
@@ -212,4 +219,4 @@ try {
     if (Test-Path -LiteralPath $testRoot) { Remove-Item -LiteralPath $testRoot -Recurse -Force }
 }
 
-Write-Output 'PASS: v9xctl delete, hash, cat, ps, kill, reg, wait-file (with pre-HELLO retry) and wait-window against protocol fixture'
+Write-Output 'PASS: v9xctl delete, hash, cat, ps, kill, reg, note, wait-file (with pre-HELLO retry) and wait-window against protocol fixture'

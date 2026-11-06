@@ -121,4 +121,5 @@ Write-Output 'PASS: native C frame, bounds, and encoding tests'
 & (Join-Path $repoRoot 'tests\host\Test-V9xFileCtl.ps1')
 & (Join-Path $repoRoot 'tests\host\Test-V9xM4Ctl.ps1')
 & (Join-Path $repoRoot 'tests\host\Test-V9xToolsCtl.ps1')
+& (Join-Path $repoRoot 'tests\host\Test-V9xWaitCtl.ps1')
 & (Join-Path $repoRoot 'tests\host\Test-V9xDiscovery.ps1')

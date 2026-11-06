@@ -1,6 +1,7 @@
 #include "agent.h"
 #include "installid_win.h"
 #include "platform_win.h"
+#include "v9xremote/version.h"
 
 static const char v9x_mutex_name[] = V9X_AGENT_MUTEX_NAME;
 static const char v9x_root[] = "C:\\V9XREMOTE";
@@ -268,6 +269,7 @@ void v9x_agent_run(void)
     state.remote_wake = 0;
     state.remote_machine[0] = '\0';
     state.last_command_set = 0l;
+    state.developer_active = 0l;
     state.last_command_tick = 0ul;
     state.last_command_type = 0u;
     state.last_command_source[0] = '\0';
@@ -287,6 +289,8 @@ void v9x_agent_run(void)
     v9x_load_pending_job(&state);
     InitializeCriticalSection(&state.screenshot_lock);
     v9x_log_line("agent-start");
+    v9x_event("Agent started, version " V9X_AGENT_VERSION, 0);
+    v9x_chat_load(&state);
     if (!state.allow_dos_vm) v9x_log_line("dos-vm-disallowed");
     v9x_hotswap_cleanup();
     if (!v9x_tray_start(&state)) v9x_log_line("tray-icon-failed");

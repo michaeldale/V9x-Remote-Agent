@@ -28,6 +28,12 @@ static const char v9x_remote_status_ini[] = "C:\\V9XREMOTE\\STATUS.INI";
 #define V9X_REMOTE_HEARTBEAT_MS 15000ul
 #define V9X_REMOTE_BODY_MAX 4096ul
 #define V9X_REMOTE_URL_MAX 512ul
+/* Relay sessions run at once, each on its own thread and loopback
+   connection (0.15.0+; the poll says max_sessions= so the server lets a
+   second caller in while a long wait holds the first). One slot stays for
+   a LAN client: V9X_MAX_CONNECTIONS is 4. An older server only ever offers
+   one session, so this is also exactly the old behaviour there. */
+#define V9X_RELAY_SESSIONS_MAX 3
 
 typedef struct V9xRemote {
     V9xAgentState *state;
@@ -46,7 +52,33 @@ typedef struct V9xRemote {
     char session_id[40];
     char session_state[16];
     int stop;
+    /* When the last check-in succeeded, and how soon the next one was due:
+       a longer silence is logged (remote-poll-gap), which is how a guest
+       that went deaf during full-screen 3D shows how long it was gone. */
+    DWORD last_ok_tick;
+    unsigned long expect_seconds;
+    /* A session worker runs on its own copy (own buffers); parent is the
+       check-in thread's, whose stop flag ends every session. */
+    struct V9xRemote *parent;
+    /* Pending sessions the last check-in offered, for the check-in thread
+       to start. */
+    char offered[V9X_RELAY_SESSIONS_MAX][40];
+    int offered_count;
 } V9xRemote;
+
+typedef struct V9xRelaySlot {
+    volatile LONG used;
+    char id[40];
+} V9xRelaySlot;
+
+static V9xRelaySlot v9x_relay_slots[V9X_RELAY_SESSIONS_MAX];
+static CRITICAL_SECTION v9x_relay_slot_lock;
+
+typedef struct V9xRelayWorker {
+    V9xRemote *parent;
+    int slot;
+    char session[40];
+} V9xRelayWorker;
 
 /* ---- small text helpers (no C runtime) ------------------------------ */
 
@@ -171,6 +203,69 @@ void v9x_note_command(V9xConnection *conn, unsigned short type)
     v9x_rt_copy(state->last_command_source, sizeof(state->last_command_source),
                 conn->peer);
     InterlockedExchange(&state->last_command_set, 1l);
+    if (InterlockedExchange(&state->developer_active, 1l) == 0l) {
+        v9x_event(conn->is_relay ? "Developer connected (remote help)" :
+                                   "Developer connected from ",
+                  conn->is_relay ? 0 : conn->peer);
+    }
+}
+
+/* Called every few seconds (tray worker, remote worker): the idle edge.
+   An open connection keeps it busy (an exec being waited on); a client
+   that went quiet is closed by idle_timeout, which then lets this fire. */
+void v9x_activity_tick(V9xAgentState *state)
+{
+    long age;
+    if (!v9x_flag_read(&state->developer_active)) return;
+    age = v9x_last_command_age(state);
+    if (age < V9X_IDLE_SECONDS || v9x_flag_read(&state->active_connections) != 0l) return;
+    if (InterlockedExchange(&state->developer_active, 0l) != 0l) {
+        v9x_event("Idle: no developer activity for 2 minutes "
+                  "(safe to reboot or shut down)", 0);
+    }
+}
+
+/* ---- chat history (CHAT.LOG) ----------------------------------------- */
+
+static const char v9x_chat_path[] = "C:\\V9XREMOTE\\CHAT.LOG";
+static const char v9x_chat_old_path[] = "C:\\V9XREMOTE\\CHAT.OLD";
+#define V9X_CHAT_FILE_CAP 65536ul
+
+/* At start: the newest part of CHAT.LOG that fits the window, from a line
+   start, so a reply that arrived just before a reboot is still there. */
+void v9x_chat_load(V9xAgentState *state)
+{
+    HANDLE file;
+    DWORD size;
+    DWORD high = 0ul;
+    DWORD got = 0ul;
+    unsigned long want;
+    unsigned long start = 0ul;
+    unsigned long index;
+    file = CreateFileA(v9x_chat_path, GENERIC_READ,
+                       FILE_SHARE_READ | FILE_SHARE_WRITE, 0, OPEN_EXISTING,
+                       FILE_ATTRIBUTE_NORMAL, 0);
+    if (file == INVALID_HANDLE_VALUE) return;
+    size = GetFileSize(file, &high);
+    if (size == 0xfffffffful || high != 0ul) {
+        CloseHandle(file);
+        return;
+    }
+    want = size < V9X_CHAT_LOG_SIZE - 1ul ? size : V9X_CHAT_LOG_SIZE - 1ul;
+    (void)SetFilePointer(file, (LONG)(size - want), 0, FILE_BEGIN);
+    if (!ReadFile(file, state->chat_log, (DWORD)want, &got, 0)) got = 0ul;
+    CloseHandle(file);
+    if (want < size) {
+        /* Started mid-line: skip to the next one. */
+        while (start < got && state->chat_log[start] != '\n') ++start;
+        if (start < got) ++start;
+    }
+    for (index = start; index < got; ++index) {
+        char ch = state->chat_log[index];
+        state->chat_log[index - start] = ch == '\0' ? ' ' : ch;
+    }
+    state->chat_log_length = got - start;
+    state->chat_log[state->chat_log_length] = '\0';
 }
 
 long v9x_last_command_age(V9xAgentState *state)
@@ -183,26 +278,19 @@ long v9x_last_command_age(V9xAgentState *state)
    it is full. */
 void v9x_chat_append(V9xAgentState *state, const char *who, const char *text)
 {
-    char line[V9X_CHAT_LINE + 32];
+    char line[V9X_CHAT_LINE + 40];
     unsigned long length;
-    SYSTEMTIME now;
-    char clock[8];
-    GetLocalTime(&now);
-    clock[0] = (char)('0' + now.wHour / 10u);
-    clock[1] = (char)('0' + now.wHour % 10u);
-    clock[2] = ':';
-    clock[3] = (char)('0' + now.wMinute / 10u);
-    clock[4] = (char)('0' + now.wMinute % 10u);
-    clock[5] = ' ';
-    clock[6] = '\0';
-    line[0] = '\0';
-    (void)v9x_rt_append(line, sizeof(line), clock);
+    (void)v9x_log_stamp(line, 0);
+    (void)v9x_rt_append(line, sizeof(line), " ");
     (void)v9x_rt_append(line, sizeof(line), who);
     (void)v9x_rt_append(line, sizeof(line), ": ");
     (void)v9x_rt_append(line, sizeof(line), text);
     (void)v9x_rt_append(line, sizeof(line), "\r\n");
     length = (unsigned long)lstrlenA(line);
     EnterCriticalSection(&state->chat_lock);
+    /* Kept on disk too, so the conversation survives a reboot. */
+    (void)v9x_log_append_file(v9x_chat_path, v9x_chat_old_path,
+                              V9X_CHAT_FILE_CAP, line, length);
     while (state->chat_log_length + length + 1ul > V9X_CHAT_LOG_SIZE) {
         /* Drop the first line. */
         unsigned long cut = 0ul;
@@ -287,7 +375,14 @@ static void v9x_remote_status(V9xRemote *remote, LONG status, const char *text)
 {
     SYSTEMTIME now;
     char stamp[24];
-    InterlockedExchange(&remote->state->remote_status, status);
+    LONG previous = InterlockedExchange(&remote->state->remote_status, status);
+    if (previous != status && status == V9X_REMOTE_ONLINE) {
+        v9x_event("Remote help: connected to the server", 0);
+    } else if (previous != status && status == V9X_REMOTE_UNREACHABLE) {
+        v9x_event("Remote help: cannot reach the server (will keep trying)", 0);
+    } else if (previous != status && status == V9X_REMOTE_STOPPED) {
+        v9x_event("Remote help: this machine was retired on the server", 0);
+    }
     GetLocalTime(&now);
     stamp[0] = '\0';
     (void)v9x_rt_append_number(stamp, sizeof(stamp), (long)now.wYear);
@@ -480,10 +575,85 @@ static void v9x_remote_forget(V9xRemote *remote)
     (void)WritePrivateProfileStringA("remote", "secret", "", v9x_remote_ini);
 }
 
-/* Check in. Fills next_poll, session_id/state; delivers chat both ways.
-   Returns 1 on an ok reply. */
-static int v9x_remote_poll(V9xRemote *remote, const char *open_session)
+/* The sessions this agent is running, comma-separated, and the first of
+   them (the old single-session poll field). */
+static void v9x_relay_running(char *list, unsigned long capacity, char *first,
+                              unsigned long first_capacity)
 {
+    int slot;
+    list[0] = '\0';
+    first[0] = '\0';
+    EnterCriticalSection(&v9x_relay_slot_lock);
+    for (slot = 0; slot < V9X_RELAY_SESSIONS_MAX; ++slot) {
+        if (!v9x_relay_slots[slot].used || v9x_relay_slots[slot].id[0] == '\0') continue;
+        if (first[0] == '\0') v9x_rt_copy(first, first_capacity, v9x_relay_slots[slot].id);
+        if (list[0] != '\0') (void)v9x_rt_append(list, capacity, ",");
+        (void)v9x_rt_append(list, capacity, v9x_relay_slots[slot].id);
+    }
+    LeaveCriticalSection(&v9x_relay_slot_lock);
+}
+
+static int v9x_relay_is_running(const char *id)
+{
+    int slot;
+    int found = 0;
+    EnterCriticalSection(&v9x_relay_slot_lock);
+    for (slot = 0; slot < V9X_RELAY_SESSIONS_MAX; ++slot) {
+        if (v9x_relay_slots[slot].used && lstrcmpA(v9x_relay_slots[slot].id, id) == 0) found = 1;
+    }
+    LeaveCriticalSection(&v9x_relay_slot_lock);
+    return found;
+}
+
+static void v9x_relay_offer(V9xRemote *remote, const char *id)
+{
+    int index;
+    if (!v9x_relay_hex_id_valid(id) || v9x_relay_is_running(id)) return;
+    for (index = 0; index < remote->offered_count; ++index) {
+        if (lstrcmpA(remote->offered[index], id) == 0) return;
+    }
+    if (remote->offered_count >= V9X_RELAY_SESSIONS_MAX) return;
+    v9x_rt_copy(remote->offered[remote->offered_count++], 40ul, id);
+}
+
+/* The pending sessions in a check-in reply: [sessions] count=, 1=<id>,<state>
+   from a server that runs several (plugin DB version 5+), else the single
+   [session] section every server sends. */
+static void v9x_relay_collect(V9xRemote *remote, const V9xHttpResponse *response)
+{
+    char value[64];
+    char key[8];
+    long count = 0l;
+    int index;
+    int comma;
+    remote->offered_count = 0;
+    if (v9x_remote_value(remote, response, "sessions", "count", value, 8ul)) {
+        for (index = 0; value[index] >= '0' && value[index] <= '9'; ++index) {
+            count = count * 10l + (long)(value[index] - '0');
+        }
+        for (index = 1; index <= (int)count && index <= 8; ++index) {
+            key[0] = '\0';
+            (void)v9x_rt_append_number(key, sizeof(key), (long)index);
+            if (!v9x_remote_value(remote, response, "sessions", key, value, sizeof(value))) continue;
+            for (comma = 0; value[comma] != '\0' && value[comma] != ','; ++comma) {
+            }
+            if (value[comma] != ',' || lstrcmpA(value + comma + 1, "pending") != 0) continue;
+            value[comma] = '\0';
+            v9x_relay_offer(remote, value);
+        }
+        return;
+    }
+    if (remote->session_id[0] != '\0' && lstrcmpA(remote->session_state, "pending") == 0) {
+        v9x_relay_offer(remote, remote->session_id);
+    }
+}
+
+/* Check in. Fills next_poll, session_id/state (the old single [session]
+   section); delivers chat both ways. Returns 1 on an ok reply. */
+static int v9x_remote_poll(V9xRemote *remote)
+{
+    char running[V9X_RELAY_SESSIONS_MAX * 34 + 4];
+    char first_running[40];
     V9xAgentState *state = remote->state;
     V9xHttpResponse response;
     char value[V9X_CHAT_LINE * 3 + 4];
@@ -506,8 +676,13 @@ static int v9x_remote_poll(V9xRemote *remote, const char *open_session)
     (void)v9x_rt_append(remote->body, sizeof(remote->body), "\r\n");
     (void)v9x_rt_append_field(remote->body, sizeof(remote->body), "last_command_source",
                               state->last_command_source);
-    (void)v9x_rt_append_field(remote->body, sizeof(remote->body), "session",
-                              open_session != 0 ? open_session : "");
+    v9x_relay_running(running, sizeof(running), first_running, sizeof(first_running));
+    (void)v9x_rt_append_field(remote->body, sizeof(remote->body), "session", first_running);
+    (void)v9x_rt_append_field(remote->body, sizeof(remote->body), "sessions", running);
+    (void)v9x_rt_append(remote->body, sizeof(remote->body), "max_sessions=");
+    (void)v9x_rt_append_number(remote->body, sizeof(remote->body),
+                               (long)V9X_RELAY_SESSIONS_MAX);
+    (void)v9x_rt_append(remote->body, sizeof(remote->body), "\r\n");
     (void)v9x_rt_append_field(remote->body, sizeof(remote->body), "display_name",
                               remote->display_name);
     (void)v9x_rt_append_field(remote->body, sizeof(remote->body), "github", remote->github);
@@ -566,6 +741,31 @@ static int v9x_remote_poll(V9xRemote *remote, const char *open_session)
         LeaveCriticalSection(&state->chat_lock);
     }
 
+    {
+        /* Silent for well past the due time (30 s grace for a slow reply):
+           say so in AGENT.LOG, and to the tester past two minutes. */
+        DWORD now = GetTickCount();
+        if (remote->last_ok_tick != 0ul) {
+            unsigned long elapsed = (unsigned long)(now - remote->last_ok_tick) / 1000ul;
+            if (elapsed > remote->expect_seconds + 30ul) {
+                char detail[48];
+                detail[0] = '\0';
+                (void)v9x_rt_append_number(detail, sizeof(detail), (long)elapsed);
+                (void)v9x_rt_append(detail, sizeof(detail), "s expected ");
+                (void)v9x_rt_append_number(detail, sizeof(detail),
+                                           (long)remote->expect_seconds);
+                (void)v9x_rt_append(detail, sizeof(detail), "s");
+                v9x_log_event("remote-poll-gap", detail);
+                if (elapsed >= 120ul) {
+                    detail[0] = '\0';
+                    (void)v9x_rt_append_number(detail, sizeof(detail), (long)elapsed);
+                    (void)v9x_rt_append(detail, sizeof(detail), " s without contact");
+                    v9x_event("Remote help: back in touch with the server after ", detail);
+                }
+            }
+        }
+        remote->last_ok_tick = now == 0ul ? 1ul : now;
+    }
     remote->next_poll = V9X_REMOTE_IDLE_POLL;
     if (v9x_remote_value(remote, &response, "poll", "next_poll", value, 16ul)) {
         unsigned long seconds = 0ul;
@@ -574,6 +774,9 @@ static int v9x_remote_poll(V9xRemote *remote, const char *open_session)
         }
         if (seconds >= 1ul && seconds <= 3600ul) remote->next_poll = seconds;
     }
+    /* Sessions run on their own threads, so check-ins keep their pace
+       during one. */
+    remote->expect_seconds = remote->next_poll;
     remote->session_id[0] = '\0';
     remote->session_state[0] = '\0';
     if (v9x_remote_value(remote, &response, "session", "id", remote->session_id,
@@ -584,6 +787,7 @@ static int v9x_remote_poll(V9xRemote *remote, const char *open_session)
     } else {
         remote->session_id[0] = '\0';
     }
+    v9x_relay_collect(remote, &response);
 
     count = 0l;
     if (v9x_remote_value(remote, &response, "chat", "count", value, 8ul)) {
@@ -723,7 +927,7 @@ static void v9x_remote_session(V9xRemote *remote, const char *session_id)
     unsigned long expected = 1ul;
     unsigned long up_seq = 1ul;
     unsigned long offset;
-    DWORD last_heartbeat = GetTickCount();
+    DWORD last_contact = GetTickCount();
     long drained;
     int moved = 1;
     int fed;
@@ -756,7 +960,7 @@ static void v9x_remote_session(V9xRemote *remote, const char *session_id)
         return;
     }
     v9x_rt_copy(reason, sizeof(reason), "ended");
-    InterlockedExchange(&state->remote_session, 1l);
+    InterlockedIncrement(&state->remote_session);
     v9x_log_event("relay-session-open", session);
 
     for (;;) {
@@ -778,9 +982,19 @@ static void v9x_remote_session(V9xRemote *remote, const char *session_id)
         (void)v9x_rt_append(query, sizeof(query), "&after=");
         (void)v9x_rt_append_number(query, sizeof(query), (long)(expected - 1ul));
         (void)v9x_rt_append(query, sizeof(query), quiet ? "&wait=3" : "&wait=0");
-        if (v9x_remote_url(remote, "down", query) &&
-            v9x_remote_call(remote, "GET", 0, 0ul, &response) &&
-            response.status == 200ul) {
+        if (!v9x_remote_url(remote, "down", query) ||
+            !v9x_remote_call(remote, "GET", 0, 0ul, &response)) {
+            /* The server is out of reach: give the session five minutes. */
+            if (GetTickCount() - last_contact >= 300000ul) {
+                v9x_rt_copy(reason, sizeof(reason), "server-unreachable");
+                break;
+            }
+        } else if (response.status == 404ul || response.status == 410ul) {
+            /* The session (or the machine) is gone on the server. */
+            server_closed = 1;
+            break;
+        } else if (response.status == 200ul) {
+            last_contact = GetTickCount();
             if (v9x_rt_ci_find(remote->reply, response.body_offset,
                                "x-v9x-session-state: closed")) {
                 server_closed = 1;
@@ -843,17 +1057,10 @@ static void v9x_remote_session(V9xRemote *remote, const char *session_id)
             break;
         }
 
-        /* Heartbeat: chat, pause and whether the session still stands. */
-        if (GetTickCount() - last_heartbeat >= V9X_REMOTE_HEARTBEAT_MS) {
-            last_heartbeat = GetTickCount();
-            if (v9x_remote_poll(remote, session) &&
-                (lstrcmpA(remote->session_id, session) != 0 ||
-                 lstrcmpA(remote->session_state, "open") != 0)) {
-                server_closed = 1;
-                break;
-            }
-            if (remote->stop) break;
-        }
+        /* Chat, pause and new sessions are the check-in thread's, which
+           keeps polling meanwhile; a session the server ended shows in the
+           down reply's X-V9X-Session-State. */
+        if (remote->parent != 0 && remote->parent->stop) break;
 
         /* The down request itself paces a quiet session (it waits up to
            3 s); this only keeps a server that answers at once from being
@@ -862,7 +1069,7 @@ static void v9x_remote_session(V9xRemote *remote, const char *session_id)
     }
 finished:
     closesocket(tunnel);
-    InterlockedExchange(&state->remote_session, 0l);
+    InterlockedDecrement(&state->remote_session);
     if (!server_closed) {
         query[0] = '\0';
         (void)v9x_rt_append(query, sizeof(query), "&reason=");
@@ -870,6 +1077,88 @@ finished:
         v9x_remote_session_call(remote, "close", session, query);
     }
     v9x_log_event("relay-session-closed", reason);
+}
+
+/* One relay session on its own thread, with its own copy of the check-in
+   state and its own buffers, so several sessions and the check-ins run at
+   the same time. */
+static DWORD WINAPI v9x_relay_worker_thread(LPVOID parameter)
+{
+    V9xRelayWorker *worker = (V9xRelayWorker *)parameter;
+    V9xRemote *own;
+    own = (V9xRemote *)VirtualAlloc(0, sizeof(V9xRemote), MEM_COMMIT, PAGE_READWRITE);
+    if (own != 0) {
+        unsigned long index;
+        const unsigned char *from = (const unsigned char *)worker->parent;
+        unsigned char *to = (unsigned char *)own;
+        /* no C runtime: CopyMemory would be memcpy */
+        for (index = 0ul; index < sizeof(V9xRemote); ++index) to[index] = from[index];
+        own->parent = worker->parent;
+        own->reply = (unsigned char *)VirtualAlloc(0, V9X_REMOTE_REPLY_MAX + 1ul,
+                                                   MEM_COMMIT, PAGE_READWRITE);
+        own->up = (unsigned char *)VirtualAlloc(0, V9X_REMOTE_UP_MAX, MEM_COMMIT,
+                                                PAGE_READWRITE);
+        if (own->reply != 0 && own->up != 0) {
+            v9x_remote_session(own, worker->session);
+        } else {
+            v9x_log_line("relay-session-alloc-failed");
+        }
+        if (own->reply != 0) (void)VirtualFree(own->reply, 0ul, MEM_RELEASE);
+        if (own->up != 0) (void)VirtualFree(own->up, 0ul, MEM_RELEASE);
+        (void)VirtualFree(own, 0ul, MEM_RELEASE);
+    }
+    EnterCriticalSection(&v9x_relay_slot_lock);
+    v9x_relay_slots[worker->slot].id[0] = '\0';
+    InterlockedExchange(&v9x_relay_slots[worker->slot].used, 0l);
+    LeaveCriticalSection(&v9x_relay_slot_lock);
+    /* Check in at once, so the server hears the session is over. */
+    if (worker->parent->state->remote_wake != 0) SetEvent(worker->parent->state->remote_wake);
+    (void)VirtualFree(worker, 0ul, MEM_RELEASE);
+    return 0ul;
+}
+
+/* Start a worker for each session the last check-in offered, while slots
+   last. Sessions beyond that stay pending; the server only offers that
+   many to an agent that said max_sessions. */
+static void v9x_relay_start_offered(V9xRemote *remote)
+{
+    int index;
+    int slot;
+    V9xRelayWorker *worker;
+    HANDLE thread;
+    DWORD thread_id;
+    for (index = 0; index < remote->offered_count; ++index) {
+        EnterCriticalSection(&v9x_relay_slot_lock);
+        for (slot = 0; slot < V9X_RELAY_SESSIONS_MAX && v9x_relay_slots[slot].used; ++slot) {
+        }
+        if (slot < V9X_RELAY_SESSIONS_MAX) {
+            v9x_relay_slots[slot].used = 1l;
+            v9x_rt_copy(v9x_relay_slots[slot].id, sizeof(v9x_relay_slots[slot].id),
+                        remote->offered[index]);
+        }
+        LeaveCriticalSection(&v9x_relay_slot_lock);
+        if (slot >= V9X_RELAY_SESSIONS_MAX) break;
+        worker = (V9xRelayWorker *)VirtualAlloc(0, sizeof(V9xRelayWorker), MEM_COMMIT,
+                                                PAGE_READWRITE);
+        thread = 0;
+        if (worker != 0) {
+            worker->parent = remote;
+            worker->slot = slot;
+            v9x_rt_copy(worker->session, sizeof(worker->session), remote->offered[index]);
+            thread = CreateThread(0, 65536ul, v9x_relay_worker_thread, worker, 0ul, &thread_id);
+        }
+        if (thread == 0) {
+            v9x_log_line("relay-session-thread-failed");
+            if (worker != 0) (void)VirtualFree(worker, 0ul, MEM_RELEASE);
+            EnterCriticalSection(&v9x_relay_slot_lock);
+            v9x_relay_slots[slot].id[0] = '\0';
+            v9x_relay_slots[slot].used = 0l;
+            LeaveCriticalSection(&v9x_relay_slot_lock);
+            break;
+        }
+        CloseHandle(thread);
+    }
+    remote->offered_count = 0;
 }
 
 static DWORD WINAPI v9x_remote_thread(LPVOID parameter)
@@ -888,6 +1177,8 @@ static DWORD WINAPI v9x_remote_thread(LPVOID parameter)
     }
     remote->state = (V9xAgentState *)parameter;
     remote->stop = 0;
+    remote->parent = 0;
+    remote->offered_count = 0;
     remote->next_poll = V9X_REMOTE_IDLE_POLL;
     v9x_remote_read_config(remote);
     while (remote->state->winsock_version == 0u) Sleep(1000ul);
@@ -904,7 +1195,7 @@ static DWORD WINAPI v9x_remote_thread(LPVOID parameter)
             }
             backoff = 30ul;
         }
-        if (!v9x_remote_poll(remote, 0)) {
+        if (!v9x_remote_poll(remote)) {
             if (remote->stop) break;
             if (remote->machine[0] == '\0') continue;
             v9x_remote_status(remote, V9X_REMOTE_UNREACHABLE, "unreachable");
@@ -913,11 +1204,8 @@ static DWORD WINAPI v9x_remote_thread(LPVOID parameter)
             continue;
         }
         backoff = 30ul;
-        if (remote->session_id[0] != '\0' &&
-            lstrcmpA(remote->session_state, "pending") == 0) {
-            v9x_remote_session(remote, remote->session_id);
-            continue;
-        }
+        v9x_relay_start_offered(remote);
+        v9x_activity_tick(remote->state);
         (void)WaitForSingleObject(remote->state->remote_wake, remote->next_poll * 1000ul);
     }
     v9x_remote_status(remote, V9X_REMOTE_STOPPED, "retired");
@@ -928,6 +1216,7 @@ int v9x_remote_start(V9xAgentState *state)
 {
     HANDLE thread;
     DWORD thread_id;
+    InitializeCriticalSection(&v9x_relay_slot_lock);
     state->remote_wake = CreateEventA(0, FALSE, FALSE, 0);
     if (state->remote_wake == 0) return 0;
     thread = CreateThread(0, 65536ul, v9x_remote_thread, state, 0ul, &thread_id);

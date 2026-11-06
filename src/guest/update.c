@@ -210,6 +210,7 @@ int v9x_handle_update(V9xConnection *conn, unsigned long request_id,
     v9x_write_u32(conn->power_response, conn->machine->boot_counter);
     v9x_write_u32(conn->power_response + 4, agent_size);
     v9x_log_event("update-accepted", "hot-swap launched");
+    v9x_event("Developer is updating the agent (it restarts by itself)", 0);
     if (!v9x_send_frame(conn, V9X_MSG_UPDATE_ACCEPTED, request_id,
                         conn->power_response, 8ul)) {
         return 0;

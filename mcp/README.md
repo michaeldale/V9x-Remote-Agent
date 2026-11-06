@@ -72,7 +72,8 @@ operator key comes from `%USERPROFILE%\.v9x\operator.key` or
 | `v9x_ps` | Guest processes; marks the agent and its exec jobs (0.13.0+, Windows 9x/2000) |
 | `v9x_kill` | Terminate a process by pid or unique name, e.g. a stuck exec job (0.13.0+) |
 | `v9x_reg_query` | Subkeys and values of one registry key, read-only (0.13.0+) |
-| `v9x_wait_file` | Wait until a guest file exists (`gone`, `stable_ms`) instead of sleeping; any agent |
+| `v9x_wait_file` | Wait until a guest file exists (`gone`, `stable_ms`; `match`: has a line containing text, 0.13.0+) instead of sleeping |
+| `v9x_wait_process` | Wait until a guest process (`pid` from `v9x_exec`, or `name`) has exited; for detached benchmarks (0.13.0+). For waits over a minute or two use `v9xctl.ps1` as a background command: an MCP call blocks the conversation |
 | `v9x_windows` | Visible top-level windows; `wait_for` a title to appear (`gone`: close) (0.13.0+) |
 
 No tool needs a sleep around it: `v9x_ping` takes `wait_seconds` (keeps

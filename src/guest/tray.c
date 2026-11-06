@@ -20,6 +20,7 @@
 #define V9X_TRAY_CMD_PAUSE 4
 #define V9X_TRAY_CMD_CHAT 5
 #define V9X_TRAY_CMD_UPDATE 6
+#define V9X_TRAY_CMD_EVENTS 7
 
 /* The chat window's controls. */
 #define V9X_CHAT_ID_LOG 101
@@ -387,6 +388,7 @@ static void v9x_tray_menu(HWND window)
         (void)v9x_tray_append(update_label, 0ul, "Check for &updates...");
     }
     (void)AppendMenuA(menu, settings_flags, V9X_TRAY_CMD_UPDATE, update_label);
+    (void)AppendMenuA(menu, MF_STRING, V9X_TRAY_CMD_EVENTS, "Activity &log...");
     (void)AppendMenuA(menu, MF_SEPARATOR, 0u, 0);
     (void)AppendMenuA(menu, MF_STRING, V9X_TRAY_CMD_RESTART, "&Restart agent");
     (void)SetMenuDefaultItem(menu, V9X_TRAY_CMD_SETTINGS, FALSE);
@@ -711,9 +713,17 @@ static void v9x_tray_service(V9xAgentState *state)
         LONG paused = !v9x_flag_read(&state->remote_paused);
         InterlockedExchange(&state->remote_paused, paused);
         v9x_log_line(paused ? "remote-paused" : "remote-resumed");
+        v9x_event(paused ? "Remote help paused at this machine" :
+                           "Remote help resumed at this machine", 0);
         if (state->remote_wake != 0) (void)SetEvent(state->remote_wake);
     } else if (request == V9X_TRAY_CMD_CHAT) {
         v9x_chat_open(state);
+    } else if (request == V9X_TRAY_CMD_EVENTS) {
+        /* Notepad, so the tester can scroll, search and copy it. */
+        if (!v9x_spawn("NOTEPAD.EXE C:\\V9XREMOTE\\EVENTS.LOG", 0, &native_error)) {
+            SetLastError(native_error);
+            v9x_tray_log_error("tray-events-failed");
+        }
     } else if (request == V9X_TRAY_CMD_RESTART) {
         v9x_tray_restart(state);
     }
@@ -777,6 +787,7 @@ static DWORD WINAPI v9x_tray_worker(LPVOID parameter)
             since_refresh += V9X_TRAY_PUMP_SLICE;
             v9x_tray_service(state);
             v9x_tray_chat_service(state);
+            v9x_activity_tick(state);
             vnc_active = v9x_tray_sample_vnc();
             if (vnc_active != v9x_tray_vnc_active) {
                 v9x_tray_vnc_active = vnc_active;

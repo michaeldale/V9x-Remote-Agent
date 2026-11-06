@@ -343,9 +343,61 @@ class ToolCodecTests(unittest.TestCase):
     def test_tools_are_listed(self):
         names = {tool["name"] for tool in v9x_mcp.TOOLS}
         for name in ("v9x_read_text", "v9x_hash", "v9x_delete", "v9x_ps", "v9x_kill", "v9x_reg_query",
-                     "v9x_windows", "v9x_wait_file"):
+                     "v9x_windows", "v9x_wait_file", "v9x_wait_process", "v9x_note"):
             self.assertIn(name, names)
             self.assertTrue(callable(getattr(v9x_mcp.ToolHandler, name)))
+
+    def fake_client(self, **methods):
+        client = v9x_mcp.V9xClient.__new__(v9x_mcp.V9xClient)
+        client.hello = {"capabilities": 0xFFFFFFFF, "build_id": "test"}
+        for name, method in methods.items():
+            setattr(client, name, method)
+        return client
+
+    def test_note_sends_cleaned_text(self):
+        sent = []
+        client = self.fake_client(
+            tool_request=lambda cap, name, msg, payload, resp: sent.append((cap, msg, payload, resp)) or b"")
+        result = client.note("Driver test 12 –\tVBE ")
+        self.assertEqual(result, {"text": "Driver test 12 ? VBE"})
+        self.assertEqual(sent, [(v9x_mcp.CAP_EVENT_LOG, 0x00A0,
+                                 v9x_mcp.encode_string("Driver test 12 ? VBE"), 0x80A0)])
+        with self.assertRaises(v9x_mcp.V9xError):
+            client.note("x" * 201)
+        with self.assertRaises(v9x_mcp.V9xError):
+            client.note(" \t ")
+
+    def test_wait_process_returns_once_the_pid_is_gone(self):
+        lists = [[{"pid": 7, "name": "BENCH.EXE"}, {"pid": 9, "name": "OTHER.EXE"}],
+                 [{"pid": 7, "name": "BENCH.EXE"}], []]
+        client = self.fake_client(processes=lambda: lists.pop(0))
+        original = v9x_mcp.time.sleep
+        v9x_mcp.time.sleep = lambda _s: None
+        try:
+            result = client.wait_process(60, pid=7)
+        finally:
+            v9x_mcp.time.sleep = original
+        self.assertTrue(result["was_running"])
+        self.assertEqual(result["exited"], ["BENCH.EXE"])
+        self.assertEqual(lists, [])
+
+    def test_wait_process_by_name_reports_never_running(self):
+        client = self.fake_client(processes=lambda: [{"pid": 9, "name": "OTHER.EXE"}])
+        result = client.wait_process(60, name="bench*.exe")
+        self.assertFalse(result["was_running"])
+
+    def test_wait_file_match_waits_for_the_line(self):
+        reads = [{"matched": 0, "text": ""}, {"matched": 1, "text": "Complete=yes\n"}]
+        client = self.fake_client(
+            stat=lambda _p: {"exists": True, "size": 10},
+            read_text=lambda _p, _t, _m, _b: reads.pop(0))
+        original = v9x_mcp.time.sleep
+        v9x_mcp.time.sleep = lambda _s: None
+        try:
+            result = client.wait_file("C:\\R.INI", 60, match="complete=yes")
+        finally:
+            v9x_mcp.time.sleep = original
+        self.assertEqual(result["line"], "Complete=yes")
 
 
 class JsonRpcTests(unittest.TestCase):
@@ -391,7 +443,7 @@ class JsonRpcTests(unittest.TestCase):
         self.assertIn("v9x_vnc", names)
         self.assertIn("v9x_relay_machines", names)
         self.assertIn("v9x_chat", names)
-        self.assertEqual(len(tools), 36)
+        self.assertEqual(len(tools), 38)
         # Every tool that talks to an agent can go through the relay.
         for tool in tools:
             if tool["name"] in ("v9x_discover", "v9x_relay_machines", "v9x_chat"):
@@ -434,6 +486,61 @@ class JsonRpcTests(unittest.TestCase):
         result = responses[0]["result"]
         self.assertTrue(result["isError"])
         self.assertIn("cannot reach the guest agent", result["content"][0]["text"])
+
+
+class RelayOpenTests(unittest.TestCase):
+    """RelaySession.open against a stubbed server: owner, label, take-over, busy."""
+
+    def make_config(self, replies):
+        import v9x_relay
+        config = v9x_relay.RelayConfig(server="http://test", operator_key="k",
+                                       signing_key=__file__, signer=__file__)
+        calls = []
+
+        def request(op, params=None, body=None, method=None, timeout=40.0):
+            calls.append((op, dict(params or {})))
+            status, value = replies.pop(0)
+            return status, {}, json.dumps(value).encode("utf-8")
+
+        config.request = request
+        return config, calls
+
+    def test_busy_refusal_raises_busy_error(self):
+        import v9x_relay
+        config, calls = self.make_config([(409, {
+            "success": False, "busy": True,
+            "message": "Machine M-ZJQ2DX is busy: another caller ('wait-window') holds its relay session"})])
+        with self.assertRaises(v9x_relay.RelayBusyError) as caught:
+            v9x_relay.RelaySession(config, "m-zjq2dx", owner="a" * 32, label="v9x_screenshot")
+        self.assertIn("busy", str(caught.exception))
+        op, params = calls[0]
+        self.assertEqual(op, "open")
+        self.assertEqual(params["machine"], "M-ZJQ2DX")
+        self.assertEqual(params["owner"], "a" * 32)
+        self.assertEqual(params["label"], "v9x_screenshot")
+        self.assertNotIn("replace", params)
+
+    def test_take_over_sends_replace_and_opens(self):
+        import v9x_relay
+        config, calls = self.make_config([
+            (200, {"success": True, "session": "b" * 32, "install_id": "x", "state": "open",
+                   "nonce": "c" * 32}),
+            (200, {"success": True}),
+        ])
+        session = v9x_relay.RelaySession(config, "M-ZJQ2DX", take_over=True)
+        self.assertEqual(calls[0][1]["replace"], "1")
+        self.assertRegex(calls[0][1]["owner"], "^[0-9a-f]{32}$")
+        self.assertEqual(session.nonce, "c" * 32)
+        session.close()
+
+    def test_tool_call_strips_take_over_argument(self):
+        handler = v9x_mcp.ToolHandler("127.0.0.1", 1, 1.0)
+        seen = {}
+        handler.v9x_probe_args = lambda args: seen.update(args) or {}
+        handler.call("v9x_probe_args", {"relay_take_over": True, "x": 1})
+        self.assertEqual(seen, {"x": 1})
+        self.assertTrue(handler.relay_take_over)
+        self.assertEqual(handler.relay_label, "v9x_probe_args")
 
 
 class InputEncodingTests(unittest.TestCase):

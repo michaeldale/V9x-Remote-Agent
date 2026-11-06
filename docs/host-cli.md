@@ -57,6 +57,12 @@ Finding agents by discovery (agent 0.8.0+ with `discovery=1`):
   `-RelayServer` (or `V9X_RELAY_SERVER`) points at another copy of the
   server, e.g. `http://localhost/bluetraitblog` for testing. The first verb
   after an idle spell waits up to a minute for the machine to check in.
+  A 0.15.0+ agent runs three relay calls at once (a `screenshot` during a
+  background wait); when every session is in use (or the agent is older
+  and runs one), the server refuses a new one and v9xctl exits 21 with which
+  verb holds it;
+  `-RelayTakeOver` takes it anyway, failing the other call. A v9xctl wait
+  that reconnects after a drop replaces its own session as before.
 
 `update -Source <package dir>` hot-swaps agents from 0.6.0 on. For an older
 agent (INFO `AgentVersion` below 0.6.0; the capability bit cannot tell) it
@@ -165,6 +171,23 @@ File, process and registry tools (agent 0.13.0+; exit 23 on older agents):
 - `stat`, `get`, `hash` and `cat` flush Windows 9x's INI write cache first, so
   an INI a running program just wrote reads current (see docs\protocol.md).
 
+The tester's activity log (agent 0.15.0+):
+
+```powershell
+.\scripts\v9xctl.ps1 note -Text "Driver test 12: installing Velocity9x 0.31, reboot follows" -Json
+.\scripts\v9xctl.ps1 cat -Path C:\V9XREMOTE\EVENTS.LOG -Tail 20
+.\scripts\v9xctl.ps1 cat -Path C:\V9XREMOTE\CHAT.LOG -Tail 20
+```
+
+- `note` (alias `-Message`) appends `Developer: <text>` to
+  `C:\V9XREMOTE\EVENTS.LOG`, which the person at the machine opens from the
+  tray (**Activity log...**). 1-200 characters; control characters become
+  spaces and other non-ASCII `?`. Empty or too long: exit 10 before
+  connecting. An agent without `V9X_CAP_EVENT_LOG`: exit 23.
+- The agent writes its own lines there too (connected, idle for 2 minutes,
+  reboot/shutdown/reset/update requested, remote-help state), and keeps the
+  remote-help chat in `CHAT.LOG` across reboots.
+
 Waiting without sleeping:
 
 ```powershell
@@ -176,6 +199,11 @@ Waiting without sleeping:
 .\scripts\v9xctl.ps1 exec -Application C:\JOBS\RUN\BENCH.EXE -Detach -WaitForFile C:\JOBS\RUN\RESULT.TXT -StableMs 1000 -Json
 .\scripts\v9xctl.ps1 wait-file -Path C:\JOBS\RUN\LOCK -Gone -WaitSeconds 600 -Json
 .\scripts\v9xctl.ps1 windows
+# Long jobs (0.14.0): until the program exits, a line appears, or line by line
+.\scripts\v9xctl.ps1 exec -Application C:\BENCH\BENCH.EXE -WaitForExit -WaitSeconds 7200 -Json
+.\scripts\v9xctl.ps1 wait-process -Name 3DMARK.EXE -WaitSeconds 7200 -Json
+.\scripts\v9xctl.ps1 wait-file -Path C:\BENCH\REPORT.INI -Match Complete=yes -WaitSeconds 3600 -Json
+.\scripts\v9xctl.ps1 cat -Path C:\BENCH\BENCH.LOG -Follow -Until "Score:" -WaitSeconds 7200
 ```
 
 - Every connection is retried when it is dropped before HELLO (a port forward
@@ -185,12 +213,42 @@ Waiting without sleeping:
   a refused connection still fails at once with exit 20. `wait-desktop`
   waits for the agent too, for its `-WaitSeconds`, and so does `ping` when
   given `-WaitSeconds`.
-- `wait-file -Path` polls `stat` on one connection (every 250 ms; a relay
-  round trip is its own pace) until the file exists, with `-Gone` until it
-  does not, and with `-StableMs N` until its size has not changed for N ms.
-  Works with every agent. `exec`/`shell` take the same as `-WaitForFile`,
-  run after the program returns (immediately with `-Detach`). Exit 47 at the
-  `-WaitSeconds` deadline (default 120).
+- Every wait polls on one connection: every 250 ms for the first 10 s, then
+  every second, so an hours-long wait barely loads a guest that is busy
+  benchmarking and still returns within a second (a relay round trip is its
+  own pace). A connection that drops mid-wait (relay hiccup, NIC reset,
+  guest reboot) is reopened for the time the wait has left, with a
+  `[connection lost ...; reconnecting]` line on stderr, instead of failing
+  with exit 20. `-WaitSeconds` goes up to 86400.
+- `wait-file -Path` waits until the file exists, with `-Gone` until it
+  does not, with `-StableMs N` until its size has not changed for N ms, and
+  with `-Match <text>` until it has a line containing the text
+  (case-insensitive; returned as `Line`). The plain forms work with every
+  agent; `-Match` needs 0.13.0+. It is the one to use when a program writes
+  its report file at the start and marks it finished later. `exec`/`shell`
+  take the same as `-WaitForFile` (and `-Match`), run after the program
+  returns (immediately with `-Detach`). Exit 47 at the `-WaitSeconds`
+  deadline (default 120).
+- `wait-process -Pid <id> | -Name <image>` waits until no such process runs
+  (`Name` takes the `ps` wildcards); `WasRunning = false` (and a note on
+  stderr) means nothing matched on the first look: it had already finished,
+  or the name is wrong. `exec -WaitForExit` launches detached and then waits
+  on the child's pid the same way: no 1-hour exec cap, no execution slot
+  held, but no captured output and no exit code. Agents before 0.14.0 do not
+  report the pid, so it waits on the image name instead. Both default to
+  `-WaitSeconds 3600`; exit 49 at the deadline. `exec` results carry `Pid`
+  on 0.14.0+ agents (for `wait-process` and `kill`).
+- `cat -Follow` prints lines as they are appended (with `-Match`, only those
+  lines; `-Tail N` first prints the last N already there), one per stdout
+  line, flushed: run it as a background command under Claude Code's Monitor
+  tool and each benchmark progress line is an event. It waits for a file
+  that does not exist yet and starts over when the file shrinks. A line is
+  printed once a newer one follows or the file has been quiet for 1 s, so a
+  half-written last line is not printed half. `-Until <text>` stops at the
+  first line containing the text (one already in the file counts, so a
+  finish before the follow started is not missed), exit 0; its deadline is
+  exit 47. Without `-Until` the follow ends quietly at `-WaitSeconds`
+  (default 3600). `-Json` does not apply; how it ended goes to stderr.
 - `windows` lists visible top-level windows; `wait-window -Title <text>`
   waits for one whose title contains the text (case-insensitive, literal) and
   returns its position and size, `-Gone` for it to close. `exec
@@ -202,8 +260,8 @@ Waiting without sleeping:
   verb list and this copy's version and path), not the full help. Verbs
   agents often guess are accepted: `ls`/`dir` (list), `pull` (get), `push`
   (put), `status` (info), `rm`/`del` (delete), `type`/`tail` (cat),
-  `tasklist` (ps), `taskkill` (kill), `wait-ready` (wait-desktop), and
-  more. `-Target host:port` sets `-Host` and `-Port` together; `-HostName`
+  `tasklist` (ps), `taskkill` (kill), `wait-ready` (wait-desktop),
+  `wait-exit` (wait-process), `follow` (cat), and more. `-Target host:port` sets `-Host` and `-Port` together; `-HostName`
   and `-EndpointPort` are aliases.
 
 Boot and capture examples:

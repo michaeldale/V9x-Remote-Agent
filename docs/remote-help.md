@@ -102,7 +102,9 @@ state=on              ; on | paused
 busy=0                ; 1 while a command arrived in the last 60 s
 last_command_age=-1   ; seconds since the last command, -1 never
 last_command_source=  ; LAN address or "relay"
-session=              ; the session the agent has open, if any
+session=              ; the session the agent has open, if any (the first)
+sessions=             ; 0.15.0+: every session it runs, comma-separated
+max_sessions=3        ; 0.15.0+: how many it runs at once (absent: 1)
 display_name=...
 github=...
 email=...
@@ -123,10 +125,21 @@ next_poll=60
 id=<32 hex>
 state=pending         ; pending | open | closed
 
+[sessions]            ; plugin DB 5+, to agents that sent max_sessions
+count=2
+1=<32 hex>,open
+2=<32 hex>,pending
+
 [chat]
 count=1
 1=Back%20in%2010%20min
 ```
+
+Every agent reads `[session]` (the newest pending session, else the newest
+live one); a 0.15.0+ agent prefers `[sessions]` and starts each pending one
+on its own thread and loopback connection, up to `max_sessions`. The server
+closes an open session the poll no longer lists (`agent-dropped`), so the
+list is how the agent says a session ended.
 
 `unknown_machine` makes the agent forget its id and register again;
 `retired` stops remote help until the developer sets the machine active
@@ -158,6 +171,18 @@ retry is safe. Reply `[up] status=ok|closed`.
 
 The agent ended the session (loopback closed, paused, bad signature).
 
+### What the owner sees (0.15.0+)
+
+Chat is kept in `C:\V9XREMOTE\CHAT.LOG` and reloaded at start, so replies
+survive a reboot. The tray's **Activity log...** opens
+`C:\V9XREMOTE\EVENTS.LOG`: developer connected, idle for 2 minutes (safe to
+reboot), each reboot, shutdown, reset or update requested, the developer's
+`note` lines, and remote help connected / unreachable / back in touch
+after a long silence. A check-in more than 30 s late is logged in
+`AGENT.LOG` as `remote-poll-gap <elapsed>s expected <due>s`. While a
+session v9xctl opened stays `pending`, it prints once a minute what `GET
+machines` last heard from the agent.
+
 ## Developer to server (HTTPS)
 
 Header `X-V9X-Operator: <operator key>` (generated on the plugin's
@@ -169,8 +194,8 @@ sign anything the agent will run.
 
 | Call | Purpose |
 |---|---|
-| `GET machines` | Every registered machine: id, names, version, OS, state, online, busy, last command, open session. |
-| `POST open?machine=` | Start a session. Closes any earlier one for that machine. Returns `{session, machine, install_id, state}`. |
+| `GET machines` | Every registered machine: id, names, version, OS, state, online, busy (`null` while offline: the last poll is too old to say), last command, `session` (the newest live one) and `sessions` (all: `id`, `state`, `label`, `age_seconds`, `operator_idle_seconds`, `in_use`), `max_sessions`. |
+| `POST open?machine=&owner=<32 hex>&label=<verb>[&replace=1]` | Start a session. Returns `{session, machine, install_id, state}`. The caller's own earlier session (same `owner`: a reconnect) is closed (`reconnected`). Up to the agent's `max_sessions` (1 before agent 0.15.0) sessions run side by side; at that limit an unused one (no `status`, `down` or `up` from its operator for 60 s) is `replaced`, `replace=1` takes the oldest (`taken-over`), and otherwise it is refused: HTTP 409, `busy: true`, `held`, `sessions`, `max_sessions` and a message; v9xctl exits 21. |
 | `GET status?session=&wait=<s≤20>` | Session state; once `open` it includes the agent's `nonce`. Waits up to `wait` seconds for a change. |
 | `POST down?session=` | Body: `V9XD` records already signed by `v9xsign relay`. Seq must continue exactly. Returns `{next_seq}`. |
 | `GET up?session=&after=<seq>&wait=<s≤20>` | Binary: `V9XU` u32 seq, u32 length, data, repeated. Header `X-V9X-Session-State`. Acknowledges up to `after`. |
@@ -191,7 +216,10 @@ Typical use from the developer's PC:
 
 The first call of a while waits for the machine's next idle check-in (up to
 a minute); for ten minutes after that it polls every 2 s, so later calls
-start within seconds. Uploads keep 1 MiB of chunks in flight: about 3 MB in
+start within seconds. A 0.15.0+ agent runs up to three calls at once, so a
+`screenshot` or `windows` works while a long wait runs; an older one runs
+one, and a second call exits 21 (busy) rather than ending that wait.
+`-RelayTakeOver` recovers a stuck one. Uploads keep 1 MiB of chunks in flight: about 3 MB in
 25 s through an 86Box NAT to a local server. VNC is not tunnelled.
 
 One-time setup on the developer's PC: `build\tools\v9xsign.exe keygen

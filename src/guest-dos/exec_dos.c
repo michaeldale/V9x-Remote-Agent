@@ -204,7 +204,8 @@ int v9x_dos_execute(V9xDos *dos, unsigned long request_id,
     job.timeout_ms = v9x_read_u32(payload + 4);
     job.stdout_limit = v9x_read_u32(payload + 8);
     job.stderr_limit = v9x_read_u32(payload + 12);
-    if ((job.options & ~V9X_EXEC_OPTION_MASK) != 0u ||
+    /* No V9X_CAP_EXEC_PID here: a DOS child has no pid to report. */
+    if ((job.options & ~V9X_EXEC_OPTION_DETACH) != 0u ||
         job.mode > V9X_EXEC_MODE_SHELL || job.show_window > 1u ||
         job.timeout_ms > V9X_EXEC_MAX_TIMEOUT ||
         job.stdout_limit > V9X_EXEC_MAX_OUTPUT ||

@@ -16,6 +16,9 @@
 #define V9X_CHAT_LOG_SIZE 8192ul
 #define V9X_CHAT_QUEUE 4
 #define V9X_CHAT_LINE 512
+/* No command for this long, and no connection open: the developer is done
+   for now and the tester may reboot (EVENTS.LOG says so). */
+#define V9X_IDLE_SECONDS 120l
 #define V9X_REMOTE_OFF 0l
 #define V9X_REMOTE_CONNECTING 1l
 #define V9X_REMOTE_ONLINE 2l
@@ -119,10 +122,10 @@ typedef struct V9xAgentState {
        connected to the relay) or 2 (connected but paused, drawn grey). */
     HICON tray_icon;
     HICON tray_icons[3][3];
-    /* Remote help (remote.c, docsemote-help.md). `remote_on` is AGENT.INI
+    /* Remote help (remote.c, docs/remote-help.md). `remote_on` is AGENT.INI
        [remote] mode=on; `remote_paused` is the tray's Pause, deliberately
        never saved so a restart is back to On; `remote_status` is one of
-       V9X_REMOTE_*; `remote_session` is 1 while a relay session is open.
+       V9X_REMOTE_*; `remote_session` counts the open relay sessions.
        Setting `remote_wake` makes the worker check in now. */
     int remote_on;
     volatile LONG remote_paused;
@@ -137,6 +140,10 @@ typedef struct V9xAgentState {
     DWORD last_command_tick;
     unsigned short last_command_type;
     char last_command_source[16];
+    /* 1 from a developer's first command until V9X_IDLE_SECONDS pass with
+       no command and no open connection; each edge writes EVENTS.LOG
+       ("Developer connected", "Idle: safe to reboot or shut down"). */
+    volatile LONG developer_active;
     /* Chat with the developer. `chat_log` is the conversation the tray's
        chat window shows; `chat_incoming` is set when the worker appended a
        message from the developer; `chat_outgoing` holds the owner's lines
@@ -249,5 +256,12 @@ void v9x_log_line(const char *event_name);
 void v9x_log_event(const char *event_name, const char *detail);
 void v9x_log_set_boot(DWORD boot_counter);
 void v9x_log_freeze(int frozen);
+unsigned long v9x_log_stamp(char *target, int seconds);
+int v9x_log_append_file(const char *path, const char *old_path,
+                        unsigned long cap, const char *data,
+                        unsigned long length);
+void v9x_event(const char *text, const char *detail);
+void v9x_activity_tick(V9xAgentState *state);
+void v9x_chat_load(V9xAgentState *state);
 
 #endif

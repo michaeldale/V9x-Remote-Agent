@@ -40,24 +40,49 @@ public sealed class V9xRelayStream : Stream
         ServicePointManager.SecurityProtocol |= SecurityProtocolType.Tls12;
     }
 
+    // One per v9xctl process: the server lets a session's own owner replace
+    // it (a wait reconnecting after a drop) and refuses anyone else while it
+    // is in use (busy, exit 21) unless they take it over on purpose.
+    static readonly string Owner = Guid.NewGuid().ToString("N");
+
     public V9xRelayStream(string server, string operatorKey, string signer,
                           string signingKey, string machine, int openWaitSeconds)
+        : this(server, operatorKey, signer, signingKey, machine, openWaitSeconds, "", false)
+    {
+    }
+
+    public V9xRelayStream(string server, string operatorKey, string signer,
+                          string signingKey, string machine, int openWaitSeconds,
+                          string label, bool takeOver)
     {
         this.server = server.TrimEnd('/');
         this.operatorKey = operatorKey;
         this.signer = signer;
         this.signingKey = signingKey;
         this.machine = machine.ToUpperInvariant();
-        Dictionary<string, object> opened = Json("open", "machine=" + Uri.EscapeDataString(this.machine), new byte[0], 40);
+        string query = "machine=" + Uri.EscapeDataString(this.machine) + "&owner=" + Owner;
+        if (!string.IsNullOrEmpty(label)) query += "&label=" + Uri.EscapeDataString(label);
+        if (takeOver) query += "&replace=1";
+        Dictionary<string, object> opened = Json("open", query, new byte[0], 40);
         session = (string)opened["session"];
         installId = (string)opened["install_id"];
         string state = (string)opened["state"];
         DateTime deadline = DateTime.UtcNow.AddSeconds(openWaitSeconds);
         Dictionary<string, object> status = opened;
+        DateTime started = DateTime.UtcNow;
+        DateTime nextReport = started.AddSeconds(60);
         while (state == "pending" && DateTime.UtcNow < deadline) {
             int wait = (int)Math.Max(1, Math.Min(WaitMax, (deadline - DateTime.UtcNow).TotalSeconds));
             status = Json("status", "session=" + session + "&wait=" + wait, null, wait + 20);
             state = (string)status["state"];
+            if (state == "pending" && DateTime.UtcNow >= nextReport) {
+                // A long wait reconnecting to a guest that stopped checking in
+                // (full-screen 3D, a hang) would otherwise be silent until its
+                // deadline: say once a minute what the server last heard.
+                nextReport = DateTime.UtcNow.AddSeconds(60);
+                Console.Error.WriteLine("[relay: " + this.machine + " session pending " +
+                    (int)(DateTime.UtcNow - started).TotalSeconds + " s; " + DescribeMachine() + "]");
+            }
         }
         if (state != "open") {
             CloseQuietly();
@@ -70,6 +95,36 @@ public sealed class V9xRelayStream : Stream
             throw new IOException("Machine " + this.machine + " refused the session (" + (reason ?? state) + ").");
         }
         nonce = (string)status["nonce"];
+    }
+
+    // "agent last checked in 600 s ago (offline)" from GET machines, or why
+    // that could not be read. Never throws: it only decorates a progress line.
+    string DescribeMachine()
+    {
+        try {
+            Dictionary<string, object> listed = Json("machines", "", null, 20);
+            object list;
+            if (!listed.TryGetValue("machines", out list) || !(list is System.Collections.ArrayList)) {
+                return "machine list unreadable";
+            }
+            foreach (object entry in (System.Collections.ArrayList)list) {
+                Dictionary<string, object> row = entry as Dictionary<string, object>;
+                object code;
+                if (row == null || !row.TryGetValue("machine", out code) ||
+                    !string.Equals(code as string, machine, StringComparison.OrdinalIgnoreCase)) {
+                    continue;
+                }
+                object ago;
+                object online;
+                row.TryGetValue("last_seen_seconds_ago", out ago);
+                row.TryGetValue("online", out online);
+                return "agent last checked in " + (ago == null ? "never" : ago + " s ago") +
+                    (online is bool && !(bool)online ? " (offline; still waiting)" : "");
+            }
+            return "machine not listed by the server";
+        } catch (Exception exception) {
+            return "server state unavailable: " + exception.Message;
+        }
     }
 
     public string Machine { get { return machine; } }
@@ -128,7 +183,16 @@ public sealed class V9xRelayStream : Stream
         object success;
         if (status != 200 || value == null || !value.TryGetValue("success", out success) || !(success is bool) || !(bool)success) {
             object message = null;
-            if (value != null) value.TryGetValue("message", out message);
+            object busy = null;
+            if (value != null) {
+                value.TryGetValue("message", out message);
+                value.TryGetValue("busy", out busy);
+            }
+            if (busy is bool && (bool)busy) {
+                // Not an IOException: retrying a busy machine would only
+                // queue behind the other caller's wait without saying so.
+                throw new V9xRelayBusyException((string)message ?? ("Machine " + machine + " is busy."));
+            }
             throw new IOException((string)message ?? ("Relay server error " + status + "."));
         }
         return value;
@@ -260,5 +324,15 @@ public sealed class V9xRelayStream : Stream
     {
         if (disposing && !closed) CloseQuietly();
         base.Dispose(disposing);
+    }
+}
+
+// The server refused to open a session because another caller is using the
+// machine's relay session. v9xctl maps it to exit 21.
+public sealed class V9xRelayBusyException : InvalidOperationException
+{
+    public V9xRelayBusyException(string message) : base(message)
+    {
+        Data["V9xExitCode"] = 21;
     }
 }

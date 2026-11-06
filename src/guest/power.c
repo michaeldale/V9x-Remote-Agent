@@ -128,6 +128,7 @@ int v9x_handle_power_message(V9xConnection *conn, unsigned short type,
                            &offset, job)) return 0;
     if (type == V9X_MSG_RESET_REQUEST) {
         v9x_log_event("reset-accepted", job);
+        v9x_event("Developer requested a hard reset", 0);
         if (!v9x_send_frame(conn, V9X_MSG_RESET_ACCEPTED, request_id,
                             conn->power_response, offset)) return 0;
         v9x_mdns_goodbye();
@@ -140,16 +141,19 @@ int v9x_handle_power_message(V9xConnection *conn, unsigned short type,
         response_type = V9X_MSG_REBOOT_ACCEPTED;
         flags = EWX_REBOOT | EWX_FORCE;
         v9x_log_event("reboot-accepted", job);
+        v9x_event("Developer requested a reboot", 0);
     } else {
         response_type = V9X_MSG_SHUTDOWN_ACCEPTED;
         if (v9x_platform_can_power_off()) {
             flags = EWX_SHUTDOWN | EWX_POWEROFF | EWX_FORCE;
             v9x_log_event("shutdown-accepted", job);
+            v9x_event("Developer requested a shutdown", 0);
         } else {
             /* NT without soft-off: EWX_POWEROFF would reboot instead. Halt
                at "It is now safe to turn off your computer". */
             flags = EWX_SHUTDOWN | EWX_FORCE;
             v9x_log_event("shutdown-accepted-halt", job);
+            v9x_event("Developer requested a shutdown", 0);
         }
     }
     if (!v9x_send_frame(conn, response_type, request_id,

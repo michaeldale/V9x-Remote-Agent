@@ -28,6 +28,7 @@ import socket
 import struct
 import sys
 import time
+import uuid
 import zlib
 
 try:
@@ -99,6 +100,9 @@ MSG_PROCESS_KILL = 0x0081
 MSG_PROCESS_KILL_RESPONSE = 0x8081
 MSG_REG_QUERY = 0x0090
 MSG_REG_QUERY_RESPONSE = 0x8090
+MSG_EVENT_NOTE = 0x00A0
+MSG_EVENT_NOTE_RESPONSE = 0x80A0
+EVENT_NOTE_MAX = 200
 MSG_ERROR = 0x8FFF
 
 CAP_INFO = 0x0001
@@ -125,6 +129,8 @@ CAP_FILE_TOOLS = 0x40000  # delete, hash, read-text; reads flush the 9x INI cach
 CAP_PROCESS = 0x80000
 CAP_REGISTRY = 0x100000
 CAP_WINDOWS = 0x200000
+CAP_EXEC_PID = 0x400000  # EXEC option 0x0002: EXEC_COMPLETE carries the pid (0.14.0+)
+CAP_EVENT_LOG = 0x800000  # EVENT_NOTE, EVENTS.LOG and CHAT.LOG (0.15.0+)
 MSG_WINDOW_LIST = 0x0062
 MSG_WINDOW_LIST_RESPONSE = 0x8062
 DELETE_RECURSIVE = 0x1
@@ -189,6 +195,7 @@ EXEC_FLAG_DETACHED = 0x40
 EXEC_FLAG_ORPHANED = 0x80
 
 EXEC_OPTION_DETACH = 0x0001
+EXEC_OPTION_PID = 0x0002
 
 EXEC_RESULT_NAMES = {
     0: "ok",
@@ -271,6 +278,19 @@ def bare_lf_warning(guest_path, data):
     )
 
 
+def clean_note_text(text):
+    """The text EVENT_NOTE carries: control characters as spaces, anything
+    outside printable ASCII as '?', trimmed, 1-200 characters."""
+    if not isinstance(text, str):
+        raise V9xError("note text must be a string")
+    cleaned = "".join(" " if ord(c) < 0x20 else ("?" if ord(c) > 0x7E else c) for c in text).strip()
+    if not cleaned:
+        raise V9xError("note text is empty")
+    if len(cleaned) > EVENT_NOTE_MAX:
+        raise V9xError("note text is %d characters; the limit is %d" % (len(cleaned), EVENT_NOTE_MAX))
+    return cleaned
+
+
 def encode_string(value):
     if not isinstance(value, str):
         raise V9xError("protocol strings must be str")
@@ -304,6 +324,12 @@ def parse_ansi_string(payload, offset):
     if offset + length > len(payload):
         raise V9xError("truncated protocol string")
     return payload[offset : offset + length].decode(GUEST_TEXT, "replace"), offset + length
+
+
+def poll_pause(started):
+    """Between wait probes: 250 ms for the first 10 s, then 1 s, so an
+    hour-long wait barely touches a guest that is busy benchmarking."""
+    time.sleep(0.25 if time.monotonic() - started < 10 else 1.0)
 
 
 def parse_read_text(payload):
@@ -1061,9 +1087,12 @@ class V9xClient:
         self.require(CAP_EXEC if mode == 0 else CAP_SHELL, "execution")
         if detach:
             self.require(CAP_EXEC_DETACH, "detached execution")
+        options = EXEC_OPTION_DETACH if detach else 0
+        if self.hello["capabilities"] & CAP_EXEC_PID:
+            options |= EXEC_OPTION_PID
         payload = struct.pack(
             "<BBHIII", mode, 1 if show_window else 0,
-            EXEC_OPTION_DETACH if detach else 0, timeout_ms, output_limit,
+            options, timeout_ms, output_limit,
             output_limit,
         )
         payload += encode_string(application)
@@ -1088,12 +1117,13 @@ class V9xClient:
                     stderr.extend(data)
                 else:
                     break
-            if len(data) != 28:
+            if len(data) != (32 if options & EXEC_OPTION_PID else 28):
                 raise V9xError("invalid EXEC_COMPLETE payload")
             result, exit_code, native, elapsed, out_total, err_total, flags = (
-                struct.unpack("<7I", data)
+                struct.unpack_from("<7I", data)
             )
             return {
+                "pid": struct.unpack_from("<I", data, 28)[0] if len(data) == 32 else None,
                 "result": EXEC_RESULT_NAMES.get(result, str(result)),
                 "exit_code": exit_code if exit_code < 0x80000000 else exit_code - 0x100000000,
                 "native_error": native,
@@ -1147,6 +1177,14 @@ class V9xClient:
         files, directories = struct.unpack("<II", answer)
         return {"path": guest_path, "files_deleted": files, "directories_deleted": directories}
 
+    def note(self, text):
+        cleaned = clean_note_text(text)
+        answer = self.tool_request(CAP_EVENT_LOG, "note (agent 0.15.0+)", MSG_EVENT_NOTE,
+                                   encode_string(cleaned), MSG_EVENT_NOTE_RESPONSE)
+        if answer:
+            raise V9xError("invalid EVENT_NOTE_RESPONSE")
+        return {"text": cleaned}
+
     def hash_file(self, guest_path):
         answer = self.tool_request(CAP_FILE_TOOLS, "hash (agent 0.13.0+)", MSG_FILE_HASH,
                                    encode_string(guest_path), MSG_FILE_HASH_RESPONSE)
@@ -1197,11 +1235,14 @@ class V9xClient:
             if time.monotonic() - started >= wait_seconds:
                 raise V9xError("no window titled *%s* %s within %d s"
                                % (title, "closed" if gone else "appeared", wait_seconds))
-            time.sleep(0.25)
+            poll_pause(started)
 
-    def wait_file(self, guest_path, wait_seconds, gone=False, stable_ms=0):
-        """Poll FILE_STAT until the file exists (gone: does not), and with
-        stable_ms until its size has not changed for that long."""
+    def wait_file(self, guest_path, wait_seconds, gone=False, stable_ms=0, match=""):
+        """Poll FILE_STAT until the file exists (gone: does not), with
+        stable_ms until its size has not changed for that long, with match
+        until it has a line containing that text (agent 0.13.0+)."""
+        if match:
+            self.require(CAP_FILE_TOOLS, "wait for a line in a file (agent 0.13.0+)")
         started = time.monotonic()
         last_size, stable_since = None, None
         while True:
@@ -1211,6 +1252,11 @@ class V9xClient:
                 done = not stat["exists"]
             elif not stat["exists"]:
                 done = False
+            elif match:
+                found = self.read_text(guest_path, 1, match, 4096)
+                done = found["matched"] > 0
+                if done:
+                    stat["line"] = found["text"].rstrip("\r\n")
             elif stable_ms <= 0:
                 done = True
             else:
@@ -1223,8 +1269,31 @@ class V9xClient:
             if now - started >= wait_seconds:
                 raise V9xError("%s %s within %d s" % (
                     guest_path, "still exists" if gone else
-                    ("kept changing size" if stat["exists"] else "did not appear"), wait_seconds))
-            time.sleep(0.25)
+                    ("did not appear" if not stat["exists"] else
+                     ("has no line containing %r" % match) if match else "kept changing size"),
+                    wait_seconds))
+            poll_pause(started)
+
+    def wait_process(self, wait_seconds, pid=0, name=""):
+        """Poll PROCESS_LIST until no process matches pid or the image name
+        (wildcards * ?): a detached benchmark or installer has finished.
+        was_running is False when nothing matched on the first look."""
+        started = time.monotonic()
+        first = None
+        while True:
+            running = [p for p in self.processes()
+                       if (p["pid"] == pid if pid else
+                           fnmatch.fnmatch(p["name"].upper(), name.upper()))]
+            if first is None:
+                first = running
+            if not running:
+                return {"pid": pid or None, "name": name, "was_running": bool(first),
+                        "exited": [p["name"] for p in first],
+                        "waited_ms": int((time.monotonic() - started) * 1000)}
+            if time.monotonic() - started >= wait_seconds:
+                raise V9xError("%s still running after %d s" % (
+                    ("pid %d" % pid) if pid else repr(name), wait_seconds))
+            poll_pause(started)
 
     def window_region(self, title):
         """The screen rectangle of the first visible window titled *title*,
@@ -1671,10 +1740,12 @@ TOOLS = [
                 "working_dir": {"type": "string", "description": "Guest working directory (optional)"},
                 "timeout_ms": {"type": "integer", "description": "Guest-side timeout in ms (default 60000, max 3600000)"},
                 "show_window": {"type": "boolean", "description": "Show the child's window (console children; GUI-subsystem EXEs manage their own window)"},
-                "detach": {"type": "boolean", "description": "Launch and return immediately without waiting or capturing output. Use for installers and programs that outlive the request."},
+                "detach": {"type": "boolean", "description": "Launch and return immediately without waiting or capturing output. Use for installers and programs that outlive the request. The result's pid (agent 0.14.0+) is what v9x_wait_process and v9x_kill take."},
+                "wait_for_exit": {"type": "boolean", "description": "Launch detached, then return when the process has exited (no 1-hour exec cap, no output captured, exit code unknown)"},
                 "wait_for_file": guest_path_schema("After the run (usually with detach): wait until this guest file exists, then return"),
+                "match": {"type": "string", "description": "With wait_for_file: wait until the file has a line containing this text (e.g. Complete=yes)"},
                 "wait_for_window": {"type": "string", "description": "After the run (usually with detach): wait until a window whose title contains this is shown, then return it"},
-                "wait_seconds": {"type": "integer", "minimum": 1, "maximum": 3600, "description": "Limit for wait_for_file / wait_for_window (default 120)"},
+                "wait_seconds": {"type": "integer", "minimum": 1, "maximum": 3600, "description": "Limit for wait_for_exit / wait_for_file / wait_for_window (default 120). This call blocks the conversation: for waits over a few minutes use v9xctl.ps1 as a background command instead"},
             },
             "required": ["application"],
             "additionalProperties": False,
@@ -1690,6 +1761,7 @@ TOOLS = [
                 "timeout_ms": {"type": "integer", "description": "Guest-side timeout in ms (default 60000)"},
                 "detach": {"type": "boolean", "description": "Launch and return immediately without waiting or capturing output. Use instead of START for commands that spawn long-lived programs."},
                 "wait_for_file": guest_path_schema("After the run (usually with detach): wait until this guest file exists, then return"),
+                "match": {"type": "string", "description": "With wait_for_file: wait until the file has a line containing this text"},
                 "wait_for_window": {"type": "string", "description": "After the run (usually with detach): wait until a window whose title contains this is shown, then return it"},
                 "wait_seconds": {"type": "integer", "minimum": 1, "maximum": 3600, "description": "Limit for wait_for_file / wait_for_window (default 120)"},
             },
@@ -1789,6 +1861,18 @@ TOOLS = [
         },
     },
     {
+        "name": "v9x_note",
+        "description": "Add a line to the tester's activity log on the guest (C:\\V9XREMOTE\\EVENTS.LOG, opened from the tray's Activity log item), as 'Developer: <text>'. Post one before each step a person at the machine should know about: a driver test, a probe, a reboot you are about to request. The agent itself logs connected, idle (safe to reboot), and reboot/shutdown/reset/update requests. 1-200 characters; non-ASCII becomes '?'. Agent 0.15.0+.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "text": {"type": "string", "description": "What you are about to do, in plain words"},
+            },
+            "required": ["text"],
+            "additionalProperties": False,
+        },
+    },
+    {
         "name": "v9x_ps",
         "description": "List guest processes (pid, parent, threads, path); marks the agent and processes started by its exec requests (with their request id). Agent 0.13.0+ on Windows 9x or 2000.",
         "inputSchema": {
@@ -1827,7 +1911,7 @@ TOOLS = [
     },
     {
         "name": "v9x_wait_file",
-        "description": "Wait until a guest file exists (gone=true: is removed; stable_ms: and its size stopped changing), polling on one connection: use instead of sleeping between exec and get. Any agent.",
+        "description": "Wait until a guest file exists (gone=true: is removed; stable_ms: and its size stopped changing; match: and it has a line containing that text, e.g. a report's Complete=yes), polling on one connection: use instead of sleeping between exec and get. Any agent; match needs 0.13.0+. Blocks the conversation: for waits over a few minutes run `v9xctl.ps1 wait-file` as a background command instead.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -1835,8 +1919,22 @@ TOOLS = [
                 "wait_seconds": {"type": "integer", "minimum": 1, "maximum": 3600, "description": "Limit (default 120)"},
                 "gone": {"type": "boolean"},
                 "stable_ms": {"type": "integer", "minimum": 0, "description": "Also wait until the size has not changed for this long"},
+                "match": {"type": "string", "description": "Wait until the file has a line containing this (case-insensitive)"},
             },
             "required": ["guest_path"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "v9x_wait_process",
+        "description": "Wait until a guest process has exited, by pid (from v9x_exec's result or v9x_ps) or image name (wildcards * ?): the way to know a detached benchmark or installer has finished, instead of sleeping. was_running=false means nothing matched on the first look. Agent 0.13.0+ on Windows 9x/2000. Blocks the conversation: for waits over a few minutes run `v9xctl.ps1 wait-process` as a background command instead.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "pid": {"type": "integer", "minimum": 1},
+                "name": {"type": "string", "description": "Image name, e.g. BENCH.EXE"},
+                "wait_seconds": {"type": "integer", "minimum": 1, "maximum": 3600, "description": "Limit (default 600)"},
+            },
             "additionalProperties": False,
         },
     },
@@ -2070,11 +2168,20 @@ RELAY_PROPERTY = {
     "type": "string",
     "description": "Remote-help machine id (M-XXXXXX, see v9x_relay_machines) to run this "
     "against through the update server instead of the local agent. Opening a session "
-    "takes up to a minute when the machine is idle, a few seconds after recent use.",
+    "takes up to a minute when the machine is idle, a few seconds after recent use. "
+    "An agent 0.15.0+ takes three relay calls at once (look at the screen while a long "
+    "wait runs); when all its sessions are in use, or an older agent's one is, the "
+    "server refuses with 'busy' rather than ending that call.",
+}
+RELAY_TAKE_OVER_PROPERTY = {
+    "type": "boolean",
+    "description": "With relay: take the machine's session from another caller that is "
+    "still using it (its call fails). Only to recover a stuck wait.",
 }
 for _tool in TOOLS:
     if _tool["name"] not in ("v9x_discover", "v9x_relay_machines", "v9x_chat"):
         _tool["inputSchema"].setdefault("properties", {})["relay"] = RELAY_PROPERTY
+        _tool["inputSchema"]["properties"]["relay_take_over"] = RELAY_TAKE_OVER_PROPERTY
 
 # The input tools can end with a screenshot on the same connection, so one GUI
 # step (act, let the guest repaint, look) is one tool call.
@@ -2195,7 +2302,10 @@ class ToolHandler:
         timeout = max(self.timeout, 60.0)
         try:
             session = RelaySession(self.relay_settings(), self.relay,
-                                   open_wait=max(5.0, open_wait), timeout=timeout)
+                                   open_wait=max(5.0, open_wait), timeout=timeout,
+                                   owner=getattr(self, "relay_owner", None),
+                                   label=getattr(self, "relay_label", ""),
+                                   take_over=getattr(self, "relay_take_over", False))
         except RelayError as exc:
             raise V9xError(str(exc))
         try:
@@ -2258,6 +2368,12 @@ class ToolHandler:
             raise V9xError("unknown tool: %s" % name)
         args = dict(args or {})
         self.relay = args.pop("relay", None) or self.default_relay
+        # One relay owner per tool call: its own reconnects (reboot and update
+        # waits) replace its session, anyone else's live session is refused
+        # as busy instead of being stolen.
+        self.relay_take_over = bool(args.pop("relay_take_over", False))
+        self.relay_owner = uuid.uuid4().hex
+        self.relay_label = name
         return method(args)
 
     def v9x_relay_machines(self, args):
@@ -2312,7 +2428,7 @@ class ToolHandler:
                 working_dir=args.get("working_dir", ""),
                 timeout_ms=int(args.get("timeout_ms", 60000)),
                 show_window=bool(args.get("show_window", False)),
-                detach=bool(args.get("detach", False)),
+                detach=bool(args.get("detach", False) or args.get("wait_for_exit", False)),
             )
             return self.text(self.after_run(client, result, args))
 
@@ -2333,8 +2449,13 @@ class ToolHandler:
         wait_seconds = int(args.get("wait_seconds", 120))
         if result.get("result") != "ok":
             return result
+        if args.get("wait_for_exit"):
+            # Agents before 0.14.0 report no pid: wait on the image name.
+            name = "" if result.get("pid") else re.split(r"[\\/:]", args["application"])[-1]
+            result["waited_for_exit"] = client.wait_process(wait_seconds, result.get("pid") or 0, name)
         if args.get("wait_for_file"):
-            result["waited_for_file"] = client.wait_file(args["wait_for_file"], wait_seconds)
+            result["waited_for_file"] = client.wait_file(args["wait_for_file"], wait_seconds,
+                                                         match=args.get("match", ""))
         if args.get("wait_for_window"):
             result["waited_for_window"] = client.wait_window(args["wait_for_window"], wait_seconds)
         return result
@@ -2426,6 +2547,10 @@ class ToolHandler:
             return self.text(client.delete(args["guest_path"], bool(args.get("recursive")),
                                            bool(args.get("force"))))
 
+    def v9x_note(self, args):
+        with self.connect() as client:
+            return self.text(client.note(args["text"]))
+
     def v9x_ps(self, args):
         with self.connect() as client:
             processes = client.processes()
@@ -2460,7 +2585,16 @@ class ToolHandler:
     def v9x_wait_file(self, args):
         with self.connect() as client:
             return self.text(client.wait_file(args["guest_path"], int(args.get("wait_seconds", 120)),
-                                              bool(args.get("gone")), int(args.get("stable_ms", 0))))
+                                              bool(args.get("gone")), int(args.get("stable_ms", 0)),
+                                              args.get("match", "")))
+
+    def v9x_wait_process(self, args):
+        pid, name = int(args.get("pid") or 0), args.get("name", "")
+        if not pid and not name:
+            raise V9xError("wait_process needs pid or name")
+        with self.connect() as client:
+            client.require(CAP_PROCESS, "process list (agent 0.13.0+, Windows 9x/2000)")
+            return self.text(client.wait_process(int(args.get("wait_seconds", 600)), pid, name))
 
     def v9x_reg_query(self, args):
         with self.connect() as client:

@@ -174,6 +174,14 @@ exit code is a nominal 0. Use it for installers and `START`-style launches
 whose target outlives the request; the pipe-capture flag is not set and flag
 `0x40` is set instead.
 
+The pid option (request option bit `0x0002`, advertised by capability
+`0x00400000`, agent 0.14.0+) makes `EXEC_COMPLETE` 32 bytes: the 28 above,
+then the child's u32 process id (0 if it never started). It is the id
+`PROCESS_LIST` and `PROCESS_KILL` use, so a host can wait for a detached
+child to exit or end it. Older agents reject the bit as an invalid payload,
+so hosts set it only when the capability is advertised; the DOS agent never
+advertises it.
+
 Capture pipes are created non-inheritable and the child receives inheritable
 duplicates of only the write ends, so agent-side handles cannot leak into the
 child's descendants. In shell mode, if every write handle on both pipes closes
@@ -308,6 +316,24 @@ Capability `V9X_CAP_WINDOWS` (`0x00200000`):
   `WM_GETTEXT` through `SendMessageTimeout` (500 ms, abort if hung), so a hung
   program yields an empty title instead of hanging the agent. Hosts poll it
   for `wait-window`, `exec -WaitForWindow` and `screenshot -Window`.
+
+## Activity log (agent 0.15.0+)
+
+Capability `V9X_CAP_EVENT_LOG` (`0x00800000`):
+
+- `EVENT_NOTE_REQUEST` (`0x00A0`): one string, 1-200 bytes of printable
+  ASCII. `EVENT_NOTE_RESPONSE` (`0x80A0`): empty. The agent appends
+  `<local date time> Developer: <text>` to `C:\V9XREMOTE\EVENTS.LOG`, the
+  plain-English log a person at the machine opens from the tray, and
+  `event-note <text>` to `AGENT.LOG`. Hosts clean the text before sending
+  (control characters to spaces, other non-ASCII to `?`) so a pasted
+  dash does not fail the call.
+
+With the same capability the agent writes its own lines to `EVENTS.LOG`
+(started, developer connected, idle for 2 minutes, reboot / shutdown /
+reset / update requested, remote-help state changes) and keeps the
+remote-help chat in `C:\V9XREMOTE\CHAT.LOG`, reloaded at start. Both
+rotate to `.OLD` at 64 KiB. Read either with `FILE_READ_TEXT`.
 
 ## HTTP download
 
