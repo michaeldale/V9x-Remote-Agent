@@ -74,7 +74,9 @@ operator key comes from `%USERPROFILE%\.v9x\operator.key` or
 | `v9x_reg_query` | Subkeys and values of one registry key, read-only (0.13.0+) |
 | `v9x_wait_file` | Wait until a guest file exists (`gone`, `stable_ms`; `match`: has a line containing text, 0.13.0+) instead of sleeping |
 | `v9x_wait_process` | Wait until a guest process (`pid` from `v9x_exec`, or `name`) has exited; for detached benchmarks (0.13.0+). For waits over a minute or two use `v9xctl.ps1` as a background command: an MCP call blocks the conversation |
-| `v9x_windows` | Visible top-level windows; `wait_for` a title to appear (`gone`: close) (0.13.0+) |
+| `v9x_wait_fault` | Wait until a process exits (`outcome: exited`) or a fault dialog about it appears (`outcome: fault`, with the dialog's title, message and details); no `pid`/`name`: any program's fault (`no_fault` at the deadline); `dismiss` closes the dialog (0.16.0+). `v9x_exec` `wait_for_exit` does the same on 0.16.0+ agents |
+| `v9x_windows` | Visible top-level windows; `wait_for` a title to appear (`gone`: close) (0.13.0+); `controls` adds each window's control text (0.16.0+) |
+| `v9x_close_window` | Close the one window whose title contains `title` (WM_CLOSE) and wait until it is gone (0.16.0+) |
 
 No tool needs a sleep around it: `v9x_ping` takes `wait_seconds` (keeps
 retrying while the guest boots), `v9x_exec`/`v9x_shell` take
@@ -98,6 +100,26 @@ connection that is dropped before HELLO is retried twice.
 
 Every tool opens a fresh connection, so a crashed VM never wedges the server;
 errors come back as tool results with `isError` set.
+
+Agent 0.17.0 development adds `dismiss_logon: true` on `v9x_wait_desktop`,
+`v9x_reboot_with_proof` and `v9x_reset_with_proof`. It cancels a recognized
+English Windows 9x startup password dialog and waits for Explorer in the
+guest, reporting `logon_dismissed`. It sends no credentials and changes no
+logon settings. NT logons and unknown/localized dialogs are unsupported.
+Power tools check support before reboot/reset, then run the desktop wait on
+the proven reconnect; `wait_seconds` bounds each phase separately. Plain
+desktop waits on older agents still work without the new option.
+
+Other 0.17.0 tools: `v9x_reg_write` changes one value (`set_string`,
+`set_dword`, `delete_value`) and returns its old value; `v9x_display`
+reports current/saved modes and takes `restore`; `v9x_kill` takes
+`restore_display` to wait for exit before restoring. Registry mutations
+are audited, limited to 1024 bytes of new/old data, and refuse protected
+system/agent keys. Input tools' `window` now selects and verifies foreground
+focus before input, and also selects an optional screenshot crop. New input
+results include `foreground_before`, `keyboard_window` (last key press/typed character)
+and `foreground_after`. On 0.17.0+, PID/unique exact-name process waits use
+bounded guest process-handle waits; wildcards retain the existing path.
 
 The screenshot tool converts the agent's BMP (24-bit, or from agent 0.13.0
 8-bit/RLE8) to PNG in-process (also standard library only) and returns it as

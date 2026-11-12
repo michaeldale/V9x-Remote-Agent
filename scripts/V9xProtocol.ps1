@@ -410,13 +410,24 @@ function New-V9xInputPayload {
 }
 
 function ConvertFrom-V9xInputPayload {
-    param([byte[]]$Payload)
-    if ($Payload.Length -ne 12) { throw 'Invalid INPUT_RESPONSE payload length.' }
-    [pscustomobject]@{
+    param([byte[]]$Payload, [switch]$Extended)
+    if ($Payload.Length -lt 12 -or (-not $Extended -and $Payload.Length -ne 12)) { throw 'Invalid INPUT_RESPONSE payload length.' }
+    $result = [pscustomobject]@{
         ActionsPerformed = [BitConverter]::ToUInt32($Payload, 0)
         CursorX = [BitConverter]::ToInt32($Payload, 4)
         CursorY = [BitConverter]::ToInt32($Payload, 8)
     }
+    if ($Extended) {
+        $offset = 12
+        foreach ($field in @('ForegroundBefore', 'KeyboardWindow', 'ForegroundAfter')) {
+            if ($offset + 8 -gt $Payload.Length) { throw 'Truncated input foreground window.' }
+            $w = [ordered]@{ Handle = [BitConverter]::ToUInt32($Payload, $offset); Pid = [BitConverter]::ToUInt32($Payload, $offset + 4) }
+            $offset += 8; $w.Title = Read-V9xAnsiString -Bytes $Payload -Offset ([ref]$offset)
+            $result | Add-Member -NotePropertyName $field -NotePropertyValue ([pscustomobject]$w)
+        }
+        if ($offset -ne $Payload.Length) { throw 'Trailing input foreground data.' }
+    }
+    return $result
 }
 
 function ConvertFrom-V9xStatPayload {
@@ -610,6 +621,45 @@ function ConvertFrom-V9xWindowListPayload {
     return $list.ToArray()
 }
 
+# WINDOW_TEXT 0x0063 (u32 handle) -> 0x8063: u32 handle, u32 pid, u32 child
+# count, u32 truncated, class string, title string, then per child u32 hwnd,
+# u32 control id, u32 flags (1 visible), class string, text string.
+# V9X_CAP_WINDOW_TEXT 0x01000000.
+function New-V9xWindowTextPayload {
+    param([uint32]$Handle)
+    return ,[BitConverter]::GetBytes($Handle)
+}
+
+function ConvertFrom-V9xWindowTextPayload {
+    param([byte[]]$Payload)
+    if ($Payload.Length -lt 16) { throw 'Truncated WINDOW_TEXT_RESPONSE payload.' }
+    $count = [BitConverter]::ToUInt32($Payload, 8)
+    $offset = 16
+    $window = [ordered]@{
+        Handle = [BitConverter]::ToUInt32($Payload, 0)
+        Pid = [BitConverter]::ToUInt32($Payload, 4)
+        Truncated = [BitConverter]::ToUInt32($Payload, 12) -ne 0
+    }
+    $window.Class = Read-V9xAnsiString -Bytes $Payload -Offset ([ref]$offset)
+    $window.Title = Read-V9xAnsiString -Bytes $Payload -Offset ([ref]$offset)
+    $children = [Collections.Generic.List[object]]::new()
+    for ($index = 0; $index -lt $count; ++$index) {
+        if ($offset + 12 -gt $Payload.Length) { throw 'Truncated child window entry.' }
+        $child = [ordered]@{
+            Handle = [BitConverter]::ToUInt32($Payload, $offset)
+            ControlId = [BitConverter]::ToUInt32($Payload, $offset + 4)
+            Visible = [bool]([BitConverter]::ToUInt32($Payload, $offset + 8) -band 1)
+        }
+        $offset += 12
+        $child.Class = Read-V9xAnsiString -Bytes $Payload -Offset ([ref]$offset)
+        $child.Text = Read-V9xAnsiString -Bytes $Payload -Offset ([ref]$offset)
+        $children.Add([pscustomobject]$child)
+    }
+    if ($offset -ne $Payload.Length) { throw 'WINDOW_TEXT_RESPONSE contains trailing data.' }
+    $window.Children = $children.ToArray()
+    return [pscustomobject]$window
+}
+
 $script:V9xRegHives = [ordered]@{
     'HKCR' = 0x80000000L; 'HKEY_CLASSES_ROOT' = 0x80000000L
     'HKCU' = 0x80000001L; 'HKEY_CURRENT_USER' = 0x80000001L
@@ -630,6 +680,59 @@ function New-V9xRegQueryPayload {
     $bytes.AddRange([BitConverter]::GetBytes([uint32]$script:V9xRegHives[$hiveName]))
     Add-V9xString -Bytes $bytes -Value $(if ($parts.Count -gt 1) { $parts[1] } else { '' })
     return $bytes.ToArray()
+}
+
+function New-V9xRegWritePayload {
+    param([string]$Key, [string]$Name, [uint32]$Operation, [byte[]]$Data)
+    if ($null -eq $Data) { $Data = [byte[]]@() }
+    if ($Name.Length -gt 259 -or $Name -match '[^\x01-\x7f]') { throw 'Registry name must be ASCII, up to 259 characters (empty: default value).' }
+    if ($Data.Length -gt 1024) { throw 'Registry data is limited to 1024 bytes.' }
+    [byte[]]$keyBytes = New-V9xRegQueryPayload -Key $Key
+    $bytes = [Collections.Generic.List[byte]]::new()
+    $bytes.AddRange([byte[]]$keyBytes[0..3]); $bytes.AddRange([BitConverter]::GetBytes($Operation))
+    $bytes.AddRange([byte[]]$keyBytes[4..($keyBytes.Length - 1)])
+    Add-V9xString -Bytes $bytes -Value $Name
+    $bytes.AddRange([BitConverter]::GetBytes([uint32]$Data.Length)); $bytes.AddRange($Data)
+    return ,$bytes.ToArray()
+}
+
+function ConvertFrom-V9xRegWritePayload {
+    param([byte[]]$Payload, [string]$Name)
+    if ($Payload.Length -lt 12 -or [BitConverter]::ToUInt32($Payload, 0) -gt 1 -or
+        12 + [BitConverter]::ToUInt32($Payload, 8) -ne $Payload.Length) { throw 'Invalid REG_WRITE response.' }
+    if ([BitConverter]::ToUInt32($Payload, 0) -eq 0) {
+        return [pscustomobject]@{ Exists = $false; Type = $null; Data = $null }
+    }
+    # The previous value uses the same type/length/data format as REG_QUERY.
+    $bytes = [Collections.Generic.List[byte]]::new()
+    $bytes.AddRange([byte[]](0,0,0,0,1,0,0,0,0,0,0,0))
+    Add-V9xString -Bytes $bytes -Value $Name
+    $bytes.AddRange([byte[]]$Payload[4..($Payload.Length - 1)])
+    $value = @( (ConvertFrom-V9xRegQueryPayload $bytes.ToArray()).Values )[0]
+    [pscustomobject]@{ Exists = $true; Type = $value.Type; Data = $value.Data }
+}
+
+function ConvertFrom-V9xDisplayPayload {
+    param([byte[]]$Payload)
+    if ($Payload.Length -ne 40) { throw 'Invalid DISPLAY response.' }
+    $flags = [BitConverter]::ToUInt32($Payload, 0)
+    if ($flags -band (-bnot 7)) { throw 'Invalid DISPLAY flags.' }
+    $modes = @(for ($i = 0; $i -lt 2; ++$i) {
+        if ($flags -band (1 -shl $i)) {
+            $at = 8 + 16 * $i
+            [pscustomobject]@{ Width = [BitConverter]::ToUInt32($Payload, $at)
+                Height = [BitConverter]::ToUInt32($Payload, $at + 4)
+                BitsPerPixel = [BitConverter]::ToUInt32($Payload, $at + 8)
+                RefreshHz = [BitConverter]::ToUInt32($Payload, $at + 12) }
+        } else { $null }
+    })
+    $different = $null
+    if ($null -ne $modes[0] -and $null -ne $modes[1]) {
+        $different = $modes[0].Width -ne $modes[1].Width -or $modes[0].Height -ne $modes[1].Height -or
+            $modes[0].BitsPerPixel -ne $modes[1].BitsPerPixel -or
+            ($modes[0].RefreshHz -gt 1 -and $modes[1].RefreshHz -gt 1 -and $modes[0].RefreshHz -ne $modes[1].RefreshHz)
+    }
+    [pscustomobject]@{ CurrentMode = $modes[0]; SavedMode = $modes[1]; ModeDiffers = $different; Restored = [bool]($flags -band 4) }
 }
 
 function ConvertFrom-V9xRegQueryPayload {

@@ -204,6 +204,12 @@ Waiting without sleeping:
 .\scripts\v9xctl.ps1 wait-process -Name 3DMARK.EXE -WaitSeconds 7200 -Json
 .\scripts\v9xctl.ps1 wait-file -Path C:\BENCH\REPORT.INI -Match Complete=yes -WaitSeconds 3600 -Json
 .\scripts\v9xctl.ps1 cat -Path C:\BENCH\BENCH.LOG -Follow -Until "Score:" -WaitSeconds 7200
+# Crashes (0.16.0): exit or fault dialog in one call, dialog text returned
+.\scripts\v9xctl.ps1 exec -Application C:\JOBS\T\MYTEST.EXE -WaitForExit -Dismiss -Json
+.\scripts\v9xctl.ps1 wait-fault -Name MYTEST.EXE -WaitSeconds 600 -Dismiss -Json
+.\scripts\v9xctl.ps1 wait-fault -WaitSeconds 300 -Json      # any program, for a whole run
+.\scripts\v9xctl.ps1 windows -Title "Error" -Controls
+.\scripts\v9xctl.ps1 close-window -Title "Application Error" -Json
 ```
 
 - Every connection is retried when it is dropped before HELLO (a port forward
@@ -238,6 +244,42 @@ Waiting without sleeping:
   report the pid, so it waits on the image name instead. Both default to
   `-WaitSeconds 3600`; exit 49 at the deadline. `exec` results carry `Pid`
   on 0.14.0+ agents (for `wait-process` and `kill`).
+- `wait-fault [-Pid <id> | -Name <image>]` (agent 0.16.0+) waits until the
+  process exits (`Outcome = Exited`, exit 0) or a fault dialog about it
+  appears (`Outcome = Fault`, exit 50). `Fault` carries the dialog's
+  `Title`, `Message` (its labels), `Details` (its edit text: on Windows 9x
+  the "caused an invalid page fault in module ... Registers: ..." dump,
+  present without pressing Details), `Buttons`, `Handle` and `DialogPid`.
+  A dialog is a fault report when its title or text has a fault phrase
+  ("performed an illegal operation", "Application Error", "has generated
+  errors", "access violation", ...), and only standard dialogs (`#32770`)
+  and Dr. Watson's `NotifyDialog` are read, so an ordinary message box or an
+  editor showing a log never counts. It belongs to the target when its owner
+  is the target's pid or its title or text names the target's image as a
+  whole word: Windows 9x shows the box from the KERNEL32 system process with
+  the module name as the title ("Crashprb"), Windows 2000 from Dr. Watson
+  (`drwtsn32.exe`, "CRASHPRB.exe has generated errors") or CSRSS. Faults are
+  checked before exit, because the dialog outlives the process: killing a
+  crashed program leaves its dialog up. Dr. Watson's box shows Cancel while
+  it writes its log and OK when done; closing it earlier cancels the log, so
+  v9xctl waits (up to 60 s) for OK and then sets `Details` to the newest
+  "Exception number:" line of the default `drwtsn32.log` (All Users
+  documents, `DrWatson` folder), e.g. `c0000094 (divide by zero)`. A log
+  moved elsewhere in Dr. Watson's settings is not read. `-Dismiss` closes the dialog
+  (WM_CLOSE) and reports `Dismissed`. Without `-Pid`/`-Name` it reports the
+  first fault dialog from any program, or ends at `-WaitSeconds` with exit 0
+  and `Outcome = NoFault`. Exit 49 at the deadline when a target still
+  runs. Each probe is one `PROCESS_LIST` and one `WINDOW_LIST`; a dialog's
+  text is read once. `exec -WaitForExit` on a 0.16.0+ agent uses the same
+  wait (and takes `-Dismiss`), so a crash returns exit 50 at once instead
+  of holding the wait until the deadline behind its dialog.
+- `windows -Controls` adds each window's child controls (`Class`,
+  `ControlId`, `Visible`, `Text`): read a dialog without a screenshot.
+  `close-window -Title <text>` posts WM_CLOSE to the one window whose title
+  contains the text and waits (`-WaitSeconds`, default 10) until it is
+  gone; it refuses the desktop, the taskbar and the agent's own windows,
+  and exits 48 on no match, several matches, or a window that stays open.
+  Both need agent 0.16.0+.
 - `cat -Follow` prints lines as they are appended (with `-Match`, only those
   lines; `-Tail N` first prints the last N already there), one per stdout
   line, flushed: run it as a background command under Claude Code's Monitor
@@ -261,7 +303,8 @@ Waiting without sleeping:
   agents often guess are accepted: `ls`/`dir` (list), `pull` (get), `push`
   (put), `status` (info), `rm`/`del` (delete), `type`/`tail` (cat),
   `tasklist` (ps), `taskkill` (kill), `wait-ready` (wait-desktop),
-  `wait-exit` (wait-process), `follow` (cat), and more. `-Target host:port` sets `-Host` and `-Port` together; `-HostName`
+  `wait-exit` (wait-process), `wait-crash` (wait-fault), `close`
+  (close-window), `follow` (cat), and more. `-Target host:port` sets `-Host` and `-Port` together; `-HostName`
   and `-EndpointPort` are aliases.
 
 Boot and capture examples:
@@ -377,17 +420,81 @@ directly through Windows SetupX, performs a proven reboot, waits for the
 desktop, and stores `DESKTOP.BMP` plus `cycle.json` under
 `build\driver-results\<job-id>`. It never performs first device association.
 
+## Remote-help operator shortcuts (0.17.0 development)
+
+`wait-desktop -DismissLogon` cancels a recognized English Win9x startup
+password dialog while waiting for Explorer. It runs as one bounded request
+inside the guest, reports `LogonDismissed`, and logs cancellation in
+`EVENTS.LOG`. It never sends credentials or changes logon settings. Unknown
+dialogs and NT secure logon are unsupported; older agents reject the option.
+Without the option, the wait does not cancel anything.
+
+```powershell
+.\scripts\v9xctl.ps1 wait-desktop -DismissLogon -Relay M-XXXXXX -Json
+.\scripts\v9xctl.ps1 reboot -DismissLogon -JobId operator-boot -WaitSeconds 180 -Json
+.\scripts\v9xctl.ps1 list C:\V9XREMOTE\JOBS -Json
+.\scripts\v9xctl.ps1 get C:\V9XREMOTE\EVENTS.LOG -Destination .\events.log
+```
+
+`reboot` and `reset` accept the same switch. They check support before
+power control, then wait for Explorer on the proven reconnect. `-WaitSeconds`
+bounds each phase separately; exit 42 means proof failed, exit 44 means the
+desktop wait failed. Use `reset` only when a normal Win9x restart hangs.
+
+`list`, `cat`, `stat`, `get` and `hash` accept a guest path as their second
+word, including verb aliases such as `ls`, `type` and `pull`. For `get` this
+is `-Source`; for the other verbs it is `-Path`. Named parameters remain
+supported. Supplying both forms is a usage error (exit 10).
+
+Registry writes, display recovery and focused input are also in 0.17.0:
+
+```powershell
+.\scripts\v9xctl.ps1 reg -Set -Key HKCU\Software\Valve\HLDemo\Settings -Name EngineType -Dword 3 -Json
+.\scripts\v9xctl.ps1 reg -Set -Key HKLM\Config\0001\Display\Settings -Name Resolution -String '1024,768' -Json
+.\scripts\v9xctl.ps1 reg -DeleteValue -Key HKLM\Config -Name Resolution -Json
+.\scripts\v9xctl.ps1 display -Json
+.\scripts\v9xctl.ps1 kill -Name HLDEMO.EXE -RestoreDisplay -Json
+.\scripts\v9xctl.ps1 input -Window 'Half-Life' -Sequence 'type quit; key ENTER' -Json
+```
+
+`reg` returns `Previous` and writes the operation/old value to `EVENTS.LOG`.
+Only one REG_SZ/REG_DWORD value can be set, or one value deleted; no registry
+key deletion. New/old data is limited to 1024 bytes. Hive roots, HKLM
+SYSTEM/SECURITY/SAM/HARDWARE, HKCC/HKDD and agent startup entries are protected.
+An empty `-Name ''` selects the default value. Registry changes do not apply
+a display mode; `display -Restore` applies the saved registry mode.
+
+`display` returns `CurrentMode`, `SavedMode`, `ModeDiffers` (null if unknown)
+and `Restored`. `kill -RestoreDisplay` checks support before killing, confirms
+exit and only then restores. If the process has not exited within 10 s, or
+the restore fails, the output still carries the kill result, with
+`Display.Restored` false and `Display.Error` saying why, and the exit code is
+51. The kill is not undone; do not repeat it.
+
+Input targeting requires one literal, case-insensitive title substring match
+and verified foreground focus. Losing target focus stops remaining actions.
+New input replies report `ForegroundBefore`, `KeyboardWindow` (the last
+key press/typed character) and `ForegroundAfter`, each with PID, handle and title.
+The same `-Window` also selects the optional screenshot crop. Old agents
+retain legacy input without this metadata and refuse explicit targeting.
+
+PID and unique exact-name process waits use bounded guest handle waits on
+0.17.0+ agents. Wildcards/multiple matches keep the existing polling behavior.
+Relay reconnects now receive the actual remaining wait budget rather than
+a minimum 150-second session-open allowance. Transport overhead is separate
+from guest deadlines. The original 0.15.0 reported hang remains unreproduced.
+
 ## set-autologon.ps1
 
 `set-autologon.ps1` reports and changes Windows 9x autologon on a guest, and
-clears a logon dialog that is already on screen. It is a host-side composition
-of existing verbs (`exec`, `put`, `get`, `stat`, `shell`, `input`,
-`wait-desktop`) with no protocol change, so any agent that supports those verbs
-supports it.
+clears a logon dialog that is already on screen. Status/enable/disable compose
+existing verbs. `-Dismiss` uses the 0.17.0+ Win9x guest cancellation request.
+Every operation forwards `-Relay` and `-RelayServer` when provided.
 
 ```powershell
 .\scripts\set-autologon.ps1                       # status only, changes nothing
 .\scripts\set-autologon.ps1 -Dismiss              # clear a dialog that is up now
+.\scripts\set-autologon.ps1 -Dismiss -Relay M-XXXXXX
 .\scripts\set-autologon.ps1 -Enable  -Json
 .\scripts\set-autologon.ps1 -Disable -Host 10.0.1.172
 ```
@@ -397,13 +504,13 @@ supports it.
 | none | Reports `PrimaryProvider`, user name, `.PWL` path and presence, `DesktopReady`, and an `Autologon` boolean. Works while the guest sits at the logon dialog. |
 | `-Enable` | Clears `HKLM\Network\Logon\PrimaryProvider` to Windows Logon if a network provider is set, and completes a pending logon dialog so Windows writes the password list. |
 | `-Disable` | Parks `C:\WINDOWS\<user>.PWL` as `C:\WINDOWS\V9XLOGON.PWL` (not deleted, so `-Enable` can restore it). The guest prompts from the next boot. |
-| `-Dismiss` | Sends one `ENTER` to a logon dialog that is up and waits for the desktop. Changes no configuration. |
+| `-Dismiss` | Cancels a recognized startup logon and waits for Explorer; reports `DialogCleared` and `LogonDismissed`. Requires a 0.17.0+ Win9x agent. Does not send credentials or change registry/PWL settings. |
 
 Autologon on Windows 9x needs two conditions together: an empty
 `PrimaryProvider`, and a `C:\WINDOWS\<user>.PWL` holding a blank password.
 The password list is only written when a logon completes, so it cannot be
 fabricated - `-Enable` on a guest with no `.PWL` and no dialog on screen
-reports that a reboot plus one `-Dismiss` is still needed. Reasoning and
+reports that a reboot plus another `-Enable` is still needed. Reasoning and
 measurements:
 [decisions/2026-09-04-prelogon-reachability-and-autologon.md](decisions/2026-09-04-prelogon-reachability-and-autologon.md).
 

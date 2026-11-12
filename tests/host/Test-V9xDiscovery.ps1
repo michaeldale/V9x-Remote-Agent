@@ -70,15 +70,20 @@ for ($index = 0; $index -lt $local.Length - 16; ++$index) {
     }
 }
 
-$responder = Start-Job -ArgumentList $udpPort, $tcpPort, $protocolScript, $local, $fixtureId -ScriptBlock {
-    param($UdpPort, $TcpPort, $ProtocolScript, [byte[]]$Answer, $InstallId)
+$readyName = 'Local\V9xDiscoveryFixture-' + [Guid]::NewGuid().ToString('N')
+$ready = [Threading.EventWaitHandle]::new($false, [Threading.EventResetMode]::ManualReset, $readyName)
+$responder = Start-Job -ArgumentList $udpPort, $tcpPort, $protocolScript, $local, $fixtureId, $readyName -ScriptBlock {
+    param($UdpPort, $TcpPort, $ProtocolScript, [byte[]]$Answer, $InstallId, $ReadyName)
     $ErrorActionPreference = 'Stop'
     . $ProtocolScript
     $udp = [Net.Sockets.UdpClient]::new([Net.IPEndPoint]::new([Net.IPAddress]::Loopback, $UdpPort))
     $listener = [Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback, $TcpPort)
     $client = $null
+    $ready = [Threading.EventWaitHandle]::OpenExisting($ReadyName)
     try {
         $listener.Start()
+        $udp.Client.ReceiveTimeout = 15000
+        [void]$ready.Set()
         # 1: discover.  2: info -Id.
         for ($round = 0; $round -lt 2; ++$round) {
             $remote = [Net.IPEndPoint]::new([Net.IPAddress]::Any, 0)
@@ -89,8 +94,11 @@ $responder = Start-Job -ArgumentList $udpPort, $tcpPort, $protocolScript, $local
             [void]$udp.Send($Answer, $Answer.Length, $remote)
         }
 
-        $client = $listener.AcceptTcpClient()
+        $accepted = $listener.AcceptTcpClientAsync()
+        if (-not $accepted.Wait(15000)) { throw 'Discovery fixture TCP accept timed out.' }
+        $client = $accepted.Result
         $stream = $client.GetStream()
+        $stream.ReadTimeout = 10000
         $hello = Read-V9xFrame -Stream $stream
         if ($hello.Type -ne 0x0001) { throw 'Expected HELLO_REQUEST.' }
         $payload = [Collections.Generic.List[byte]]::new()
@@ -131,11 +139,14 @@ $responder = Start-Job -ArgumentList $udpPort, $tcpPort, $protocolScript, $local
         if ($null -ne $client) { $client.Dispose() }
         $listener.Stop()
         $udp.Dispose()
+        $ready.Dispose()
     }
 }
 
 try {
-    Start-Sleep -Milliseconds 700
+    # Starting a PowerShell worker can exceed 700 ms under load. A lost UDP
+    # query is never retried, so wait for an actual listening responder.
+    if (-not $ready.WaitOne(15000)) { throw 'Discovery fixture did not become ready.' }
     $discovered = & $clientScript discover -QueryAddress "127.0.0.1:$udpPort" -DiscoverSeconds 2 -Json | ConvertFrom-Json
     if ($LASTEXITCODE -ne 0) { throw "discover exited $LASTEXITCODE." }
     if ($discovered.Count -ne 1 -or $discovered.Agents[0].InstallId -ne $fixtureId -or
@@ -153,6 +164,7 @@ try {
 } finally {
     Stop-Job -Job $responder -ErrorAction SilentlyContinue
     Remove-Job -Job $responder -Force -ErrorAction SilentlyContinue
+    $ready.Dispose()
 }
 
 # Nobody answering is exit 20, like any unreachable agent.

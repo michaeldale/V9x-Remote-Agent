@@ -90,14 +90,14 @@ param(
         param($commandName, $parameterName, $wordToComplete)
         @('discover', 'ping', 'info', 'inventory', 'exec', 'shell', 'stat', 'list', 'mkdir',
           'put', 'get', 'push-tree', 'wait-file', 'delete', 'hash', 'cat', 'ps', 'kill', 'reg',
-          'windows', 'wait-window', 'wait-process', 'note',
+          'windows', 'wait-window', 'close-window', 'wait-process', 'wait-fault', 'note',
           'download', 'update', 'reboot', 'reset', 'shutdown',
-          'wait-desktop', 'screenshot', 'input', 'vnc', 'help') |
+          'wait-desktop', 'screenshot', 'input', 'display', 'vnc', 'help') |
             Where-Object { $_ -like "$wordToComplete*" }
     })]
     [string]$Action,
-    # vnc: status|start|stop; help: the verb to describe. Checked per verb
-    # below, so `help update` is not rejected by parameter binding.
+    # vnc: status|start|stop; help: the verb; path verbs: guest path. Checked
+    # per verb below, so `help update` is not rejected by parameter binding.
     [Parameter(Position = 1)]
     [string]$VncCommand = '',
     [Alias('Host', 'HostName', 'Address')]
@@ -122,6 +122,21 @@ param(
     [string]$Title = '',
     [string]$WaitForWindow = '',
     [string]$Window = '',
+    # windows -Controls: also each window's child controls and their text
+    # (agent 0.16.0+).
+    [switch]$Controls,
+    # wait-fault / exec -WaitForExit: close the fault dialog once read.
+    [switch]$Dismiss,
+    # Win9x only (0.17.0+): cancel a recognized startup logon dialog while
+    # waiting for Explorer, without changing the owner's logon settings.
+    [switch]$DismissLogon,
+    [switch]$Restore,
+    [switch]$RestoreDisplay,
+    [switch]$Set,
+    [switch]$DeleteValue,
+    [AllowEmptyString()]
+    [string]$String,
+    [uint32]$Dword,
     [switch]$Gone,
     [ValidateRange(0, 600000)]
     [int]$StableMs = 0,
@@ -303,11 +318,11 @@ function ConvertTo-V9xInputActions {
 }
 
 function Connect-V9xSession {
-    param([string]$HostName, [int]$TcpPort, [int]$TimeoutSeconds)
+    param([string]$HostName, [int]$TcpPort, [int]$TimeoutSeconds, [int]$RelayOpenWaitSeconds = 0)
     if ($Relay) {
         # The relay stream is its own client; disposing it ends the session.
         $sessionClient = New-V9xRelayStream -Machine $Relay -Server $RelayServer `
-            -OpenWaitSeconds ([Math]::Max($TimeoutSeconds, 150)) -Label $Action `
+            -OpenWaitSeconds $(if ($RelayOpenWaitSeconds -gt 0) { $RelayOpenWaitSeconds } else { [Math]::Max($TimeoutSeconds, 150) }) -Label $Action `
             -TakeOver:$RelayTakeOver
         $sessionStream = $sessionClient
     } else {
@@ -360,7 +375,10 @@ function Connect-V9xSessionWithRetry {
     $attempt = 0
     for (;;) {
         try {
-            return Connect-V9xSession -HostName $HostName -TcpPort $TcpPort -TimeoutSeconds $TimeoutSeconds
+            $relayBudget = if ($Relay -and $WaitSeconds -gt 0) {
+                [int][Math]::Max(1, [Math]::Ceiling(($deadline - [DateTime]::UtcNow).TotalSeconds))
+            } else { 0 }
+            return Connect-V9xSession -HostName $HostName -TcpPort $TcpPort -TimeoutSeconds $TimeoutSeconds -RelayOpenWaitSeconds $relayBudget
         } catch {
             $failure = $_.Exception
             while ($failure -is [Management.Automation.MethodInvocationException] -and $failure.InnerException) {
@@ -463,10 +481,16 @@ function Invoke-V9xWaitLoop {
 
 # Exit 23 with a pointer to the fix when the agent lacks a capability.
 function Assert-V9xCapability {
-    param([uint32]$Capability, [string]$What, [string]$Since = '0.13.0')
+    param([uint32]$Capability, [string]$What, [string]$Since = '0.13.0', [switch]$Win9xOnly)
     if (($script:hello.Capabilities -band $Capability) -eq 0) {
-        $exception = [InvalidOperationException]::new(
-            "Agent build '$($script:hello.BuildId)' cannot $What (needs agent $Since+). Update it first: .\scripts\v9xctl.ps1 update -Source .\build\install")
+        # A Win9x-only capability is also withheld by current NT agents, so
+        # "update it" alone would send an NT user on a pointless update.
+        $text = if ($Win9xOnly) {
+            "Agent build '$($script:hello.BuildId)' cannot $What (Windows 9x only, agent $Since+). Windows NT/2000/XP agents never offer it; on Windows 9x, update the agent: .\scripts\v9xctl.ps1 update -Source .\build\install"
+        } else {
+            "Agent build '$($script:hello.BuildId)' cannot $What (needs agent $Since+). Update it first: .\scripts\v9xctl.ps1 update -Source .\build\install"
+        }
+        $exception = [InvalidOperationException]::new($text)
         $exception.Data['V9xExitCode'] = 23
         throw $exception
     }
@@ -542,12 +566,254 @@ function Wait-V9xGuestFile {
     }
 }
 
+# DESKTOP_WAIT on an open connection (Win9x, 0.17.0+).
+function Wait-V9xGuestDesktop {
+    param($Stream, [ref]$RequestId, [int]$WaitSeconds, [switch]$DismissLogon)
+    Assert-V9xCapability 0x02000000 'cancel a logon dialog' '0.17.0' -Win9xOnly
+    # The guest bounds each request to 60 s (a dropped caller must not hold
+    # its connection), so loop until this caller's own deadline.
+    $clock = [Diagnostics.Stopwatch]::StartNew()
+    $dismissed = $false
+    for (;;) {
+        $ms = [uint32][Math]::Max(0, [Math]::Min(60000, ($WaitSeconds * 1000) - $clock.ElapsedMilliseconds))
+        $payload = [byte[]]([BitConverter]::GetBytes([uint32][bool]$DismissLogon) + [BitConverter]::GetBytes($ms))
+        $savedTimeout = $Stream.ReadTimeout
+        try {
+            $margin = if ($Relay) { 120000 } else { 30000 }
+            $Stream.ReadTimeout = [Math]::Max($savedTimeout, [int]$ms + $margin)
+            $answer = Invoke-V9xRequest -Stream $Stream -RequestId $RequestId -Type 0x0065 `
+                -Payload $payload -Expected 0x8065 -GuestErrorExitCode 44
+        } finally { $Stream.ReadTimeout = $savedTimeout }
+        if ($answer.Length -ne 24) { throw 'Invalid DESKTOP_WAIT response length.' }
+        $flags = [BitConverter]::ToUInt32($answer, 0)
+        if (($flags -band (-bnot 3)) -ne 0) { throw 'Invalid DESKTOP_WAIT response flags.' }
+        $dismissed = $dismissed -or (($flags -band 2) -ne 0)
+        if (($flags -band 1) -ne 0 -or $ms -lt 60000) { break }
+    }
+    $outcome = [pscustomobject]@{
+        DesktopReady = ($flags -band 1) -ne 0
+        LogonDismissed = $dismissed
+        BootCounter = [BitConverter]::ToUInt32($answer, 4)
+        ScreenWidth = [BitConverter]::ToUInt32($answer, 8)
+        ScreenHeight = [BitConverter]::ToUInt32($answer, 12)
+        BitsPerPixel = [BitConverter]::ToUInt32($answer, 16)
+        WaitedMilliseconds = [uint32]$clock.ElapsedMilliseconds
+    }
+    if (-not $outcome.DesktopReady) {
+        $failure = [InvalidOperationException]::new("Windows desktop did not become ready within $WaitSeconds seconds (LogonDismissed: $($outcome.LogonDismissed)).")
+        $failure.Data['V9xExitCode'] = 44
+        throw $failure
+    }
+    return $outcome
+}
+
+function Get-V9xGuestDisplay {
+    param($Stream, [ref]$RequestId, [switch]$Restore)
+    Assert-V9xCapability 0x08000000 'report/restore the display mode' '0.17.0'
+    ConvertFrom-V9xDisplayPayload (Invoke-V9xRequest -Stream $Stream -RequestId $RequestId -Type 0x0067 `
+        -Payload ([BitConverter]::GetBytes([uint32][bool]$Restore)) -Expected 0x8067 -GuestErrorExitCode 51)
+}
+
 # WINDOW_LIST on an open connection (needs V9X_CAP_WINDOWS 0x00200000).
 function Get-V9xGuestWindows {
     param($Stream, [ref]$RequestId)
     Assert-V9xCapability 0x00200000 'list windows'
     @(ConvertFrom-V9xWindowListPayload -Payload (Invoke-V9xRequest -Stream $Stream -RequestId $RequestId `
         -Type 0x0062 -Payload ([byte[]]@()) -Expected 0x8062 -GuestErrorExitCode 48))
+}
+
+# WINDOW_TEXT (needs V9X_CAP_WINDOW_TEXT 0x01000000): one window's title and
+# its child controls' class and text.
+function Get-V9xGuestWindowText {
+    param($Stream, [ref]$RequestId, [uint32]$Handle)
+    Assert-V9xCapability 0x01000000 'read a window''s text' '0.16.0'
+    ConvertFrom-V9xWindowTextPayload -Payload (Invoke-V9xRequest -Stream $Stream -RequestId $RequestId `
+        -Type 0x0063 -Payload (New-V9xWindowTextPayload -Handle $Handle) -Expected 0x8063 -GuestErrorExitCode 48)
+}
+
+# WINDOW_CLOSE: post WM_CLOSE to a top-level window (0.16.0+).
+function Close-V9xGuestWindow {
+    param($Stream, [ref]$RequestId, [uint32]$Handle)
+    Assert-V9xCapability 0x01000000 'close a window' '0.16.0'
+    $null = Invoke-V9xRequest -Stream $Stream -RequestId $RequestId -Type 0x0064 `
+        -Payload (New-V9xWindowTextPayload -Handle $Handle) -Expected 0x8064 -GuestErrorExitCode 48
+}
+
+# Phrases that make a dialog a fault report rather than an ordinary message:
+# Windows 9x "This program has performed an illegal operation" (Details:
+# "caused an invalid page fault in module"), the NT hard-error box
+# "<image> - Application Error" / "The instruction at ... referenced memory",
+# Dr. Watson's "has generated errors and will be closed".
+$script:V9xFaultPhrases = @(
+    'performed an illegal operation', 'invalid page fault', 'general protection fault',
+    'caused an exception', 'caused a stack fault', 'caused an invalid',
+    'application error', 'referenced memory at', 'has generated errors',
+    'has encountered a problem', 'unhandled exception', 'access violation',
+    'fatal exception', 'privileged instruction', 'illegal instruction'
+)
+
+# Window classes a fault report comes in: the standard dialog (9x fault box,
+# NT hard-error box) and Dr. Watson's NotifyDialog (Windows 2000 with the
+# default AeDebug Auto=1). Ordinary application windows are never read, so
+# an editor showing a log that says 'access violation' is not a fault.
+$script:V9xFaultDialogClasses = @('#32770', 'NotifyDialog')
+
+# Read a dialog and decide whether it is a fault report: the title and every
+# control's text are searched for a fault phrase. Message = the static text,
+# Details = edit-control text (9x register dump), both without a screenshot.
+function Get-V9xFaultDialog {
+    param($Stream, [ref]$RequestId, $Window)
+    $text = Get-V9xGuestWindowText -Stream $Stream -RequestId $RequestId -Handle $Window.Handle
+    $all = (@($text.Title) + @($text.Children | ForEach-Object { $_.Text })) -join "`n"
+    $phrase = $script:V9xFaultPhrases | Where-Object { $all.IndexOf($_, [StringComparison]::OrdinalIgnoreCase) -ge 0 } |
+        Select-Object -First 1
+    $message = @($text.Children | Where-Object { $_.Class -ieq 'Static' -and $_.Text } | ForEach-Object { $_.Text }) -join "`n"
+    $details = @($text.Children | Where-Object { $_.Class -ieq 'Edit' -and $_.Text } | ForEach-Object { $_.Text }) -join "`n"
+    [pscustomobject]@{
+        IsFault = [bool]$phrase; Phrase = $phrase
+        Handle = $Window.Handle; DialogPid = $Window.Pid; Title = $text.Title; Class = $text.Class
+        Message = ($message -replace "`r`n", "`n").Trim(); Details = ($details -replace "`r`n", "`n").Trim()
+        Buttons = @($text.Children | Where-Object { $_.Class -ieq 'Button' -and $_.Visible } |
+            ForEach-Object { $_.Text -replace '&', '' })
+        AllText = $all
+    }
+}
+
+# Wait until the process (-ProcessId or -Name) exits or a fault dialog about
+# it appears, and return which, with the dialog's text. With neither, watch
+# for a fault dialog from any program and end quietly at the deadline.
+#
+# Why not the dialog's owner pid: Windows 9x shows the fault dialog from the
+# KERNEL32 system process and the crashed process lingers (even after kill
+# the dialog stays); NT shows it from CSRSS or Dr. Watson. So a dialog
+# counts when its owner is the target, or its title or text names the
+# target's image ("Crashprb", "CRASHPRB.EXE - Application Error", "caused an
+# invalid page fault in module CRASHPRB.EXE"). Faults are checked before
+# exit, so a dialog left behind by a process that has already gone is still
+# reported. -Dismiss closes the dialog (WM_CLOSE) and waits for it to go.
+function Wait-V9xGuestFault {
+    param($Stream, [ref]$RequestId, [uint32]$ProcessId, [string]$Name, [int]$WaitSeconds, [switch]$Dismiss)
+    Assert-V9xCapability 0x01000000 'read fault dialogs (wait-fault)' '0.16.0'
+    $anyFault = -not $ProcessId -and -not $Name
+    $what = if ($ProcessId) { 'pid {0} ({0:X8})' -f $ProcessId } elseif ($Name) { "'$Name'" } else { 'any program' }
+    $probeState = @{ First = $true; WasRunning = $false; Initial = @(); Running = @(); Seen = @{}; Names = @() }
+    if ($Name -and -not [Management.Automation.WildcardPattern]::ContainsWildcardCharacters($Name)) {
+        $probeState.Names = @([IO.Path]::GetFileNameWithoutExtension($Name))
+    }
+    $outcome = Invoke-V9xWaitLoop -Stream $Stream -RequestId $RequestId -WaitSeconds $WaitSeconds -ExitCode 49 `
+        -EndQuietly:$anyFault -Probe {
+        param($s, $r)
+        $running = @()
+        if (-not $anyFault) {
+            $running = @(Get-V9xGuestProcesses -Stream $s -RequestId $r | Where-Object {
+                if ($ProcessId) { $_.Pid -eq $ProcessId } else { $_.Name -like $Name } })
+            if ($probeState.First) {
+                $probeState.First = $false
+                $probeState.WasRunning = $running.Count -gt 0
+                $probeState.Initial = $running
+            }
+            $probeState.Running = $running
+            foreach ($p in $running) {
+                $base = [IO.Path]::GetFileNameWithoutExtension($p.Name)
+                if ($base -and $probeState.Names -notcontains $base) { $probeState.Names += $base }
+            }
+        }
+        $pids = @($probeState.Initial | ForEach-Object { $_.Pid }) + @($running | ForEach-Object { $_.Pid })
+        if ($ProcessId) { $pids += $ProcessId }
+        $dialogs = @(Get-V9xGuestWindows -Stream $s -RequestId $r | Where-Object { $script:V9xFaultDialogClasses -contains $_.Class })
+        foreach ($dialog in $dialogs) {
+            $key = "$($dialog.Handle)|$($dialog.Title)"
+            if (-not $probeState.Seen.ContainsKey($key)) {
+                try {
+                    $probeState.Seen[$key] = Get-V9xFaultDialog -Stream $s -RequestId $r -Window $dialog
+                } catch {
+                    # Gone between the list and the read: look again next probe.
+                    if ($_.Exception.Data['V9xExitCode'] -eq 48) { continue }
+                    throw
+                }
+            }
+            $fault = $probeState.Seen[$key]
+            if (-not $fault.IsFault) { continue }
+            $mine = $anyFault -or ($pids -contains $fault.DialogPid)
+            if (-not $mine) {
+                foreach ($base in $probeState.Names) {
+                    if ($fault.AllText -match "(?i)(^|[^A-Za-z0-9_])$([regex]::Escape($base))([^A-Za-z0-9_]|$)") { $mine = $true; break }
+                }
+            }
+            if ($mine) {
+                return [pscustomobject]@{ Outcome = 'Fault'; Fault = $fault
+                                          WasRunning = $probeState.WasRunning; Processes = $probeState.Initial }
+            }
+        }
+        if (-not $anyFault -and $running.Count -eq 0) {
+            return [pscustomobject]@{ Outcome = 'Exited'; Fault = $null
+                                      WasRunning = $probeState.WasRunning; Processes = $probeState.Initial }
+        }
+        return $null
+    } -OnTimeout { "$what still running after $WaitSeconds s ($($probeState.Running.Count) process(es)); no fault dialog." }
+    if ($outcome.PSObject.Properties['TimedOut']) {
+        return [pscustomobject]@{ Outcome = 'NoFault'; Fault = $null; WasRunning = $false; Processes = @()
+                                  WaitedMilliseconds = $outcome.WaitedMilliseconds; Dismissed = $false }
+    }
+    if ($outcome.Outcome -eq 'Fault') {
+        $outcome.Fault = Complete-V9xDrWatsonFault -Stream $Stream -RequestId $RequestId -Fault $outcome.Fault
+    }
+    $dismissed = $false
+    if ($Dismiss -and $outcome.Outcome -eq 'Fault') {
+        Close-V9xGuestWindow -Stream $Stream -RequestId $RequestId -Handle $outcome.Fault.Handle
+        $clock = [Diagnostics.Stopwatch]::StartNew()
+        while ($clock.ElapsedMilliseconds -lt 5000) {
+            if (-not @(Get-V9xGuestWindows -Stream $Stream -RequestId $RequestId |
+                       Where-Object { $_.Handle -eq $outcome.Fault.Handle }).Count) { $dismissed = $true; break }
+            Start-Sleep -Milliseconds 250
+        }
+    }
+    $outcome | Add-Member -NotePropertyName Dismissed -NotePropertyValue $dismissed -Force
+    return $outcome
+}
+
+# Windows 2000's Dr. Watson box (NotifyDialog) shows Cancel while it writes
+# its log ("An error log is being created") and OK when done; closing it
+# before then cancels the log. Wait (up to 60 s) for OK, then take the
+# exception line of the newest entry in the default log as Details:
+# "Exception number: c0000005 (access violation)".
+$script:V9xDrWatsonLog = 'C:\Documents and Settings\All Users\Documents\DrWatson\drwtsn32.log'
+function Complete-V9xDrWatsonFault {
+    param($Stream, [ref]$RequestId, $Fault)
+    if ($Fault.Class -ne 'NotifyDialog') { return $Fault }
+    $clock = [Diagnostics.Stopwatch]::StartNew()
+    $current = $Fault
+    while ($clock.ElapsedMilliseconds -lt 60000 -and ($current.Buttons -contains 'Cancel' -or $current.Buttons -notcontains 'OK')) {
+        Start-Sleep -Milliseconds 250
+        try {
+            $current = Get-V9xFaultDialog -Stream $Stream -RequestId $RequestId -Window ([pscustomobject]@{ Handle = $Fault.Handle; Pid = $Fault.DialogPid })
+        } catch {
+            if ($_.Exception.Data['V9xExitCode'] -eq 48) { break }   # closed by someone
+            throw
+        }
+    }
+    # Unfinished (or closed meanwhile): the newest entry may be an older crash.
+    if ($current.Buttons -contains 'Cancel' -or $current.Buttons -notcontains 'OK') { return $current }
+    try {
+        $line = Read-V9xGuestText -Stream $Stream -RequestId $RequestId -Path $script:V9xDrWatsonLog `
+            -Tail 1 -MaxBytes 512 -Match 'Exception number:'
+        if ($line.Matched -gt 0) {
+            $current.Details = "Dr. Watson: $($line.Text.Trim()) (log: $script:V9xDrWatsonLog)"
+        }
+    } catch {
+        if ($_.Exception.Data['V9xExitCode'] -ne 40 -and $_.Exception.Data['V9xExitCode'] -ne 23) { throw }
+    }
+    return $current
+}
+
+# The JSON face of a fault for wait-fault and exec -WaitForExit.
+function ConvertTo-V9xFaultResult {
+    param($Fault)
+    if ($null -eq $Fault) { return $null }
+    [pscustomobject][ordered]@{
+        Title = $Fault.Title; Message = $Fault.Message; Details = $Fault.Details
+        Buttons = $Fault.Buttons; Handle = $Fault.Handle; DialogPid = $Fault.DialogPid
+    }
 }
 
 # Wait until a window whose title contains -Title is visible (not
@@ -574,6 +840,40 @@ function Wait-V9xGuestWindow {
 function Wait-V9xGuestProcessExit {
     param($Stream, [ref]$RequestId, [uint32]$ProcessId, [string]$Name, [int]$WaitSeconds)
     Assert-V9xCapability 0x00080000 'list processes to wait on one (Windows 9x/2000)'
+    if (($script:hello.Capabilities -band 0x20000000) -ne 0 -and ($ProcessId -or $Name -notmatch '[*?\[\]]')) {
+        $state = @{ Pid = $ProcessId; First = $true; NamedCaptured = $false; WasRunning = $false; Initial = @(); Clock = [Diagnostics.Stopwatch]::StartNew() }
+        return Invoke-V9xWaitLoop -Stream $Stream -RequestId $RequestId -WaitSeconds $WaitSeconds -ExitCode 49 -Probe {
+            param($s, $r)
+            if (-not $state.Pid) {
+                $found = @(Get-V9xGuestProcesses -Stream $s -RequestId $r | Where-Object { $_.Name -ieq $Name })
+                if (-not $state.NamedCaptured) {
+                    $state.Initial = $found; $state.WasRunning = $found.Count -gt 0; $state.NamedCaptured = $true
+                }
+                if ($found.Count -eq 0) { return [pscustomobject]@{ WasRunning = $state.WasRunning; Processes = $state.Initial } }
+                if ($found.Count -gt 1) { return $null } # preserve wait-for-all behavior
+                $state.Pid = $found[0].Pid
+            }
+            $ms = [uint32][Math]::Max(0, [Math]::Min(60000, ($WaitSeconds * 1000) - $state.Clock.ElapsedMilliseconds))
+            $saved = $s.ReadTimeout
+            try {
+                $margin = if ($Relay) { 120000 } else { 30000 }
+                $s.ReadTimeout = [Math]::Max($saved, [int]$ms + $margin)
+                $answer = Invoke-V9xRequest -Stream $s -RequestId $r -Type 0x0082 -Expected 0x8082 -GuestErrorExitCode 49 `
+                    -Payload ([byte[]]([BitConverter]::GetBytes([uint32]$state.Pid) + [BitConverter]::GetBytes($ms)))
+            } finally { $s.ReadTimeout = $saved }
+            if ($answer.Length -lt 10) { throw 'Invalid PROCESS_WAIT response.' }
+            $flags = [BitConverter]::ToUInt32($answer, 0); $at = 8
+            $image = Read-V9xAnsiString -Bytes $answer -Offset ([ref]$at)
+            if ($at -ne $answer.Length -or ($flags -band (-bnot 3))) { throw 'Invalid PROCESS_WAIT fields.' }
+            if ($state.First) {
+                $state.First = $false
+                $state.WasRunning = $state.WasRunning -or [bool]($flags -band 1)
+                if ($state.Initial.Count -eq 0 -and $image) { $state.Initial = @([pscustomobject]@{ Pid = $state.Pid; Name = $image }) }
+            }
+            if ($flags -band 2) { return [pscustomobject]@{ WasRunning = $state.WasRunning; Processes = $state.Initial } }
+            return $null
+        } -OnTimeout { "$(if ($ProcessId) { "pid $ProcessId" } else { $Name }) still running after $WaitSeconds s." }
+    }
     $what = if ($ProcessId) { 'pid {0} ({0:X8})' -f $ProcessId } else { "'$Name'" }
     $probeState = @{ First = $true; WasRunning = $false; Initial = @(); Running = @() }
     Invoke-V9xWaitLoop -Stream $Stream -RequestId $RequestId -WaitSeconds $WaitSeconds -ExitCode 49 -Probe {
@@ -1061,13 +1361,13 @@ $script:V9xVerbs = [ordered]@{
     }
     'stat' = @{
         Purpose = 'Existence, size and attributes of one guest path'
-        Usage = 'stat -Path <guest path>'
+        Usage = 'stat [-Path] <guest path>'
         Example = 'stat -Path C:\WINDOWS\WIN.INI'
         Required = @{ RemotePath = '-Path' }
     }
     'list' = @{
         Purpose = 'Directory listing (bounded to 16 KiB)'
-        Usage = 'list -Path <guest dir>'
+        Usage = 'list [-Path] <guest dir>'
         Example = 'list -Path C:\V9XREMOTE\JOBS -Json'
         Required = @{ RemotePath = '-Path' }
     }
@@ -1085,7 +1385,7 @@ $script:V9xVerbs = [ordered]@{
     }
     'get' = @{
         Purpose = 'Download one file from the guest, CRC32-verified'
-        Usage = 'get -Source <guest path> -Destination <local file>'
+        Usage = 'get [-Source] <guest path> -Destination <local file>'
         Example = 'get -Source C:\V9XREMOTE\AGENT.LOG -Destination .\agent.log'
         Required = @{ Source = '-Source'; Destination = '-Destination' }
     }
@@ -1103,7 +1403,7 @@ $script:V9xVerbs = [ordered]@{
     }
     'hash' = @{
         Purpose = 'Size, CRC32 and SHA-256 of a guest file; with -Source, compare to a local file (agent 0.13.0+)'
-        Usage = 'hash -Path <guest file> [-Source <local file>]'
+        Usage = 'hash [-Path] <guest file> [-Source <local file>]'
         Example = 'hash -Path C:\WINDOWS\SYSTEM\V9X.DRV -Source .\build\V9X.DRV -Json'
         Required = @{ RemotePath = '-Path' }
     }
@@ -1118,10 +1418,21 @@ $script:V9xVerbs = [ordered]@{
         Usage = 'wait-process -Pid <id> | -Name <image name> [-WaitSeconds <n>]   (default 3600)'
         Example = 'wait-process -Name 3DMARK.EXE -WaitSeconds 7200 -Json'
     }
+    'wait-fault' = @{
+        Purpose = 'Wait until a process exits (exit 0) or a fault dialog about it appears (exit 50, with the dialog text); no -Pid/-Name: watch for any fault until -WaitSeconds (agent 0.16.0+)'
+        Usage = 'wait-fault [-Pid <id> | -Name <image name>] [-WaitSeconds <n>] [-Dismiss]   (default 3600)'
+        Example = 'wait-fault -Name MYTEST.EXE -WaitSeconds 600 -Dismiss -Json'
+    }
     'windows' = @{
-        Purpose = 'Visible top-level windows: title, class, position, size, pid (agent 0.13.0+)'
-        Usage = 'windows [-Title <part of title>]'
-        Example = 'windows -Json'
+        Purpose = 'Visible top-level windows: title, class, position, size, pid (agent 0.13.0+); -Controls adds each one''s control text (0.16.0+)'
+        Usage = 'windows [-Title <part of title>] [-Controls]'
+        Example = 'windows -Title "Error" -Controls'
+    }
+    'close-window' = @{
+        Purpose = 'Close a top-level window whose title contains -Title (WM_CLOSE), and wait until it is gone (agent 0.16.0+)'
+        Usage = 'close-window -Title <part of title> [-WaitSeconds <n>]'
+        Example = 'close-window -Title "Application Error" -Json'
+        Required = @{ Title = '-Title' }
     }
     'wait-window' = @{
         Purpose = 'Wait until a window whose title contains -Title is shown (or with -Gone, closed)'
@@ -1131,7 +1442,7 @@ $script:V9xVerbs = [ordered]@{
     }
     'cat' = @{
         Purpose = 'Print a guest text file inline: -Tail N lines, -Match text, bounded; -Follow streams new lines (-Until <text> stops) (agent 0.13.0+)'
-        Usage = 'cat -Path <guest file> [-Tail <n>] [-Match <text>] [-MaxBytes <n>] [-Follow [-Until <text>] [-WaitSeconds <n>]]'
+        Usage = 'cat [-Path] <guest file> [-Tail <n>] [-Match <text>] [-MaxBytes <n>] [-Follow [-Until <text>] [-WaitSeconds <n>]]'
         Example = 'cat -Path C:\V9XREMOTE\AGENT.LOG -Tail 40 -Match error'
         Required = @{ RemotePath = '-Path' }
     }
@@ -1142,7 +1453,7 @@ $script:V9xVerbs = [ordered]@{
     }
     'kill' = @{
         Purpose = 'Terminate a guest process by -Pid or -Name (agent 0.13.0+; refuses the agent and Windows core processes)'
-        Usage = 'kill -Pid <id> | -Name <image name>'
+        Usage = 'kill -Pid <id> | -Name <image name> [-RestoreDisplay]'
         Example = 'kill -Name NOTEPAD.EXE -Json'
     }
     'note' = @{
@@ -1152,8 +1463,8 @@ $script:V9xVerbs = [ordered]@{
         Required = @{ NoteText = '-Text' }
     }
     'reg' = @{
-        Purpose = 'Read a registry key: subkeys and values (read-only; agent 0.13.0+)'
-        Usage = 'reg -Key <HKLM\path>'
+        Purpose = 'Read a registry key (0.13.0+); set/delete one value with previous-value audit (0.17.0+)'
+        Usage = 'reg -Key <HKLM\path> [-Set -Name <name> (-String <text> | -Dword <n>) | -DeleteValue -Name <name>]'
         Example = 'reg -Key HKLM\System\CurrentControlSet\Services\Class\Display -Json'
         Required = @{ Key = '-Key' }
     }
@@ -1171,12 +1482,12 @@ $script:V9xVerbs = [ordered]@{
     }
     'reboot' = @{
         Purpose = 'Reboot the guest and prove it came back'
-        Usage = 'reboot [-JobId <token>] [-WaitSeconds <n>]'
+        Usage = 'reboot [-JobId <token>] [-WaitSeconds <n>] [-DismissLogon]'
         Example = 'reboot -JobId myjob-reboot-1 -WaitSeconds 180 -Json'
     }
     'reset' = @{
         Purpose = 'Flush, then hard-reset (CF9h) without Windows'' restart path; for guests whose reboot hangs (Win9x)'
-        Usage = 'reset [-JobId <token>] [-WaitSeconds <n>]'
+        Usage = 'reset [-JobId <token>] [-WaitSeconds <n>] [-DismissLogon]'
         Example = 'reset -Host 192.168.10.98 -JobId myjob-reset-1 -WaitSeconds 240 -Json'
     }
     'shutdown' = @{
@@ -1185,9 +1496,14 @@ $script:V9xVerbs = [ordered]@{
         Example = 'shutdown -JobId myjob-off-1'
     }
     'wait-desktop' = @{
-        Purpose = 'Block until the Explorer desktop is ready'
-        Usage = 'wait-desktop [-WaitSeconds <n>]'
+        Purpose = 'Block until Explorer is ready; -DismissLogon cancels a recognized Win9x startup logon (0.17.0+)'
+        Usage = 'wait-desktop [-WaitSeconds <n>] [-DismissLogon]'
         Example = 'wait-desktop -WaitSeconds 120 -Json'
+    }
+    'display' = @{
+        Purpose = 'Report current and saved display modes; -Restore returns to the saved mode (0.17.0+)'
+        Usage = 'display [-Restore]'
+        Example = 'display -Restore -Json'
     }
     'screenshot' = @{
         Purpose = 'Capture the guest screen (PNG/JPEG/GIF/TIFF/BMP by extension)'
@@ -1197,7 +1513,7 @@ $script:V9xVerbs = [ordered]@{
     }
     'input' = @{
         Purpose = 'Inject mouse/keyboard actions; with -OutFile, settle and screenshot in the same call'
-        Usage = 'input -Sequence "<verb args>; <verb args>; ..." [-OutFile <local image> [-SettleMs 500] [-Region x,y,w,h] [-Scale 0.5] [-Gray]]'
+        Usage = 'input -Sequence "<verb args>; <verb args>; ..." [-Window <title>] [-OutFile <local image> [-SettleMs 500] [-Region x,y,w,h] [-Scale 0.5] [-Gray]]'
         Example = 'input -Sequence "click left; key ENTER" -OutFile .\after.png'
         Required = @{ Sequence = '-Sequence' }
     }
@@ -1259,7 +1575,7 @@ function Write-V9xUsage {
     $Writer.WriteLine()
     $Writer.WriteLine('Exit codes: 0 ok, 10 usage, 20 agent unreachable, 22/23 protocol, 30-33 execution,')
     $Writer.WriteLine('40 file transfer, 41-42 power control, 43 screenshot, 44 desktop not ready, 45 process, 46 registry, 47 wait-file, 48 window,')
-    $Writer.WriteLine('49 wait-process. Waits longer than a minute: run them as a background command (AGENTS.md, "Long jobs").')
+    $Writer.WriteLine('49 wait-process, 50 a fault dialog (wait-fault, exec -WaitForExit). Waits longer than a minute: run them as a background command (AGENTS.md, "Long jobs").')
     $Writer.WriteLine('Full reference: AGENTS.md and docs\host-cli.md.')
 }
 
@@ -1286,6 +1602,7 @@ $script:V9xVerbAliases = @{
     'processes' = 'ps'; 'taskkill' = 'kill'; 'regquery' = 'reg'; 'wait-ready' = 'wait-desktop'; 'wait-for-window' = 'wait-window'
     'wait-boot' = 'wait-desktop'; 'wait-for-file' = 'wait-file'; 'capture' = 'screenshot'
     'wait-exit' = 'wait-process'; 'wait-pid' = 'wait-process'; 'wait-for-process' = 'wait-process'
+    'wait-crash' = 'wait-fault'; 'watch-faults' = 'wait-fault'; 'close' = 'close-window'
     'follow' = 'cat'
 }
 
@@ -1330,6 +1647,19 @@ if ($Target) {
     if ($Matches[2]) { $Port = [int]$Matches[2] }
 }
 $verbEntry = $script:V9xVerbs[$Action]
+# Position 1 belongs to vnc/help there; for path verbs it is the guest path.
+# get's guest path is Source (Destination remains explicit).
+if ($VncCommand -and $Action -in @('list', 'cat', 'stat', 'get', 'hash')) {
+    $pathParameter = if ($Action -eq 'get') { 'Source' } else { 'RemotePath' }
+    if ($PSBoundParameters.ContainsKey($pathParameter)) {
+        Write-V9xVerbUsage -Writer ([Console]::Error) -Verb $Action -Problem 'Give the guest path either positionally or by name, not both.'
+        exit 10
+    }
+    Set-Variable -Name $pathParameter -Value $VncCommand
+} elseif ($VncCommand -and $Action -ne 'vnc') {
+    Write-V9xVerbUsage -Writer ([Console]::Error) -Verb $Action -Problem "Unexpected positional argument '$VncCommand'."
+    exit 10
+}
 if ($verbEntry.ContainsKey('Required')) {
     $missing = @($verbEntry.Required.Keys |
         Where-Object { [string]::IsNullOrWhiteSpace((Get-Variable -Name $_ -ValueOnly)) } |
@@ -1366,7 +1696,38 @@ if ($WaitForExit -and $Action -ne 'exec') {
     Write-V9xVerbUsage -Writer ([Console]::Error) -Verb 'exec' -Problem '-WaitForExit is an exec option (a shell -Detach pid is only the COMMAND.COM wrapper).'
     exit 10
 }
-$waitFileMatch = if ($Action -eq 'exec') { $WaitForFile -and $Match } else { $Action -eq 'wait-file' -and $Match }
+if ($Dismiss -and -not ($Action -eq 'wait-fault' -or ($Action -eq 'exec' -and $WaitForExit))) {
+    Write-V9xVerbUsage -Writer ([Console]::Error) -Verb 'wait-fault' -Problem '-Dismiss goes with wait-fault or exec -WaitForExit (to close any window: close-window -Title).'
+    exit 10
+}
+if ($Controls -and $Action -ne 'windows') {
+    Write-V9xVerbUsage -Writer ([Console]::Error) -Verb 'windows' -Problem '-Controls is a windows option.'
+    exit 10
+}
+if ($DismissLogon -and $Action -notin @('wait-desktop', 'reboot', 'reset')) {
+    Write-V9xVerbUsage -Writer ([Console]::Error) -Verb 'wait-desktop' -Problem '-DismissLogon goes with wait-desktop, reboot or reset.'
+    exit 10
+}
+if (($Restore -and $Action -ne 'display') -or ($RestoreDisplay -and $Action -ne 'kill')) {
+    [Console]::Error.WriteLine('Usage error: -Restore goes with display; -RestoreDisplay goes with kill.')
+    exit 10
+}
+$regWrite = $Set -or $DeleteValue
+if ($regWrite -or $PSBoundParameters.ContainsKey('String') -or $PSBoundParameters.ContainsKey('Dword')) {
+    $hasString = $PSBoundParameters.ContainsKey('String'); $hasDword = $PSBoundParameters.ContainsKey('Dword')
+    if ($Action -ne 'reg' -or ($Set -eq $DeleteValue) -or -not $PSBoundParameters.ContainsKey('Name') -or
+        ($Set -and ($hasString -eq $hasDword)) -or ($DeleteValue -and ($hasString -or $hasDword))) {
+        Write-V9xVerbUsage -Writer ([Console]::Error) -Verb 'reg' -Problem 'Use reg -Set -Key <key> -Name <name> with exactly one of -String/-Dword, or reg -DeleteValue -Key <key> -Name <name>.'
+        exit 10
+    }
+    try {
+        if ($hasString -and $String -match '[^\x01-\x7f]') { throw 'Registry string must be ASCII without NULs.' }
+        $regData = if ($hasString) { [Text.Encoding]::ASCII.GetBytes($String + [char]0) } elseif ($hasDword) { [BitConverter]::GetBytes($Dword) } else { [byte[]]@() }
+        $regOp = if ($DeleteValue) { 3 } elseif ($hasDword) { 2 } else { 1 }
+        $regWritePayload = New-V9xRegWritePayload -Key $Key -Name $Name -Operation $regOp -Data ([byte[]]$regData)
+    } catch { [Console]::Error.WriteLine($_.Exception.Message); exit 10 }
+}
+$waitFileMatch = if($Action -eq 'exec') { $WaitForFile -and $Match } else { $Action -eq 'wait-file' -and $Match }
 if ($waitFileMatch -and ($Gone -or $StableMs -gt 0)) {
     Write-V9xVerbUsage -Writer ([Console]::Error) -Verb $Action -Problem '-Match cannot be combined with -Gone or -StableMs.'
     exit 10
@@ -1377,7 +1738,7 @@ if ($Until -and -not ($Action -eq 'cat' -and $Follow)) {
 }
 # Waits that are about a program finishing default to an hour, not 120 s.
 if (-not $PSBoundParameters.ContainsKey('WaitSeconds') -and
-    ($Action -eq 'wait-process' -or $WaitForExit -or ($Action -eq 'cat' -and $Follow))) {
+    ($Action -in 'wait-process', 'wait-fault' -or $WaitForExit -or ($Action -eq 'cat' -and $Follow))) {
     $WaitSeconds = 3600
 }
 # The program's own exit is what -WaitForExit waits on, so it runs detached:
@@ -1418,6 +1779,13 @@ function Invoke-V9xSelf {
     param([hashtable]$Arguments)
     $selfArgs = @{ EndpointHost = $EndpointHost; Port = $Port
                  ConnectTimeoutSeconds = $ConnectTimeoutSeconds; Json = $true }
+    # A remote-help target stays one: without this the inner call went to
+    # the local default port and update never replaced V9XVNC.EXE/SETUP.EXE
+    # on relay machines. Each inner call opens and closes its own session.
+    if ($Relay) {
+        $selfArgs['Relay'] = $Relay
+        if ($RelayServer) { $selfArgs['RelayServer'] = $RelayServer }
+    }
     foreach ($key in $Arguments.Keys) { $selfArgs[$key] = $Arguments[$key] }
     $output = @(& $PSCommandPath @selfArgs)
     $code = $LASTEXITCODE
@@ -1544,6 +1912,10 @@ if ($Action -eq 'update') {
     $selfTarget = @{ EndpointHost = $EndpointHost; Port = $Port
                  ConnectTimeoutSeconds = $ConnectTimeoutSeconds; Json = $true }
     if ($Id) { $selfTarget['Id'] = $Id }
+    if ($Relay) {
+        $selfTarget['Relay'] = $Relay
+        if ($RelayServer) { $selfTarget['RelayServer'] = $RelayServer }
+    }
     $agentInfo = $null
     try { $agentInfo = (& $PSCommandPath -Action info @selfTarget) -join "`n" | ConvertFrom-Json } catch { }
     if ($null -ne $agentInfo) {
@@ -1617,7 +1989,14 @@ try {
     $stream = $session.Stream
     [uint32]$requestId = $session.RequestId
     $captureAfterInput = $false
+    $killDisplayFailed = $false
     $hello = $session.Hello
+
+    # Refuse before reboot/reset does anything on unsupported agents.
+    if ($DismissLogon) {
+        Assert-V9xCapability 0x02000000 'cancel a logon dialog' '0.17.0' -Win9xOnly
+    }
+    if ($RestoreDisplay) { Assert-V9xCapability 0x08000000 'restore the display after kill' '0.17.0' }
 
     ++$requestId
     if ($Action -in @('ping', 'info')) {
@@ -1711,6 +2090,20 @@ try {
     }
 
     if ($Action -eq 'wait-desktop') {
+        if (($hello.Capabilities -band [uint32]0x02000000) -ne 0) {
+            $desktop = Wait-V9xGuestDesktop -Stream $stream -RequestId ([ref]$requestId) `
+                -WaitSeconds $WaitSeconds -DismissLogon:$DismissLogon
+            $result = [pscustomobject]@{
+                Success = $true; RequestId = $requestId; AgentBuild = $hello.BuildId
+                BootCounter = $desktop.BootCounter; PendingJob = $hello.PendingJob
+                DesktopReady = $desktop.DesktopReady; LogonDismissed = $desktop.LogonDismissed
+                ScreenWidth = $desktop.ScreenWidth; ScreenHeight = $desktop.ScreenHeight
+                BitsPerPixel = $desktop.BitsPerPixel; WaitedMilliseconds = $desktop.WaitedMilliseconds
+                Endpoint = "${EndpointHost}:$Port"
+            }
+            if ($Json) { $result | ConvertTo-Json -Depth 4 -Compress } else { $result | Format-List }
+            exit 0
+        }
         if (($hello.Capabilities -band [uint32]0x00000001) -eq 0) {
             $exitCategory = 23
             throw "Agent build '$($hello.BuildId)' does not advertise information support."
@@ -1794,7 +2187,8 @@ try {
                 Start-Sleep -Milliseconds 500
                 try {
                     $candidate = Connect-V9xSession -HostName $EndpointHost -TcpPort $Port `
-                        -TimeoutSeconds ([Math]::Min($ConnectTimeoutSeconds, 3))
+                        -TimeoutSeconds ([Math]::Min($ConnectTimeoutSeconds, 3)) `
+                        -RelayOpenWaitSeconds ([int][Math]::Max(1, [Math]::Ceiling(($deadline - [DateTime]::UtcNow).TotalSeconds)))
                     if ($candidate.Hello.BootCounter -ne $oldBootCounter -and
                         $candidate.Hello.PendingJob -eq $JobId) {
                         $resumed = $candidate
@@ -1814,6 +2208,14 @@ try {
                 throw $exception
             }
             $client = $resumed.Client
+            $desktop = $null
+            if ($DismissLogon) {
+                $stream = $resumed.Stream
+                $hello = $resumed.Hello
+                $requestId = [uint32]($resumed.RequestId + 1)
+                $desktop = Wait-V9xGuestDesktop -Stream $stream -RequestId ([ref]$requestId) `
+                    -WaitSeconds $WaitSeconds -DismissLogon
+            }
             $result = [pscustomobject]@{
                 Success = $true; RequestId = $requestId; AgentBuild = $resumed.Hello.BuildId
                 Action = $(if ($Action -eq 'reset') { 'Reset' } else { 'Reboot' })
@@ -1826,7 +2228,22 @@ try {
                 AllowedClient = $resumed.Hello.AllowedClient
                 Endpoint = "${EndpointHost}:$Port"
             }
+            if ($null -ne $desktop) {
+                foreach ($field in @('DesktopReady', 'ScreenWidth', 'ScreenHeight', 'BitsPerPixel')) {
+                    $result.$field = $desktop.$field
+                }
+                $result | Add-Member -NotePropertyName LogonDismissed -NotePropertyValue $desktop.LogonDismissed
+            }
         }
+        if ($Json) { $result | ConvertTo-Json -Depth 4 -Compress } else { $result | Format-List }
+        exit 0
+    }
+
+    if ($Action -eq 'display') {
+        $display = Get-V9xGuestDisplay -Stream $stream -RequestId ([ref]$requestId) -Restore:$Restore
+        $result = [pscustomobject]@{ Success = $true; AgentBuild = $hello.BuildId
+            CurrentMode = $display.CurrentMode; SavedMode = $display.SavedMode
+            ModeDiffers = $display.ModeDiffers; Restored = $display.Restored }
         if ($Json) { $result | ConvertTo-Json -Depth 4 -Compress } else { $result | Format-List }
         exit 0
     }
@@ -1849,11 +2266,19 @@ try {
         }
         $actions = ConvertTo-V9xInputActions -Sequence $Sequence
         $payload = New-V9xInputPayload -Actions $actions
-        $bytes = New-V9xFrameBytes -Type 0x0060 -RequestId $requestId -Payload $payload
+        $targetInput = ($hello.Capabilities -band 0x10000000) -ne 0
+        if ($Window -and -not $targetInput) { Assert-V9xCapability 0x10000000 'target input to a window' '0.17.0' }
+        if ($targetInput) {
+            $targetBytes = [Collections.Generic.List[byte]]::new()
+            Add-V9xString -Bytes $targetBytes -Value $Window
+            $targetBytes.AddRange([byte[]]$payload); $payload = $targetBytes.ToArray()
+        }
+        $inputType = if ($targetInput) { 0x0066 } else { 0x0060 }
+        $bytes = New-V9xFrameBytes -Type $inputType -RequestId $requestId -Payload $payload
         $stream.Write($bytes, 0, $bytes.Length)
         $frame = Read-V9xOperationFrame -Stream $stream -RequestId $requestId `
-            -ExpectedTypes 0x8060 -GuestErrorExitCode 23
-        $inputResult = ConvertFrom-V9xInputPayload -Payload $frame.Payload
+            -ExpectedTypes ($inputType -bor 0x8000) -GuestErrorExitCode 23
+        $inputResult = ConvertFrom-V9xInputPayload -Payload $frame.Payload -Extended:$targetInput
         if (-not $captureAfterInput) {
             $result = [pscustomobject]@{
                 Success = $true; RequestId = $requestId; AgentBuild = $hello.BuildId
@@ -1861,6 +2286,8 @@ try {
                 CursorX = $inputResult.CursorX; CursorY = $inputResult.CursorY
                 Endpoint = "${EndpointHost}:$Port"
             }
+            if ($targetInput) { $result | Add-Member -NotePropertyMembers @{
+                ForegroundBefore = $inputResult.ForegroundBefore; KeyboardWindow = $inputResult.KeyboardWindow; ForegroundAfter = $inputResult.ForegroundAfter } }
             if ($Json) { $result | ConvertTo-Json -Depth 4 -Compress } else { $result | Format-List }
             exit 0
         }
@@ -2017,6 +2444,8 @@ try {
                 CursorX = $inputResult.CursorX; CursorY = $inputResult.CursorY
                 SettleMs = $SettleMs
             })
+            if ($targetInput) { $result | Add-Member -NotePropertyMembers @{
+                ForegroundBefore = $inputResult.ForegroundBefore; KeyboardWindow = $inputResult.KeyboardWindow; ForegroundAfter = $inputResult.ForegroundAfter } }
         }
         if ($Json) { $result | ConvertTo-Json -Depth 4 -Compress } else { $result | Format-List }
         exit 0
@@ -2164,7 +2593,8 @@ try {
             Start-Sleep -Milliseconds 500
             try {
                 $candidate = Connect-V9xSession -HostName $EndpointHost -TcpPort $Port `
-                    -TimeoutSeconds ([Math]::Min($ConnectTimeoutSeconds, 3))
+                    -TimeoutSeconds ([Math]::Min($ConnectTimeoutSeconds, 3)) `
+                    -RelayOpenWaitSeconds ([int][Math]::Max(1, [Math]::Ceiling(($deadline - [DateTime]::UtcNow).TotalSeconds)))
                 if ($candidate.Hello.BootCounter -ne $oldBootCounter) {
                     $resumed = $candidate
                 } else {
@@ -2200,6 +2630,24 @@ try {
         if ($Action -eq 'windows') {
             $windows = @(Get-V9xGuestWindows -Stream $stream -RequestId ([ref]$requestId))
             if ($Title) { $windows = @($windows | Where-Object { $_.Title -like "*$([Management.Automation.WildcardPattern]::Escape($Title))*" }) }
+            if ($Controls) {
+                # Each window's child controls and their text (0.16.0+): what
+                # a dialog says, without a screenshot.
+                $textRequest = [uint32]($requestId)
+                $windows = @($windows | ForEach-Object {
+                    $text = Get-V9xGuestWindowText -Stream $stream -RequestId ([ref]$textRequest) -Handle $_.Handle
+                    $_ | Add-Member -NotePropertyName Controls -NotePropertyValue $text.Children -PassThru
+                })
+                if (-not $Json) {
+                    foreach ($w in $windows) {
+                        [Console]::Out.WriteLine("[$($w.Class)] $($w.Title)  (handle $($w.Handle), pid $($w.Pid))")
+                        foreach ($c in $w.Controls) {
+                            if ($c.Text) { [Console]::Out.WriteLine("  $($c.Class) #$($c.ControlId)$(if (-not $c.Visible) { ' (hidden)' }): $($c.Text -replace "`r?`n", "`n    ")") }
+                        }
+                    }
+                    exit 0
+                }
+            }
             if (-not $Json) {
                 $windows | Format-Table Title, Class, X, Y, Width, Height, Foreground, Minimized, Pid -AutoSize
                 exit 0
@@ -2230,8 +2678,60 @@ try {
         exit 0
     }
 
+    if ($Action -eq 'wait-fault') {
+        $waited = Wait-V9xGuestFault -Stream $stream -RequestId ([ref]$requestId) `
+            -ProcessId $ProcessId -Name $Name -WaitSeconds $WaitSeconds -Dismiss:$Dismiss
+        if (($ProcessId -or $Name) -and -not $waited.WasRunning -and $waited.Outcome -eq 'Exited') {
+            [Console]::Error.WriteLine("Note: no process matched $(if ($ProcessId) { "pid $ProcessId" } else { "'$Name'" }) on the first look: it had already exited, or the name is wrong (see ps).")
+        }
+        $result = [pscustomobject]@{
+            Success = $waited.Outcome -ne 'Fault'; AgentBuild = $hello.BuildId
+            Outcome = $waited.Outcome
+            Pid = $(if ($ProcessId) { $ProcessId } else { $null }); Name = $Name
+            WasRunning = $waited.WasRunning; Processes = @($waited.Processes | ForEach-Object { $_.Name })
+            Fault = ConvertTo-V9xFaultResult $waited.Fault; Dismissed = $waited.Dismissed
+            WaitedMilliseconds = $waited.WaitedMilliseconds
+        }
+        if ($Json) { $result | ConvertTo-Json -Depth 4 -Compress }
+        else {
+            $result | Select-Object Outcome, Pid, Name, WasRunning, Processes, Dismissed, WaitedMilliseconds | Format-List
+            if ($result.Fault) {
+                [Console]::Out.WriteLine("Fault dialog: $($result.Fault.Title)")
+                [Console]::Out.WriteLine($result.Fault.Message)
+                if ($result.Fault.Details) { [Console]::Out.WriteLine(''); [Console]::Out.WriteLine($result.Fault.Details) }
+            }
+        }
+        exit $(if ($waited.Outcome -eq 'Fault') { 50 } else { 0 })
+    }
+
+    if ($Action -eq 'close-window') {
+        $pattern = "*$([Management.Automation.WildcardPattern]::Escape($Title))*"
+        $found = @(Get-V9xGuestWindows -Stream $stream -RequestId ([ref]$requestId) | Where-Object { $_.Title -like $pattern })
+        if ($found.Count -eq 0) {
+            $exitCategory = 48
+            throw "No window titled '*$Title*' is open."
+        }
+        if ($found.Count -gt 1) {
+            $exitCategory = 48
+            throw "$($found.Count) windows match '*$Title*' ($(@($found | ForEach-Object { "'$($_.Title)'" }) -join ', ')); give more of the title."
+        }
+        Close-V9xGuestWindow -Stream $stream -RequestId ([ref]$requestId) -Handle $found[0].Handle
+        $closeWait = if ($PSBoundParameters.ContainsKey('WaitSeconds')) { $WaitSeconds } else { 10 }
+        $waited = Invoke-V9xWaitLoop -Stream $stream -RequestId ([ref]$requestId) -WaitSeconds $closeWait -ExitCode 48 -Probe {
+            param($s, $r)
+            if (@(Get-V9xGuestWindows -Stream $s -RequestId $r | Where-Object { $_.Handle -eq $found[0].Handle }).Count -eq 0) {
+                return [pscustomobject]@{ Closed = $true }
+            }
+            return $null
+        } -OnTimeout { "'$($found[0].Title)' was asked to close but is still open after $closeWait s (it may be asking a question: windows -Title ... -Controls)." }
+        $result = [pscustomobject]@{ Success = $true; AgentBuild = $hello.BuildId; Window = $found[0]
+                                     Closed = $true; WaitedMilliseconds = $waited.WaitedMilliseconds }
+        if ($Json) { $result | ConvertTo-Json -Depth 4 -Compress } else { $result | Format-List }
+        exit 0
+    }
+
     if ($Action -eq 'wait-process') {
-        $waited = Wait-V9xGuestProcessExit -Stream $stream -RequestId ([ref]$requestId) `
+        $waited =Wait-V9xGuestProcessExit -Stream $stream -RequestId ([ref]$requestId) `
             -ProcessId $ProcessId -Name $Name -WaitSeconds $WaitSeconds
         if (-not $waited.WasRunning) {
             [Console]::Error.WriteLine("Note: no process matched $(if ($ProcessId) { "pid $ProcessId" } else { "'$Name'" }) on the first look: it had already exited, or the name is wrong (see ps).")
@@ -2359,15 +2859,38 @@ try {
                     WasAgentJob = [BitConverter]::ToUInt32($killed, 4) -ne 0
                     JobRequestId = [BitConverter]::ToUInt32($killed, 4)
                 })
+                if ($RestoreDisplay) {
+                    # The kill has already happened: a slow exit or a failed
+                    # restore must not swallow its result. Report both and
+                    # exit 51 (display) with the kill fields intact.
+                    $restored = $null
+                    try {
+                        $null = Wait-V9xGuestProcessExit -Stream $stream -RequestId ([ref]$requestId) -ProcessId $victims[0].Pid -WaitSeconds 10
+                        $restored = Get-V9xGuestDisplay -Stream $stream -RequestId ([ref]$requestId) -Restore
+                    } catch {
+                        if (Test-V9xTransportFailure $_.Exception) { throw }
+                        $restored = [pscustomobject]@{ Restored = $false; Error = $_.Exception.Message }
+                        $killDisplayFailed = $true
+                    }
+                    $result | Add-Member -NotePropertyName Display -NotePropertyValue $restored
+                }
             }
         } else {
-            try { $regPayload = New-V9xRegQueryPayload -Key $Key } catch { $exitCategory = 10; throw }
-            $reg = ConvertFrom-V9xRegQueryPayload -Payload (Invoke-V9xToolRequest 0x0090 $regPayload 0x8090)
-            $result = Join-V9xResult $common ([ordered]@{
-                Key = $Key; Subkeys = $reg.Subkeys; Values = $reg.Values; Truncated = $reg.Truncated
-            })
+            if ($regWrite) {
+                Assert-V9xCapability 0x04000000 'write a registry value' '0.17.0'
+                $previous = ConvertFrom-V9xRegWritePayload -Name $Name -Payload (Invoke-V9xToolRequest 0x0091 $regWritePayload 0x8091)
+                $result = Join-V9xResult $common ([ordered]@{ Key = $Key; Name = $Name
+                    Operation = $(if ($DeleteValue) { 'DeleteValue' } else { 'Set' }); Previous = $previous })
+            } else {
+                try { $regPayload = New-V9xRegQueryPayload -Key $Key } catch { $exitCategory = 10; throw }
+                $reg = ConvertFrom-V9xRegQueryPayload -Payload (Invoke-V9xToolRequest 0x0090 $regPayload 0x8090)
+                $result = Join-V9xResult $common ([ordered]@{
+                    Key = $Key; Subkeys = $reg.Subkeys; Values = $reg.Values; Truncated = $reg.Truncated
+                })
+            }
         }
         if ($Json) { $result | ConvertTo-Json -Depth 5 -Compress } else { $result | Format-List }
+        if ($killDisplayFailed) { exit 51 }
         exit 0
     }
 
@@ -2565,13 +3088,31 @@ try {
             $exitName = Split-Path -Leaf $Application
             [Console]::Error.WriteLine("Note: agent $($hello.BuildId) does not report the pid (0.14.0+); waiting until no '$exitName' runs.")
         }
-        $waited = Wait-V9xGuestProcessExit -Stream $stream -RequestId ([ref]$exitRequest) `
-            -ProcessId $(if ($null -ne $complete.Pid) { $complete.Pid } else { 0 }) -Name $exitName `
-            -WaitSeconds $WaitSeconds
-        $result | Add-Member -NotePropertyMembers ([ordered]@{
-            WaitedForExit = $true; ExitWaitedMilliseconds = $waited.WaitedMilliseconds
-            WasRunning = $waited.WasRunning
-        })
+        $exitPid = $(if ($null -ne $complete.Pid) { $complete.Pid } else { 0 })
+        if (($hello.Capabilities -band [uint32]0x01000000) -ne 0) {
+            # Agent 0.16.0+: a crash ends the wait too (exit 50, with the
+            # fault dialog's text), where it used to sit out -WaitSeconds
+            # because a faulted process lingers while its dialog is up.
+            $waited = Wait-V9xGuestFault -Stream $stream -RequestId ([ref]$exitRequest) `
+                -ProcessId $exitPid -Name $(if ($exitPid) { '' } else { $exitName }) `
+                -WaitSeconds $WaitSeconds -Dismiss:$Dismiss
+            $result | Add-Member -NotePropertyMembers ([ordered]@{
+                WaitedForExit = $true; ExitWaitedMilliseconds = $waited.WaitedMilliseconds
+                WasRunning = $waited.WasRunning; Outcome = $waited.Outcome
+                Fault = ConvertTo-V9xFaultResult $waited.Fault; Dismissed = $waited.Dismissed
+            })
+            if ($waited.Outcome -eq 'Fault') {
+                $outcomeExit = 50
+                $result.Success = $false
+            }
+        } else {
+            $waited = Wait-V9xGuestProcessExit -Stream $stream -RequestId ([ref]$exitRequest) `
+                -ProcessId $exitPid -Name $exitName -WaitSeconds $WaitSeconds
+            $result | Add-Member -NotePropertyMembers ([ordered]@{
+                WaitedForExit = $true; ExitWaitedMilliseconds = $waited.WaitedMilliseconds
+                WasRunning = $waited.WasRunning
+            })
+        }
     }
     # -WaitForFile: the program (often -Detach'ed) signals completion by
     # writing a file (with -Match: a line in it); wait for it here, on this

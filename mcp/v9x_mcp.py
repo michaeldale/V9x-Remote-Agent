@@ -131,8 +131,24 @@ CAP_REGISTRY = 0x100000
 CAP_WINDOWS = 0x200000
 CAP_EXEC_PID = 0x400000  # EXEC option 0x0002: EXEC_COMPLETE carries the pid (0.14.0+)
 CAP_EVENT_LOG = 0x800000  # EVENT_NOTE, EVENTS.LOG and CHAT.LOG (0.15.0+)
+CAP_WINDOW_TOOLS = 0x1000000  # WINDOW_TEXT and WINDOW_CLOSE (0.16.0+)
+CAP_LOGON_DISMISS = 0x2000000  # DESKTOP_WAIT (0.17.0+, Windows 9x only)
+CAP_REG_WRITE = 0x4000000
+CAP_DISPLAY = 0x8000000
+CAP_INPUT_TARGET = 0x10000000
+CAP_PROCESS_WAIT = 0x20000000
+MSG_REG_WRITE, MSG_REG_WRITE_RESPONSE = 0x0091, 0x8091
+MSG_DISPLAY, MSG_DISPLAY_RESPONSE = 0x0067, 0x8067
+MSG_INPUT_TARGET, MSG_INPUT_TARGET_RESPONSE = 0x0066, 0x8066
+MSG_PROCESS_WAIT, MSG_PROCESS_WAIT_RESPONSE = 0x0082, 0x8082
+MSG_DESKTOP_WAIT = 0x0065
+MSG_DESKTOP_WAIT_RESPONSE = 0x8065
 MSG_WINDOW_LIST = 0x0062
 MSG_WINDOW_LIST_RESPONSE = 0x8062
+MSG_WINDOW_TEXT = 0x0063
+MSG_WINDOW_TEXT_RESPONSE = 0x8063
+MSG_WINDOW_CLOSE = 0x0064
+MSG_WINDOW_CLOSE_RESPONSE = 0x8064
 DELETE_RECURSIVE = 0x1
 DELETE_FORCE = 0x2
 REG_HIVES = {
@@ -388,6 +404,76 @@ def parse_window_list(payload):
     if offset != len(payload):
         raise V9xError("WINDOW_LIST_RESPONSE contains trailing data")
     return windows
+
+
+def parse_window_text(payload):
+    if len(payload) < 16:
+        raise V9xError("truncated WINDOW_TEXT_RESPONSE")
+    handle, pid, count, truncated = struct.unpack_from("<4I", payload, 0)
+    class_name, offset = parse_ansi_string(payload, 16)
+    title, offset = parse_ansi_string(payload, offset)
+    controls = []
+    for _ in range(count):
+        if offset + 12 > len(payload):
+            raise V9xError("truncated child window entry")
+        child, control_id, flags = struct.unpack_from("<III", payload, offset)
+        child_class, offset = parse_ansi_string(payload, offset + 12)
+        text, offset = parse_ansi_string(payload, offset)
+        controls.append({"handle": child, "control_id": control_id, "visible": bool(flags & 1),
+                         "class": child_class, "text": text})
+    if offset != len(payload):
+        raise V9xError("WINDOW_TEXT_RESPONSE contains trailing data")
+    return {"handle": handle, "pid": pid, "class": class_name, "title": title,
+            "truncated": bool(truncated), "controls": controls}
+
+
+# A dialog is a fault report when its title or a control's text has one of
+# these (same list as v9xctl.ps1): Windows 9x "performed an illegal
+# operation" / "caused an invalid page fault in module", NT "<image> -
+# Application Error" / "referenced memory at", Dr. Watson.
+FAULT_PHRASES = (
+    "performed an illegal operation", "invalid page fault", "general protection fault",
+    "caused an exception", "caused a stack fault", "caused an invalid",
+    "application error", "referenced memory at", "has generated errors",
+    "has encountered a problem", "unhandled exception", "access violation",
+    "fatal exception", "privileged instruction", "illegal instruction",
+)
+
+
+# Fault reports come in standard dialogs (9x fault box, NT hard-error box) or
+# Dr. Watson's NotifyDialog (Windows 2000, AeDebug Auto=1); other windows are
+# never read, so an editor showing a log is not a fault.
+FAULT_DIALOG_CLASSES = ("#32770", "NotifyDialog")
+
+
+def classify_fault_dialog(window_text):
+    """Fault-report view of a WINDOW_TEXT answer: is_fault, message (static
+    text), details (edit text: the 9x register dump), buttons."""
+    controls = window_text["controls"]
+    all_text = "\n".join([window_text["title"]] + [c["text"] for c in controls])
+    lowered = all_text.lower()
+    phrase = next((p for p in FAULT_PHRASES if p in lowered), None)
+
+    def joined(cls):
+        return "\n".join(c["text"] for c in controls
+                         if c["class"].lower() == cls and c["text"]).replace("\r\n", "\n").strip()
+
+    return {
+        "is_fault": phrase is not None, "phrase": phrase,
+        "title": window_text["title"], "class": window_text["class"],
+        "message": joined("static"), "details": joined("edit"),
+        "buttons": [c["text"].replace("&", "") for c in controls
+                    if c["class"].lower() == "button" and c["visible"]],
+        "handle": window_text["handle"], "dialog_pid": window_text["pid"], "all_text": all_text,
+    }
+
+
+def fault_names_target(all_text, names):
+    """Whether a dialog's text names one of the target's images (base names
+    without extension, as a whole word): 9x titles it "Crashprb", NT
+    "CRASHPRB.EXE - Application Error"."""
+    return any(re.search(r"(?i)(^|[^A-Za-z0-9_])%s([^A-Za-z0-9_]|$)" % re.escape(n), all_text)
+               for n in names)
 
 
 def encode_reg_key(key):
@@ -1143,6 +1229,55 @@ class V9xClient:
         finally:
             self.sock.settimeout(self.timeout)
 
+    def wait_desktop(self, wait_seconds=120, dismiss_logon=False):
+        if not 0 <= wait_seconds <= 86400:
+            raise V9xError("wait_seconds must be between 0 and 86400")
+        if dismiss_logon:
+            self.require(CAP_LOGON_DISMISS, "logon cancellation (agent 0.17.0+, Windows 9x)")
+        if self.hello["capabilities"] & CAP_LOGON_DISMISS:
+            # The guest bounds each DESKTOP_WAIT to 60 s (a dropped caller
+            # must not hold its connection); loop until our own deadline.
+            started = time.monotonic()
+            dismissed = False
+            while True:
+                elapsed_ms = int((time.monotonic() - started) * 1000)
+                ms = max(0, min(60000, int(wait_seconds * 1000) - elapsed_ms))
+                try:
+                    margin = 120.0 if isinstance(self.sock, RelaySession) else 30.0
+                    self.sock.settimeout(max(self.timeout, ms / 1000.0 + margin))
+                    answer = self.tool_request(
+                        CAP_LOGON_DISMISS, "guest desktop wait", MSG_DESKTOP_WAIT,
+                        struct.pack("<II", int(dismiss_logon), ms),
+                        MSG_DESKTOP_WAIT_RESPONSE)
+                finally:
+                    self.sock.settimeout(self.timeout)
+                if len(answer) != 24:
+                    raise V9xError("invalid DESKTOP_WAIT_RESPONSE length")
+                flags, boot, width, height, bpp, _elapsed = struct.unpack("<6I", answer)
+                if flags & ~3:
+                    raise V9xError("invalid DESKTOP_WAIT_RESPONSE flags")
+                dismissed = dismissed or bool(flags & 2)
+                if flags & 1 or ms < 60000:
+                    break
+            result = {"desktop_ready": bool(flags & 1), "logon_dismissed": dismissed,
+                      "boot_counter": boot, "screen_width": width, "screen_height": height,
+                      "bits_per_pixel": bpp,
+                      "waited_ms": int((time.monotonic() - started) * 1000)}
+            if not result["desktop_ready"]:
+                raise V9xError("desktop did not become ready within %d seconds (logon_dismissed: %s)"
+                               % (wait_seconds, result["logon_dismissed"]))
+            return result
+        # Older agents and NT retain the original read-only INFO wait.
+        deadline = time.monotonic() + wait_seconds
+        while True:
+            info = self.info()
+            if info["desktop_ready"]:
+                return {key: info[key] for key in ("desktop_ready", "boot_counter",
+                        "screen_width", "screen_height", "bits_per_pixel")}
+            if time.monotonic() >= deadline:
+                raise V9xError("desktop did not become ready within %d seconds" % wait_seconds)
+            time.sleep(1.0)
+
     def stat(self, guest_path):
         self.require(CAP_FILE_READ, "file")
         self.next_id()
@@ -1280,7 +1415,41 @@ class V9xClient:
         was_running is False when nothing matched on the first look."""
         started = time.monotonic()
         first = None
+        native = bool(self.hello["capabilities"] & CAP_PROCESS_WAIT) and (pid or not any(c in name for c in "*?[]"))
         while True:
+            if native:
+                if not pid:
+                    first = [p for p in self.processes() if p["name"].upper() == name.upper()]
+                    if not first:
+                        return {"pid": None, "name": name, "was_running": False, "exited": [],
+                                "waited_ms": int((time.monotonic() - started) * 1000)}
+                    if len(first) > 1:
+                        native = False  # retain the existing wait-for-all semantics
+                        continue
+                    pid = first[0]["pid"]
+                ms = max(0, min(60000, int((wait_seconds - (time.monotonic() - started)) * 1000)))
+                try:
+                    margin = 120.0 if isinstance(self.sock, RelaySession) else 30.0
+                    self.sock.settimeout(max(self.timeout, ms / 1000.0 + margin))
+                    answer = self.tool_request(CAP_PROCESS_WAIT, "process wait (agent 0.17.0+)",
+                        MSG_PROCESS_WAIT, struct.pack("<II", pid, ms), MSG_PROCESS_WAIT_RESPONSE)
+                finally:
+                    self.sock.settimeout(self.timeout)
+                if len(answer) < 10:
+                    raise V9xError("invalid PROCESS_WAIT_RESPONSE")
+                flags, elapsed = struct.unpack_from("<II", answer)
+                image, end = parse_string(answer, 8)
+                if end != len(answer) or flags & ~3:
+                    raise V9xError("invalid PROCESS_WAIT_RESPONSE fields")
+                if first is None:
+                    first = [{"pid": pid, "name": image}] if flags & 1 else []
+                if flags & 2:
+                    return {"pid": pid, "name": name, "was_running": bool(first),
+                            "exited": [p["name"] for p in first],
+                            "waited_ms": int((time.monotonic() - started) * 1000)}
+                if time.monotonic() - started >= wait_seconds:
+                    raise V9xError("pid %d still running after %d s" % (pid, wait_seconds))
+                continue
             running = [p for p in self.processes()
                        if (p["pid"] == pid if pid else
                            fnmatch.fnmatch(p["name"].upper(), name.upper()))]
@@ -1292,6 +1461,114 @@ class V9xClient:
                         "waited_ms": int((time.monotonic() - started) * 1000)}
             if time.monotonic() - started >= wait_seconds:
                 raise V9xError("%s still running after %d s" % (
+                    ("pid %d" % pid) if pid else repr(name), wait_seconds))
+            poll_pause(started)
+
+    def window_text(self, handle):
+        """One window's title and its child controls' text (agent 0.16.0+)."""
+        return parse_window_text(self.tool_request(
+            CAP_WINDOW_TOOLS, "window text (agent 0.16.0+)", MSG_WINDOW_TEXT,
+            struct.pack("<I", handle), MSG_WINDOW_TEXT_RESPONSE))
+
+    def close_window(self, handle):
+        """Post WM_CLOSE to a top-level window (agent 0.16.0+); refuses the
+        desktop, the taskbar and the agent."""
+        answer = self.tool_request(CAP_WINDOW_TOOLS, "close window (agent 0.16.0+)",
+                                   MSG_WINDOW_CLOSE, struct.pack("<I", handle),
+                                   MSG_WINDOW_CLOSE_RESPONSE)
+        if len(answer) != 4:
+            raise V9xError("invalid WINDOW_CLOSE_RESPONSE")
+        return {"handle": struct.unpack("<I", answer)[0]}
+
+    DR_WATSON_LOG = r"C:\Documents and Settings\All Users\Documents\DrWatson\drwtsn32.log"
+
+    def complete_dr_watson_fault(self, fault):
+        """Windows 2000's Dr. Watson box (NotifyDialog) shows Cancel while
+        it writes its log and OK when done; closing it earlier cancels the
+        log. Wait (up to 60 s) for OK, then take the newest exception line
+        of the default log as details."""
+        if fault.get("class") != "NotifyDialog":
+            return fault
+        started = time.monotonic()
+        while (time.monotonic() - started < 60
+               and ("Cancel" in fault["buttons"] or "OK" not in fault["buttons"])):
+            time.sleep(0.25)
+            try:
+                fault = classify_fault_dialog(self.window_text(fault["handle"]))
+            except V9xError:
+                break
+        if "Cancel" in fault["buttons"] or "OK" not in fault["buttons"]:
+            return fault  # unfinished: the newest log entry may be an older crash
+        try:
+            found = self.read_text(self.DR_WATSON_LOG, 1, "Exception number:", 512)
+            if found["matched"]:
+                fault["details"] = "Dr. Watson: %s (log: %s)" % (found["text"].strip(), self.DR_WATSON_LOG)
+        except V9xError:
+            pass
+        return fault
+
+    def wait_fault(self, wait_seconds, pid=0, name="", dismiss=False):
+        """Poll until the process (pid or image name) exits -> outcome
+        "exited", or a fault dialog about it appears -> outcome "fault" with
+        the dialog's title, message and details. Neither pid nor name: watch
+        for a fault in any program and end with outcome "no_fault" at the
+        deadline. The dialog's owner is not the crashed process (9x: KERNEL32,
+        NT: CSRSS or Dr. Watson), so a dialog counts when it names the
+        target's image. Faults are checked before exit: a dialog outlives
+        its process. dismiss: close it (WM_CLOSE) and wait for it to go."""
+        self.require(CAP_WINDOW_TOOLS, "fault dialogs (agent 0.16.0+)")
+        any_fault = not pid and not name
+        started = time.monotonic()
+        first, running, seen = None, [], {}
+        names = set()
+        if name and not any(ch in name for ch in "*?["):
+            names.add(os.path.splitext(name)[0].upper())
+        while True:
+            if not any_fault:
+                running = [p for p in self.processes()
+                           if (p["pid"] == pid if pid else
+                               fnmatch.fnmatch(p["name"].upper(), name.upper()))]
+                if first is None:
+                    first = running
+                names.update(os.path.splitext(p["name"])[0].upper() for p in running)
+            pids = {p["pid"] for p in (first or []) + running} | ({pid} if pid else set())
+            fault = None
+            for window in self.windows():
+                if window["class"] not in FAULT_DIALOG_CLASSES:
+                    continue
+                key = (window["handle"], window["title"])
+                if key not in seen:
+                    try:
+                        seen[key] = classify_fault_dialog(self.window_text(window["handle"]))
+                    except V9xError:
+                        continue  # closed between the list and the read
+                found = seen[key]
+                if found["is_fault"] and (any_fault or found["dialog_pid"] in pids
+                                          or fault_names_target(found["all_text"], names)):
+                    fault = found
+                    break
+            waited = int((time.monotonic() - started) * 1000)
+            base = {"pid": pid or None, "name": name, "was_running": bool(first),
+                    "processes": [p["name"] for p in first or []], "waited_ms": waited}
+            if fault is not None:
+                fault = self.complete_dr_watson_fault(fault)
+                dismissed = False
+                if dismiss:
+                    self.close_window(fault["handle"])
+                    deadline = time.monotonic() + 5
+                    while time.monotonic() < deadline:
+                        if not any(w["handle"] == fault["handle"] for w in self.windows()):
+                            dismissed = True
+                            break
+                        time.sleep(0.25)
+                fault = {k: v for k, v in fault.items() if k not in ("is_fault", "all_text", "phrase")}
+                return dict(base, outcome="fault", fault=fault, dismissed=dismissed)
+            if not any_fault and not running:
+                return dict(base, outcome="exited", fault=None, dismissed=False)
+            if time.monotonic() - started >= wait_seconds:
+                if any_fault:
+                    return dict(base, outcome="no_fault", fault=None, dismissed=False)
+                raise V9xError("%s still running after %d s; no fault dialog" % (
                     ("pid %d" % pid) if pid else repr(name), wait_seconds))
             poll_pause(started)
 
@@ -1316,6 +1593,56 @@ class V9xClient:
             MSG_REG_QUERY_RESPONSE))
         result["key"] = key
         return result
+
+    def reg_write(self, key, name, operation, value=None):
+        self.require(CAP_REG_WRITE, "registry writes (agent 0.17.0+)")
+        if len(name) > 259 or "\0" in name:
+            raise V9xError("registry name is limited to 259 ASCII characters without NULs")
+        operations = {"set_string": 1, "set_dword": 2, "delete_value": 3}
+        if operation not in operations:
+            raise V9xError("operation must be set_string, set_dword or delete_value")
+        if operation == "set_string":
+            if not isinstance(value, str) or "\0" in value:
+                raise V9xError("set_string needs a string without NULs")
+            try: data = value.encode("ascii") + b"\0"
+            except UnicodeEncodeError: raise V9xError("registry string must be ASCII") from None
+        elif operation == "set_dword":
+            if not isinstance(value, int) or not 0 <= value <= 0xFFFFFFFF:
+                raise V9xError("set_dword needs an integer from 0 to 4294967295")
+            data = struct.pack("<I", value)
+        else:
+            if value is not None: raise V9xError("delete_value takes no value")
+            data = b""
+        if len(data) > 1024: raise V9xError("registry data is limited to 1024 bytes")
+        encoded = encode_reg_key(key)
+        payload = encoded[:4] + struct.pack("<I", operations[operation]) + encoded[4:]
+        payload += encode_string(name) + struct.pack("<I", len(data)) + data
+        answer = self.tool_request(CAP_REG_WRITE, "registry write", MSG_REG_WRITE, payload, MSG_REG_WRITE_RESPONSE)
+        if len(answer) < 12:
+            raise V9xError("invalid REG_WRITE_RESPONSE")
+        exists, old_type, size = struct.unpack_from("<III", answer)
+        if exists > 1 or len(answer) != 12 + size:
+            raise V9xError("invalid REG_WRITE_RESPONSE fields")
+        previous = None
+        if exists:
+            previous = parse_reg_query(struct.pack("<III", 0, 1, 0) + encode_string(name) + answer[4:])["values"][0]
+        return {"key": key, "name": name, "operation": operation, "previous": previous}
+
+    def display(self, restore=False):
+        answer = self.tool_request(CAP_DISPLAY, "display (agent 0.17.0+)", MSG_DISPLAY,
+                                   struct.pack("<I", int(restore)), MSG_DISPLAY_RESPONSE)
+        if len(answer) != 40: raise V9xError("invalid DISPLAY_RESPONSE")
+        values = struct.unpack("<10I", answer)
+        flags = values[0]
+        if flags & ~7: raise V9xError("invalid DISPLAY_RESPONSE flags")
+        modes = [dict(zip(("width", "height", "bits_per_pixel", "refresh_hz"), values[2+i*4:6+i*4]))
+                 if flags & (1 << i) else None for i in range(2)]
+        different = None
+        if all(modes):
+            a, b = modes
+            different = any(a[k] != b[k] for k in ("width", "height", "bits_per_pixel")) or (
+                a["refresh_hz"] > 1 and b["refresh_hz"] > 1 and a["refresh_hz"] != b["refresh_hz"])
+        return {"current_mode": modes[0], "saved_mode": modes[1], "mode_differs": different, "restored": bool(flags & 4)}
 
     def list_dir(self, guest_path):
         self.require(CAP_FILE_READ, "file")
@@ -1542,7 +1869,7 @@ class V9xClient:
                 metadata["host_shape"] = (region, scale_percent, bool(gray))
         return metadata, data
 
-    def send_input(self, actions):
+    def send_input(self, actions, window=""):
         self.require(CAP_INPUT, "input")
         if len(actions) > 256:
             raise V9xError("at most 256 input actions per request")
@@ -1579,17 +1906,29 @@ class V9xClient:
                 payload += struct.pack("<BH", INPUT_OP_DELAY, int(action["ms"]))
             else:
                 raise V9xError("unknown input action '%s'" % op)
+        extended = bool(self.hello["capabilities"] & CAP_INPUT_TARGET)
+        if window: self.require(CAP_INPUT_TARGET, "targeted input (agent 0.17.0+)")
+        if extended: payload = encode_string(window or "") + payload
         self.next_id()
-        self.send(MSG_INPUT, payload)
-        _, _, _, response = self.expect((MSG_INPUT_RESPONSE,))
-        if len(response) != 12:
+        self.send(MSG_INPUT_TARGET if extended else MSG_INPUT, payload)
+        _, _, _, response = self.expect((MSG_INPUT_TARGET_RESPONSE if extended else MSG_INPUT_RESPONSE,))
+        if len(response) < 12 or (not extended and len(response) != 12):
             raise V9xError("invalid INPUT_RESPONSE payload")
-        performed, cursor_x, cursor_y = struct.unpack("<Iii", response)
-        return {
+        performed, cursor_x, cursor_y = struct.unpack_from("<Iii", response)
+        result = {
             "actions_performed": performed,
             "cursor_x": cursor_x,
             "cursor_y": cursor_y,
         }
+        if extended:
+            offset = 12
+            for field in ("foreground_before", "keyboard_window", "foreground_after"):
+                if offset + 8 > len(response): raise V9xError("truncated input foreground window")
+                handle, pid = struct.unpack_from("<II", response, offset)
+                title, offset = parse_string(response, offset + 8)
+                result[field] = {"handle": handle, "pid": pid, "title": title}
+            if offset != len(response): raise V9xError("trailing input foreground data")
+        return result
 
     def power(self, msg_type, response_type, job_id):
         self.require(CAP_POWER, "power-control")
@@ -1638,7 +1977,8 @@ def wait_for_update(host, port, old_boot, wait_seconds, resolve=None, connect=No
     )
 
 
-def wait_for_reboot(host, port, old_boot, job_id, wait_seconds, resolve=None, connect=None):
+def wait_for_reboot(host, port, old_boot, job_id, wait_seconds, resolve=None, connect=None,
+                    dismiss_logon=False):
     deadline = time.monotonic() + wait_seconds
     last_error = "no connection attempt succeeded"
     while time.monotonic() < deadline:
@@ -1658,6 +1998,8 @@ def wait_for_reboot(host, port, old_boot, job_id, wait_seconds, resolve=None, co
         try:
             hello = candidate.hello
             if hello["boot_counter"] != old_boot and hello["pending_job"] == job_id:
+                if dismiss_logon:
+                    hello = dict(hello, **candidate.wait_desktop(wait_seconds, dismiss_logon=True))
                 return hello
             last_error = "reconnected without proof (boot %d, pending '%s')" % (
                 hello["boot_counter"],
@@ -1741,7 +2083,8 @@ TOOLS = [
                 "timeout_ms": {"type": "integer", "description": "Guest-side timeout in ms (default 60000, max 3600000)"},
                 "show_window": {"type": "boolean", "description": "Show the child's window (console children; GUI-subsystem EXEs manage their own window)"},
                 "detach": {"type": "boolean", "description": "Launch and return immediately without waiting or capturing output. Use for installers and programs that outlive the request. The result's pid (agent 0.14.0+) is what v9x_wait_process and v9x_kill take."},
-                "wait_for_exit": {"type": "boolean", "description": "Launch detached, then return when the process has exited (no 1-hour exec cap, no output captured, exit code unknown)"},
+                "wait_for_exit": {"type": "boolean", "description": "Launch detached, then return when the process has exited (no 1-hour exec cap, no output captured, exit code unknown). Agent 0.16.0+: a crash ends the wait too, with result \"fault\" and the fault dialog's text in waited_for_exit.fault"},
+                "dismiss": {"type": "boolean", "description": "With wait_for_exit: close the fault dialog once read, so the next test starts clean"},
                 "wait_for_file": guest_path_schema("After the run (usually with detach): wait until this guest file exists, then return"),
                 "match": {"type": "string", "description": "With wait_for_file: wait until the file has a line containing this text (e.g. Complete=yes)"},
                 "wait_for_window": {"type": "string", "description": "After the run (usually with detach): wait until a window whose title contains this is shown, then return it"},
@@ -1891,17 +2234,19 @@ TOOLS = [
             "properties": {
                 "pid": {"type": "integer", "minimum": 1},
                 "name": {"type": "string", "description": "Image name, e.g. NOTEPAD.EXE; must match exactly one process"},
+                "restore_display": {"type": "boolean", "description": "Wait for termination, then restore the saved display mode (agent 0.17.0+)"},
             },
             "additionalProperties": False,
         },
     },
     {
         "name": "v9x_windows",
-        "description": "Visible top-level windows in the guest: title, class, x, y, width, height, foreground, minimized, pid. With wait_for (part of a title): wait until such a window is shown (gone=true: closed) instead of sleeping; then screenshot it with window=<title>. Agent 0.13.0+.",
+        "description": "Visible top-level windows in the guest: title, class, x, y, width, height, foreground, minimized, pid. With wait_for (part of a title): wait until such a window is shown (gone=true: closed) instead of sleeping; then screenshot it with window=<title>. controls=true adds each window's child controls and their text (what a dialog says, without a screenshot; agent 0.16.0+). Agent 0.13.0+.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "title": {"type": "string", "description": "Only windows whose title contains this"},
+                "controls": {"type": "boolean", "description": "Also return each window's child controls (class, control_id, text)"},
                 "wait_for": {"type": "string", "description": "Wait until a window whose title contains this is shown"},
                 "gone": {"type": "boolean", "description": "With wait_for: wait until it is closed"},
                 "wait_seconds": {"type": "integer", "minimum": 1, "maximum": 3600, "description": "Limit for wait_for (default 60)"},
@@ -1939,6 +2284,33 @@ TOOLS = [
         },
     },
     {
+        "name": "v9x_wait_fault",
+        "description": "Wait until a guest process exits (outcome \"exited\") or a fault dialog about it appears (outcome \"fault\": the dialog's title, message and details, e.g. Windows 9x's \"caused an invalid page fault in module X at ...\" register dump), in one call instead of polling windows and processes. Without pid or name: watch for a fault in any program until wait_seconds (outcome \"no_fault\"). dismiss=true closes the dialog afterwards. Agent 0.16.0+. Blocks the conversation: for long runs use `v9xctl.ps1 wait-fault` as a background command.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "pid": {"type": "integer", "minimum": 1, "description": "From v9x_exec's result (detach) or v9x_ps"},
+                "name": {"type": "string", "description": "Image name, e.g. MYTEST.EXE"},
+                "wait_seconds": {"type": "integer", "minimum": 1, "maximum": 3600, "description": "Limit (default 600)"},
+                "dismiss": {"type": "boolean", "description": "Close the fault dialog once read"},
+            },
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "v9x_close_window",
+        "description": "Close the one top-level guest window whose title contains title (WM_CLOSE) and wait until it is gone: a leftover dialog, a finished program. Refuses the desktop, the taskbar and the agent. Agent 0.16.0+.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "title": {"type": "string", "description": "Part of the window title; must match exactly one window"},
+                "wait_seconds": {"type": "integer", "minimum": 1, "maximum": 600, "description": "How long to wait for it to close (default 10)"},
+            },
+            "required": ["title"],
+            "additionalProperties": False,
+        },
+    },
+    {
         "name": "v9x_reg_query",
         "description": "Read one registry key in the guest: its subkey names and values (strings, DWORDs, multi-strings, binary as hex). Read-only. Key like HKLM\\System\\CurrentControlSet\\Services\\Class\\Display. Agent 0.13.0+.",
         "inputSchema": {
@@ -1947,6 +2319,20 @@ TOOLS = [
             "required": ["key"],
             "additionalProperties": False,
         },
+    },
+    {
+        "name": "v9x_reg_write",
+        "description": "Set or delete one registry value, with the previous value returned and recorded in the guest activity log. Protects hive roots, system/security/hardware branches and the agent's startup entries. No key-tree deletion. Agent 0.17.0+.",
+        "inputSchema": {"type": "object", "properties": {
+            "key": {"type": "string"}, "name": {"type": "string", "description": "Value name; empty string selects the default value"},
+            "operation": {"type": "string", "enum": ["set_string", "set_dword", "delete_value"]},
+            "value": {"anyOf": [{"type": "string"}, {"type": "integer", "minimum": 0, "maximum": 4294967295}], "description": "Required for set operations; omit for deletion"}},
+            "required": ["key", "name", "operation"], "additionalProperties": False},
+    },
+    {
+        "name": "v9x_display",
+        "description": "Report current versus saved registry display mode. restore=true calls ChangeDisplaySettings(NULL, 0) to recover the desktop after killing an exclusive fullscreen program. Agent 0.17.0+.",
+        "inputSchema": {"type": "object", "properties": {"restore": {"type": "boolean"}}, "additionalProperties": False},
     },
     {
         "name": "v9x_list_dir",
@@ -2097,7 +2483,8 @@ TOOLS = [
             "type": "object",
             "properties": {
                 "job_id": {"type": "string", "description": "Resume token, 1 to 63 ASCII chars (default: generated)"},
-                "wait_seconds": {"type": "integer", "description": "How long to wait for the proof (default 180)"},
+                "wait_seconds": {"type": "integer", "minimum": 0, "maximum": 86400, "description": "Maximum wait per phase: reboot proof, then desktop if dismiss_logon (default 180)"},
+                "dismiss_logon": {"type": "boolean", "description": "After reboot proof, cancel a recognized Win9x startup logon and wait for Explorer. No credentials or settings changed; requires agent 0.17.0+"},
             },
             "additionalProperties": False,
         },
@@ -2109,7 +2496,8 @@ TOOLS = [
             "type": "object",
             "properties": {
                 "job_id": {"type": "string", "description": "Resume token, 1 to 63 ASCII chars (default: generated)"},
-                "wait_seconds": {"type": "integer", "description": "How long to wait for the proof (default 180)"},
+                "wait_seconds": {"type": "integer", "minimum": 0, "maximum": 86400, "description": "Maximum wait per phase: reset proof, then desktop if dismiss_logon (default 180)"},
+                "dismiss_logon": {"type": "boolean", "description": "After reset proof, cancel a recognized Win9x startup logon and wait for Explorer. No credentials or settings changed; requires agent 0.17.0+"},
             },
             "additionalProperties": False,
         },
@@ -2131,7 +2519,8 @@ TOOLS = [
         "inputSchema": {
             "type": "object",
             "properties": {
-                "wait_seconds": {"type": "integer", "description": "Maximum wait (default 120)"},
+                "wait_seconds": {"type": "integer", "minimum": 0, "maximum": 86400, "description": "Maximum wait (default 120)"},
+                "dismiss_logon": {"type": "boolean", "description": "Cancel a recognized Win9x startup logon while waiting for Explorer. No credentials or settings changed; requires agent 0.17.0+"},
             },
             "additionalProperties": False,
         },
@@ -2240,6 +2629,9 @@ for _tool in TOOLS:
         _tool["inputSchema"]["properties"].update(SCREENSHOT_PROPERTIES)
     if _tool["name"] in INPUT_TOOLS or _tool["name"] == "v9x_screenshot":
         _tool["inputSchema"]["properties"].update(SHAPE_PROPERTIES)
+    if _tool["name"] in INPUT_TOOLS:
+        _tool["inputSchema"]["properties"]["window"] = {
+            "type": "string", "description": "Bring the one window matching this title substring to the foreground before input; refuse missing/ambiguous/unfocusable targets (agent 0.17.0+). Also crops an optional screenshot to that window."}
 
 
 class ToolHandler:
@@ -2302,7 +2694,7 @@ class ToolHandler:
         timeout = max(self.timeout, 60.0)
         try:
             session = RelaySession(self.relay_settings(), self.relay,
-                                   open_wait=max(5.0, open_wait), timeout=timeout,
+                                   open_wait=max(1.0, open_wait), timeout=timeout,
                                    owner=getattr(self, "relay_owner", None),
                                    label=getattr(self, "relay_label", ""),
                                    take_over=getattr(self, "relay_take_over", False))
@@ -2327,7 +2719,7 @@ class ToolHandler:
         wait_seconds every connection failure is retried for that long,
         backing off 1, 2, 4, 5 s, so callers never sleep-and-poll."""
         if self.relay:
-            return self.connect_relay()
+            return self.connect_relay(open_wait=wait_seconds) if wait_seconds > 0 else self.connect_relay()
         if self.install_id and not self.resolved:
             self.resolve()
         deadline = time.monotonic() + wait_seconds
@@ -2452,7 +2844,16 @@ class ToolHandler:
         if args.get("wait_for_exit"):
             # Agents before 0.14.0 report no pid: wait on the image name.
             name = "" if result.get("pid") else re.split(r"[\\/:]", args["application"])[-1]
-            result["waited_for_exit"] = client.wait_process(wait_seconds, result.get("pid") or 0, name)
+            if client.hello["capabilities"] & CAP_WINDOW_TOOLS:
+                # 0.16.0+: a crash ends the wait, with the fault dialog's text,
+                # instead of sitting out wait_seconds behind the dialog.
+                waited = client.wait_fault(wait_seconds, result.get("pid") or 0, name,
+                                           bool(args.get("dismiss")))
+                if waited["outcome"] == "fault":
+                    result["result"] = "fault"
+            else:
+                waited = client.wait_process(wait_seconds, result.get("pid") or 0, name)
+            result["waited_for_exit"] = waited
         if args.get("wait_for_file"):
             result["waited_for_file"] = client.wait_file(args["wait_for_file"], wait_seconds,
                                                          match=args.get("match", ""))
@@ -2564,13 +2965,25 @@ class ToolHandler:
         if not pid and not name:
             raise V9xError("kill needs pid or name")
         with self.connect() as client:
+            if args.get("restore_display"):
+                client.require(CAP_DISPLAY, "display restoration (agent 0.17.0+)")
             if not pid:
                 found = [p for p in client.processes() if p["name"].upper() == name.upper()]
                 if len(found) != 1:
                     raise V9xError("%r matches %d processes; pass pid (see v9x_ps)"
                                    % (name, len(found)))
                 pid = found[0]["pid"]
-            return self.text(client.kill(int(pid)))
+            result = client.kill(int(pid))
+            if args.get("restore_display"):
+                # The kill already happened: a slow exit or failed restore
+                # must still report it, so the caller does not kill again.
+                try:
+                    client.wait_process(10, int(pid))
+                    result["display"] = client.display(restore=True)
+                except V9xError as exc:
+                    raise V9xError("pid %d was killed, but the display was not restored: %s; kill result: %s"
+                                   % (int(pid), exc, json.dumps(result))) from None
+            return self.text(result)
 
     def v9x_windows(self, args):
         with self.connect() as client:
@@ -2578,9 +2991,29 @@ class ToolHandler:
                 return self.text(client.wait_window(args["wait_for"], int(args.get("wait_seconds", 60)),
                                                     bool(args.get("gone"))))
             windows = client.windows()
-        if args.get("title"):
-            windows = [w for w in windows if args["title"].lower() in w["title"].lower()]
+            if args.get("title"):
+                windows = [w for w in windows if args["title"].lower() in w["title"].lower()]
+            if args.get("controls"):
+                for w in windows:
+                    w["controls"] = client.window_text(w["handle"])["controls"]
         return self.text({"count": len(windows), "windows": windows})
+
+    def v9x_wait_fault(self, args):
+        pid, name = int(args.get("pid") or 0), args.get("name", "")
+        with self.connect() as client:
+            client.require(CAP_PROCESS, "process list (agent 0.13.0+, Windows 9x/2000)")
+            return self.text(client.wait_fault(int(args.get("wait_seconds", 600)), pid, name,
+                                               bool(args.get("dismiss"))))
+
+    def v9x_close_window(self, args):
+        with self.connect() as client:
+            found = [w for w in client.windows() if args["title"].lower() in w["title"].lower()]
+            if len(found) != 1:
+                raise V9xError("%d windows match *%s*; give more of the title (see v9x_windows)"
+                               % (len(found), args["title"]))
+            client.close_window(found[0]["handle"])
+            closed = client.wait_window(found[0]["title"], int(args.get("wait_seconds", 10)), gone=True)
+            return self.text({"window": found[0], "closed": True, "waited_ms": closed["waited_ms"]})
 
     def v9x_wait_file(self, args):
         with self.connect() as client:
@@ -2599,6 +3032,14 @@ class ToolHandler:
     def v9x_reg_query(self, args):
         with self.connect() as client:
             return self.text(client.reg_query(args["key"]))
+
+    def v9x_reg_write(self, args):
+        with self.connect() as client:
+            return self.text(client.reg_write(args["key"], args["name"], args["operation"], args.get("value")))
+
+    def v9x_display(self, args):
+        with self.connect() as client:
+            return self.text(client.display(bool(args.get("restore"))))
 
     def v9x_list_dir(self, args):
         with self.connect() as client:
@@ -2659,7 +3100,7 @@ class ToolHandler:
         with self.connect() as client:
             if any(action["op"] == "moverel" for action in actions):
                 client.require(CAP_INPUT_RELATIVE, "relative mouse moves")
-            result = client.send_input(actions)
+            result = client.send_input(actions, window=args["window"]) if args.get("window") else client.send_input(actions)
             if not args.get("screenshot"):
                 return self.text(result)
             time.sleep(settle_ms / 1000.0)
@@ -2871,11 +3312,14 @@ class ToolHandler:
         job_id = args.get("job_id") or ("mcp-%d" % (int(time.time()) % 100000000))
         wait_seconds = int(args.get("wait_seconds", 180))
         with self.connect() as client:
+            if args.get("dismiss_logon", False):
+                client.require(CAP_LOGON_DISMISS, "logon cancellation (agent 0.17.0+, Windows 9x)")
             old_boot = client.hello["boot_counter"]
             client.power(MSG_REBOOT, MSG_REBOOT_ACCEPTED, job_id)
         hello = wait_for_reboot(
             self.host, self.port, old_boot, job_id, wait_seconds,
             self.reresolve if self.install_id else None, connect=self.reconnector(),
+            dismiss_logon=args.get("dismiss_logon", False),
         )
         return self.text(
             {
@@ -2885,6 +3329,7 @@ class ToolHandler:
                 "boot_counter": hello["boot_counter"],
                 "pending_job": hello["pending_job"],
                 "desktop_ready": hello["desktop_ready"],
+                **({"logon_dismissed": hello["logon_dismissed"]} if args.get("dismiss_logon") else {}),
             }
         )
 
@@ -2893,11 +3338,14 @@ class ToolHandler:
         wait_seconds = int(args.get("wait_seconds", 180))
         with self.connect() as client:
             client.require(CAP_HARD_RESET, "reset (agent 0.10.0+ on Windows 9x)")
+            if args.get("dismiss_logon", False):
+                client.require(CAP_LOGON_DISMISS, "logon cancellation (agent 0.17.0+, Windows 9x)")
             old_boot = client.hello["boot_counter"]
             client.power(MSG_RESET, MSG_RESET_ACCEPTED, job_id)
         hello = wait_for_reboot(
             self.host, self.port, old_boot, job_id, wait_seconds,
             self.reresolve if self.install_id else None, connect=self.reconnector(),
+            dismiss_logon=args.get("dismiss_logon", False),
         )
         return self.text(
             {
@@ -2907,6 +3355,7 @@ class ToolHandler:
                 "boot_counter": hello["boot_counter"],
                 "pending_job": hello["pending_job"],
                 "desktop_ready": hello["desktop_ready"],
+                **({"logon_dismissed": hello["logon_dismissed"]} if args.get("dismiss_logon") else {}),
             }
         )
 
@@ -2918,25 +3367,8 @@ class ToolHandler:
 
     def v9x_wait_desktop(self, args):
         wait_seconds = int(args.get("wait_seconds", 120))
-        deadline = time.monotonic() + wait_seconds
         with self.connect(wait_seconds) as client:
-            while True:
-                info = client.info()
-                if info["desktop_ready"]:
-                    return self.text(
-                        {
-                            "desktop_ready": True,
-                            "boot_counter": info["boot_counter"],
-                            "screen_width": info["screen_width"],
-                            "screen_height": info["screen_height"],
-                            "bits_per_pixel": info["bits_per_pixel"],
-                        }
-                    )
-                if time.monotonic() >= deadline:
-                    raise V9xError(
-                        "desktop did not become ready within %d seconds" % wait_seconds
-                    )
-                time.sleep(1.0)
+            return self.text(client.wait_desktop(wait_seconds, args.get("dismiss_logon", False)))
 
 
 class McpServer:

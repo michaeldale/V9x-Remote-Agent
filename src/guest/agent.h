@@ -183,7 +183,7 @@ typedef struct V9xConnection {
     unsigned char file_response[V9X_LIST_RESPONSE_MAX];
     unsigned char file_buffer[V9X_FILE_CHUNK_SIZE + 4ul];
     unsigned char screen_response[320];
-    unsigned char input_response[16];
+    unsigned char input_response[1024];
     unsigned char power_response[96];
 } V9xConnection;
 
@@ -245,12 +245,19 @@ int v9x_capture_screenshot(V9xConnection *conn, unsigned long request_id,
                            unsigned long length);
 int v9x_handle_input(V9xConnection *conn, unsigned long request_id,
                      const unsigned char *payload, unsigned long length);
+int v9x_handle_target_input(V9xConnection *conn, unsigned long request_id,
+                            const unsigned char *payload, unsigned long length);
+int v9x_handle_operator(V9xConnection *conn, unsigned short type,
+                        unsigned long request_id, const unsigned char *payload,
+                        unsigned long length);
 int v9x_handle_download(V9xConnection *conn, unsigned long request_id,
                         const unsigned char *payload, unsigned long length);
 int v9x_handle_update(V9xConnection *conn, unsigned long request_id,
                       const unsigned char *payload, unsigned long length);
 int v9x_handle_inventory(V9xConnection *conn, unsigned long request_id);
 int v9x_desktop_ready(void);
+int v9x_handle_desktop_wait(V9xConnection *conn, unsigned long request_id,
+                            const unsigned char *payload, unsigned long length);
 void v9x_screen_info(DWORD *width, DWORD *height, DWORD *bits_per_pixel);
 void v9x_log_line(const char *event_name);
 void v9x_log_event(const char *event_name, const char *detail);

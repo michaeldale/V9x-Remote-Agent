@@ -84,6 +84,97 @@ without receiving a HELLO response.
 Unknown operations return `ERROR_RESPONSE` (`0x8fff`). Malformed framing closes
 the connection. Operational requests before HELLO receive an error and close.
 
+## Guest desktop wait and logon cancellation (0.17.0+)
+
+`V9X_CAP_LOGON_DISMISS` (`0x02000000`, Windows 9x only) advertises
+`DESKTOP_WAIT_REQUEST` (`0x0065`) / `DESKTOP_WAIT_RESPONSE` (`0x8065`).
+Request: flags (u32; bit 0 permits cancelling a startup logon, all others
+reserved), then timeout milliseconds (u32, 0-60,000). The wait runs
+inside the guest; callers allow the timeout plus transport overhead when
+reading the response. This occupies one connection, not an execution slot.
+The one-minute cap matches PROCESS_WAIT: the guest cannot see a client drop
+mid-wait, so a longer bound would let a dead caller hold a connection or
+relay session. Hosts repeat the request until their own deadline, and treat
+logon-dismissed from any earlier response as sticky.
+
+Response: six u32 fields: flags (bit 0 desktop ready, bit 1 logon dismissed),
+boot counter, screen width, screen height, bits per pixel (0: unknown), and
+elapsed milliseconds. A deadline returns an ordinary response with desktop
+ready clear; CLI maps that to exit 44. Invalid flags/size/timeout are
+`INVALID_PAYLOAD`; NT returns `UNSUPPORTED_OPERATION` and withholds the cap.
+
+Cancellation is opt-in, before Explorer is ready, and only for a visible,
+enabled `#32770` dialog titled exactly `Enter Network Password` or `Enter
+Windows Password`, with a visible, enabled `IDCANCEL` control. The agent
+posts `WM_COMMAND IDCANCEL` once and reports dismissal only after that dialog
+is gone/hidden. It records the cancellation request in `EVENTS.LOG` and
+does not inject input, send credentials or alter the logon provider/PWL.
+Other languages and NT secure logon are unsupported. Flags 0 only wait.
+
+Reboot/reset wire formats are unchanged. Hosts preflight the new capability
+before power control and send the desktop wait on the proven reconnect,
+after checking the changed boot counter and exact resume token. A separate
+timeout bounds each phase. Older agents and NT retain the INFO-based plain
+desktop wait; opting into cancellation on them is refused.
+
+## Operator tools (0.17.0+)
+
+New capability bits: registry writes `0x04000000`, display mode tools
+`0x08000000`, targeted/reported input `0x10000000`, and process-handle waits
+`0x20000000`. The last is withheld wherever PROCESS_LIST is unsupported.
+Old request/response formats are unchanged; hosts check capabilities first.
+
+`REG_WRITE_REQUEST` `0x0091` / response `0x8091`: request is hive (u32, same
+as REG_QUERY), operation (u32: 1 REG_SZ, 2 REG_DWORD, 3 delete value), key
+path string, value name string (empty: default), data length u32, data.
+REG_SZ includes its terminating NUL and otherwise contains non-NUL ASCII;
+DWORD is exactly four little-endian bytes; deletion has zero bytes. New and
+old values are limited to 1024 bytes; an unreadable/oversized old value
+refuses mutation. Set may create a key, but deletion never removes keys.
+Response is previous-exists (u32 boolean), previous type (u32), previous
+data length (u32), and exact old bytes. Deleting an absent value in an
+existing key is idempotent. The guest logs the operation and previous value
+(long/binary old values use bounded hex log lines), then writes and flushes.
+It refuses hive roots, HKLM SYSTEM/SECURITY/SAM/HARDWARE branches, HKCC/HKDD,
+and its own startup/update/uninstall values/keys.
+
+`DISPLAY_REQUEST` `0x0067` / response `0x8067`: request flags u32 (bit 0:
+restore registry mode with ChangeDisplaySettings(NULL, 0)). Response: flags
+u32 (bit 0 current valid, bit 1 registry valid, bit 2 restored), display API
+result u32, current width/height/bpp/Hz (four u32), then saved width/height/
+bpp/Hz. Unavailable modes are zero-filled with their valid bit clear.
+Restore needs a ready desktop; a non-success display API result is an error.
+CLI display failures use exit 51. `kill -RestoreDisplay` is a host composition
+of kill, verified process exit, then display restore, on one connection. If
+the exit wait (10 s) or the restore fails, the completed kill is still
+reported: the CLI prints the kill result with `Display.Error` and exits 51,
+MCP returns an error naming the killed pid and its kill result.
+
+`INPUT_TARGET_REQUEST` `0x0066` / response `0x8066`: window title substring
+string (empty: current focus), then the ordinary INPUT action payload.
+The guest validates the entire batch before changing focus, matches titles
+literally/case-insensitively, rejects zero/multiple matches, foregrounds the
+one target and verifies it. It checks targeted focus between actions and
+typed characters; focus loss aborts remaining input and releases keys/buttons
+this batch pressed. Input batches are serialized, including legacy input.
+This does not make Windows input delivery atomic against user/OS focus
+changes. Response is the old 12-byte input result followed by three window
+snapshots: foreground before input, foreground at the last key press/typed character,
+and foreground after input. Each snapshot is HWND u32, PID u32, title string.
+The keyboard snapshot is all zero/empty when no keyboard action occurred.
+Snapshots preserve the title before a command closes its own window.
+
+`PROCESS_WAIT_REQUEST` `0x0082` / response `0x8082`: PID u32 (nonzero), timeout
+milliseconds u32 (0-60000). It opens a SYNCHRONIZE handle and waits on that
+process, not a series of relay process-list requests. Response is flags u32
+(bit 0 was running, bit 1 exited), elapsed ms u32, image-name string. An
+already absent PID returns exited with was-running clear. Access or wait
+errors are errors, not a successful exit. A timeout leaves exited clear.
+Hosts repeat bounded chunks for the remaining overall wait budget; CLI
+reconnects after transport loss using that remaining budget. Exact-name
+selection resolves a unique PID first; wildcard/multiple-name selection
+retains PROCESS_LIST polling. Process exit alone is not fault detection.
+
 ## Discovery (mDNS / DNS-SD)
 
 Separate from the TCP protocol. With `AGENT.INI [agent] discovery=1` the Win9x
@@ -316,6 +407,26 @@ Capability `V9X_CAP_WINDOWS` (`0x00200000`):
   `WM_GETTEXT` through `SendMessageTimeout` (500 ms, abort if hung), so a hung
   program yields an empty title instead of hanging the agent. Hosts poll it
   for `wait-window`, `exec -WaitForWindow` and `screenshot -Window`.
+
+Capability `V9X_CAP_WINDOW_TOOLS` (`0x01000000`, agent 0.16.0+):
+
+- `WINDOW_TEXT_REQUEST` (`0x0063`): u32 window handle (from
+  `WINDOW_LIST`). `WINDOW_TEXT_RESPONSE` (`0x8063`): u32 handle, u32 owning
+  pid, u32 child count, u32 truncated (the 16 KiB answer filled), class
+  string, title string, then per child window (every descendant, in
+  `EnumChildWindows` order): u32 handle, u32 control id, u32 flags (`0x1`
+  visible), class string, text string (ANSI; up to 4095 bytes). Text is
+  read with `WM_GETTEXT` through `SendMessageTimeout` (500 ms, abort if
+  hung). A Windows 9x fault dialog's Details edit control holds the
+  register dump even while collapsed. Error `NOT_FOUND` when the handle is
+  not a window. Hosts poll it with `PROCESS_LIST` and `WINDOW_LIST` for
+  `wait-fault` and read each dialog once.
+- `WINDOW_CLOSE_REQUEST` (`0x0064`): u32 handle of a top-level window.
+  `WINDOW_CLOSE_RESPONSE` (`0x8064`): the same u32 handle. `WM_CLOSE` is
+  posted, not sent, so the answer means delivered; hosts confirm with
+  `WINDOW_LIST`. Refused (`ACCESS_DENIED`): the desktop window, `Progman`
+  (it would raise the Shut Down dialog), `Shell_TrayWnd` and the agent's own
+  windows. `NOT_FOUND` for a child window or a stale handle.
 
 ## Activity log (agent 0.15.0+)
 

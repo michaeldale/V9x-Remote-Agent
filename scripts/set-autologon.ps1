@@ -14,7 +14,8 @@
 #      network provider here (Client for Microsoft Networks) always prompts.
 #   2. A password-list file C:\WINDOWS\<user>.PWL exists and holds a blank
 #      password. Windows creates it when a logon completes; it cannot be
-#      fabricated from outside, which is why -Enable may need one -Dismiss.
+#      fabricated from outside. -Enable completes a pending blank logon;
+#      -Dismiss only cancels a recognized dialog (0.17.0+).
 [CmdletBinding(DefaultParameterSetName = 'Status')]
 param(
     [Parameter(ParameterSetName = 'Enable', Mandatory = $true)]
@@ -27,6 +28,9 @@ param(
     [string]$EndpointHost = '127.0.0.1',
     [ValidateRange(1, 65535)]
     [int]$Port = 9869,
+    [ValidatePattern('^$|^[Mm]-[0-9A-HJKMNP-TV-Za-hjkmnp-tv-z]{6}$')]
+    [string]$Relay,
+    [string]$RelayServer,
     [string]$UserName,
     [ValidateRange(5, 600)]
     [int]$DesktopTimeoutSeconds = 120,
@@ -35,7 +39,9 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $ctl = Join-Path $PSScriptRoot 'v9xctl.ps1'
-$powershell = Join-Path $PSHOME 'powershell.exe'
+$powershell = if (Test-Path (Join-Path $PSHOME 'powershell.exe')) {
+    Join-Path $PSHOME 'powershell.exe'
+} else { Join-Path $PSHOME 'pwsh.exe' }
 $guestJobDirectory = 'C:\V9XREMOTE\JOBS\AUTOLOGN'
 $logonKey = 'HKEY_LOCAL_MACHINE\Network\Logon'
 
@@ -45,6 +51,8 @@ function Invoke-V9xCtlJson {
         '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $ctl, $Operation,
         '-Host', $EndpointHost, '-Port', [string]$Port, '-Json'
     ) + $OperationArguments
+    if ($Relay) { $arguments += @('-Relay', $Relay) }
+    if ($RelayServer) { $arguments += @('-RelayServer', $RelayServer) }
     $lines = @(& $powershell @arguments 2>&1)
     $nativeExit = $LASTEXITCODE
     if ($AllowExit -notcontains $nativeExit) {
@@ -106,10 +114,8 @@ function Get-GuestLogonState {
 }
 
 function Clear-LogonDialog {
-    param([switch]$RequireDialog)
     $info = Invoke-V9xCtlJson -Operation 'info'
     if ($info.Result.DesktopReady) {
-        if ($RequireDialog) { Write-Verbose 'Desktop already ready; no logon dialog to clear.' }
         return $false
     }
     # The dialog owns the focus at this point in boot and OK is its default
@@ -122,6 +128,23 @@ function Clear-LogonDialog {
         throw "Sent ENTER to the logon dialog but the desktop did not become ready within $DesktopTimeoutSeconds seconds."
     }
     return $true
+}
+
+# Dismiss is cancellation only: no registry exports, credentials, PWL changes
+# or foreground keystrokes. Enable intentionally retains blank-logon creation.
+if ($Dismiss) {
+    $waited = Invoke-V9xCtlJson -Operation 'wait-desktop' -OperationArguments @(
+        '-DismissLogon', '-WaitSeconds', [string]$DesktopTimeoutSeconds)
+    $result = [pscustomobject]@{
+        Success = $true; Action = 'Dismiss'
+        Endpoint = $(if ($Relay) { $Relay } else { "${EndpointHost}:$Port" })
+        DesktopReady = $waited.Result.DesktopReady
+        BootCounter = $waited.Result.BootCounter
+        DialogCleared = $waited.Result.LogonDismissed
+        LogonDismissed = $waited.Result.LogonDismissed
+    }
+    if ($Json) { $result | ConvertTo-Json -Depth 4 -Compress } else { $result | Format-List }
+    exit 0
 }
 
 $before = Get-GuestLogonState
@@ -155,7 +178,7 @@ switch ($action) {
             if ($dialogCleared) {
                 $notes += 'Completed the pending logon dialog with a blank password, which created the PWL.'
             } else {
-                $notes += "No PWL and no dialog on screen: reboot, then run -Dismiss once (or -Enable again) to create it."
+                $notes += "No PWL and no dialog on screen: reboot, then run -Enable again to create it."
             }
         }
         # Restore any PWL this script had previously moved aside.
@@ -182,11 +205,6 @@ switch ($action) {
             $notes += "Parked $($before.PwlPath) as C:\WINDOWS\V9XLOGON.PWL; the guest prompts from the next boot."
         }
     }
-    'Dismiss' {
-        $dialogCleared = Clear-LogonDialog -RequireDialog
-        $notes += if ($dialogCleared) { 'Cleared the logon dialog; the desktop is ready.' }
-                  else { 'Desktop was already ready; nothing to dismiss.' }
-    }
     default {
         $notes += if ($before.Autologon) { 'Autologon is on: Windows Logon with a cached password list.' }
                   elseif (-not [string]::IsNullOrEmpty($before.PrimaryProvider)) { "A network provider ('$($before.PrimaryProvider)') is the primary logon, so the guest always prompts." }
@@ -198,7 +216,7 @@ $after = if ($action -eq 'Status') { $before } else { Get-GuestLogonState }
 $result = [pscustomobject]@{
     Success         = $true
     Action          = $action
-    Endpoint        = "${EndpointHost}:$Port"
+    Endpoint        = $(if ($Relay) { $Relay } else { "${EndpointHost}:$Port" })
     UserName        = $after.UserName
     PrimaryProvider = $after.PrimaryProvider
     PwlPath         = $after.PwlPath

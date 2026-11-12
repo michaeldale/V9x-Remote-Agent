@@ -53,6 +53,8 @@
 #define V9X_MSG_PROCESS_LIST_RESPONSE 0x8080u
 #define V9X_MSG_PROCESS_KILL_REQUEST  0x0081u
 #define V9X_MSG_PROCESS_KILL_RESPONSE 0x8081u
+#define V9X_MSG_PROCESS_WAIT_REQUEST 0x0082u
+#define V9X_MSG_PROCESS_WAIT_RESPONSE 0x8082u
 #define V9X_PROCESS_AGENT_JOB 0x00000001ul  /* started by an EXEC request */
 #define V9X_PROCESS_AGENT     0x00000002ul  /* the agent itself */
 /* Top-level windows (V9X_CAP_WINDOWS, 0.13.0+). */
@@ -60,8 +62,30 @@
 #define V9X_MSG_WINDOW_LIST_RESPONSE 0x8062u
 #define V9X_WINDOW_FOREGROUND 0x00000001ul
 #define V9X_WINDOW_MINIMIZED  0x00000002ul
+/* One window's own text and its child controls' text (V9X_CAP_WINDOW_TOOLS,
+   0.16.0+): what a fault or message box says, read without a screenshot. */
+#define V9X_MSG_WINDOW_TEXT_REQUEST  0x0063u
+#define V9X_MSG_WINDOW_TEXT_RESPONSE 0x8063u
+#define V9X_WINDOW_CHILD_VISIBLE 0x00000001ul
+#define V9X_WINDOW_TEXT_MAX 4095ul
+/* Ask a top-level window to close (WM_CLOSE posted, so a hung program does
+   not hang the agent). Refuses the desktop, the taskbar and the agent's own
+   windows. */
+#define V9X_MSG_WINDOW_CLOSE_REQUEST  0x0064u
+#define V9X_MSG_WINDOW_CLOSE_RESPONSE 0x8064u
+/* Bounded guest-side desktop wait, optionally cancelling a Win9x logon. */
+#define V9X_MSG_DESKTOP_WAIT_REQUEST  0x0065u
+#define V9X_MSG_DESKTOP_WAIT_RESPONSE 0x8065u
+#define V9X_DESKTOP_DISMISS_LOGON 0x00000001ul
+#define V9X_DESKTOP_READY         0x00000001ul
+#define V9X_DESKTOP_LOGON_DISMISSED 0x00000002ul
 #define V9X_MSG_REG_QUERY_REQUEST  0x0090u
 #define V9X_MSG_REG_QUERY_RESPONSE 0x8090u
+#define V9X_MSG_REG_WRITE_REQUEST 0x0091u
+#define V9X_MSG_REG_WRITE_RESPONSE 0x8091u
+#define V9X_REG_SET_STRING 1ul
+#define V9X_REG_SET_DWORD 2ul
+#define V9X_REG_DELETE_VALUE 3ul
 #define V9X_REG_TRUNCATED 0x00000001ul
 /* A line for the tester's activity log, EVENTS.LOG (V9X_CAP_EVENT_LOG,
    0.15.0+): "attempting driver test 12", "rebooting to try VBE". */
@@ -82,6 +106,10 @@
 #define V9X_MSG_SCREENSHOT_RESPONSE 0x8050u
 #define V9X_MSG_INPUT_REQUEST       0x0060u
 #define V9X_MSG_INPUT_RESPONSE      0x8060u
+#define V9X_MSG_INPUT_TARGET_REQUEST 0x0066u
+#define V9X_MSG_INPUT_TARGET_RESPONSE 0x8066u
+#define V9X_MSG_DISPLAY_REQUEST 0x0067u
+#define V9X_MSG_DISPLAY_RESPONSE 0x8067u
 #define V9X_MSG_INVENTORY_REQUEST   0x0070u
 #define V9X_MSG_INVENTORY_RESPONSE  0x8070u
 #define V9X_MSG_ERROR_RESPONSE 0x8fffu
@@ -135,6 +163,15 @@
    to C:\V9XREMOTE\EVENTS.LOG (connected, idle, reboot requested) and keeps
    the remote-help chat in CHAT.LOG across reboots. */
 #define V9X_CAP_EVENT_LOG      0x00800000ul
+/* WINDOW_TEXT and WINDOW_CLOSE (0.16.0+); hosts poll WINDOW_TEXT with
+   WINDOW_LIST and PROCESS_LIST for wait-fault, and close the dialog. */
+#define V9X_CAP_WINDOW_TOOLS   0x01000000ul
+/* DESKTOP_WAIT, including opt-in logon cancellation (0.17.0+, Win9x only). */
+#define V9X_CAP_LOGON_DISMISS  0x02000000ul
+#define V9X_CAP_REG_WRITE      0x04000000ul
+#define V9X_CAP_DISPLAY        0x08000000ul
+#define V9X_CAP_INPUT_TARGET   0x10000000ul
+#define V9X_CAP_PROCESS_WAIT   0x20000000ul
 #define V9X_INFO_FLAG_EXTENDED 0x00000001ul
 #define V9X_CAPABILITIES (V9X_CAP_INFO | V9X_CAP_PING | \
                           V9X_CAP_EXEC_DIRECT | V9X_CAP_EXEC_SHELL | \
@@ -147,7 +184,10 @@
                           V9X_CAP_HARD_RESET | V9X_CAP_SCREENSHOT_OPTIONS | \
                           V9X_CAP_FILE_TOOLS | V9X_CAP_PROCESS | \
                           V9X_CAP_REGISTRY | V9X_CAP_WINDOWS | \
-                          V9X_CAP_EXEC_PID | V9X_CAP_EVENT_LOG)
+                          V9X_CAP_EXEC_PID | V9X_CAP_EVENT_LOG | \
+                          V9X_CAP_WINDOW_TOOLS | V9X_CAP_LOGON_DISMISS | \
+                          V9X_CAP_REG_WRITE | V9X_CAP_DISPLAY | \
+                          V9X_CAP_INPUT_TARGET | V9X_CAP_PROCESS_WAIT)
 
 /* PUT/GET (0.11.0+, 256 MiB before) and DOWNLOAD all stream 32 KiB chunks
  * straight to disk. 2 GiB - 1 keeps every size inside the u32 wire fields

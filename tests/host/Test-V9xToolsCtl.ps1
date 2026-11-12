@@ -168,10 +168,10 @@ function Invoke-FixtureClient([string[]]$Arguments, [int]$ExpectedExit = 0) {
 
 try {
     Start-Sleep -Milliseconds 400
-    $cat = Invoke-FixtureClient @('cat', '-Path', 'C:\LOG.TXT', '-Tail', '2', '-Match', 'err', '-MaxBytes', '100')
+    $cat = Invoke-FixtureClient @('cat', 'C:\LOG.TXT', '-Tail', '2', '-Match', 'err', '-MaxBytes', '100')
     if ($cat.Text -ne "error two`nerror three`n" -or $cat.Lines -ne 90 -or $cat.Matched -ne 3 -or
         $cat.Returned -ne 2 -or $cat.Truncated) { throw "cat result mismatch: $($cat | ConvertTo-Json -Compress)" }
-    $hash = Invoke-FixtureClient @('hash', '-Path', 'C:\WINDOWS\SYSTEM\V9X.DRV', '-Source', $localFile)
+    $hash = Invoke-FixtureClient @('hash', 'C:\WINDOWS\SYSTEM\V9X.DRV', '-Source', $localFile)
     if (-not $hash.Matches -or $hash.Crc32 -ne 'DEADBEEF' -or $hash.Size -ne 200) {
         throw "hash result mismatch: $($hash | ConvertTo-Json -Compress)"
     }

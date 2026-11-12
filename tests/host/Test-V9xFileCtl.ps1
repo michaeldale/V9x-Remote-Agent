@@ -120,7 +120,7 @@ try {
     if ($putExit -ne 0) { throw "v9xctl put fixture failed: $($putOutput -join ' ')" }
     $ErrorActionPreference = 'Continue'
     $getOutput = @(& powershell.exe -NoProfile -ExecutionPolicy Bypass -File $clientScript `
-        get -Source 'C:\FIXTURE.BIN' -Destination $downloadPath -Host 127.0.0.1 -Port $port -Json 2>&1)
+        get 'C:\FIXTURE.BIN' -Destination $downloadPath -Host 127.0.0.1 -Port $port -Json 2>&1)
     $getExit = $LASTEXITCODE
     $ErrorActionPreference = $savedErrorAction
     if ($getExit -ne 0) {

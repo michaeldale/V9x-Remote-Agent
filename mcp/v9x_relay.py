@@ -165,10 +165,10 @@ class RelaySession:
             params["label"] = label
         if take_over:
             params["replace"] = "1"
-        opened = config.json("open", params, method="POST")
+        deadline = time.monotonic() + open_wait
+        opened = config.json("open", params, method="POST", timeout=max(1.0, min(40.0, open_wait)))
         self.session = opened["session"]
         self.install_id = opened["install_id"]
-        deadline = time.monotonic() + open_wait
         state = opened
         while state["state"] == "pending" and time.monotonic() < deadline:
             wait = int(min(WAIT_MAX, max(1, deadline - time.monotonic())))

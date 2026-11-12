@@ -399,6 +399,16 @@ int v9x_serve_client(V9xConnection *conn)
             if (!v9x_capture_screenshot(conn, header.request_id,
                                         conn->payload,
                                         header.payload_length)) return 0;
+        } else if (header.type == V9X_MSG_DESKTOP_WAIT_REQUEST) {
+            if (!v9x_handle_desktop_wait(conn, header.request_id, conn->payload,
+                                         header.payload_length)) return 0;
+        } else if (header.type == V9X_MSG_REG_WRITE_REQUEST ||
+                   header.type == V9X_MSG_DISPLAY_REQUEST) {
+            if (!v9x_handle_operator(conn, header.type, header.request_id,
+                                      conn->payload, header.payload_length)) return 0;
+        } else if (header.type == V9X_MSG_INPUT_TARGET_REQUEST) {
+            if (!v9x_handle_target_input(conn, header.request_id, conn->payload,
+                                         header.payload_length)) return 0;
         } else if (header.type == V9X_MSG_INPUT_REQUEST) {
             if (!v9x_handle_input(conn, header.request_id, conn->payload,
                                   header.payload_length)) return 0;

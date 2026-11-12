@@ -38,6 +38,15 @@ try {
         if ($announce -ne $fixture) {
             throw 'tests\host\mdns-announce.hex no longer matches the C mDNS encoder; regenerate it with test_protocol.exe dump-mdns.'
         }
+        # Guest-side logon cancellation: simulated USER32, no real logon changes.
+        & $compilerDriver '-bt=nt' '-zq' '-wx' '-s' '-fe=test_desktop.exe' `
+            (Join-Path $repoRoot 'tests\host\test_desktop.c') `
+            (Join-Path $repoRoot 'src\common\frame.c') `
+            (Join-Path $repoRoot 'src\common\bounds.c') `
+            (Join-Path $watcomRoot 'lib386\nt\user32.lib')
+        if ($LASTEXITCODE -ne 0) { throw 'Open Watcom failed to build desktop wait tests.' }
+        & (Join-Path $outputDir 'test_desktop.exe')
+        if ($LASTEXITCODE -ne 0) { throw 'Guest desktop wait tests failed.' }
         # READ_TEXT line filtering (tail, match, bounded output).
         & $compilerDriver '-bt=nt' '-zq' '-wx' '-s' '-fe=test_textscan.exe' `
             (Join-Path $repoRoot 'tests\host\test_textscan.c') `
@@ -122,4 +131,6 @@ Write-Output 'PASS: native C frame, bounds, and encoding tests'
 & (Join-Path $repoRoot 'tests\host\Test-V9xM4Ctl.ps1')
 & (Join-Path $repoRoot 'tests\host\Test-V9xToolsCtl.ps1')
 & (Join-Path $repoRoot 'tests\host\Test-V9xWaitCtl.ps1')
+& (Join-Path $repoRoot 'tests\host\Test-V9xFaultCtl.ps1')
+& (Join-Path $repoRoot 'tests\host\Test-V9xOperatorCtl.ps1')
 & (Join-Path $repoRoot 'tests\host\Test-V9xDiscovery.ps1')

@@ -541,6 +541,43 @@ static int v9x_handle_process_list(V9xConnection *conn, DWORD request_id)
                           conn->file_response, offset);
 }
 
+/* A bounded wait on a real process handle. Relay operators no longer need
+   a PROCESS_LIST round trip for every poll. Up to one minute per request,
+   so a disconnected client cannot strand a connection for hours. */
+static int v9x_handle_process_wait(V9xConnection *conn, DWORD request_id,
+                                   const unsigned char *payload, unsigned long length)
+{
+    DWORD pid, timeout, started, waited, flags = 0ul, error;
+    unsigned long offset = 8ul;
+    HANDLE process;
+    char name[MAX_PATH];
+    if (length != 8ul || (pid = v9x_read_u32(payload)) == 0ul ||
+        (timeout = v9x_read_u32(payload + 4)) > 60000ul)
+        return v9x_tools_error(conn, request_id, V9X_STATUS_INVALID_PAYLOAD, 0, "invalid process wait");
+    started = GetTickCount();
+    name[0] = 0;
+    process = OpenProcess(SYNCHRONIZE, FALSE, pid);
+    if (process == 0) {
+        error = GetLastError();
+        if (error != ERROR_INVALID_PARAMETER)
+            return v9x_tools_error(conn, request_id, V9X_STATUS_IO_FAILED, error, "cannot wait on process");
+        flags = 2ul;
+    } else {
+        flags = 1ul;
+        (void)v9x_process_name(pid, name, sizeof(name));
+        waited = WaitForSingleObject(process, timeout);
+        error = GetLastError();
+        CloseHandle(process);
+        if (waited == WAIT_OBJECT_0) flags |= 2ul;
+        else if (waited != WAIT_TIMEOUT)
+            return v9x_tools_error(conn, request_id, V9X_STATUS_IO_FAILED, error, "process wait failed");
+    }
+    v9x_write_u32(conn->response, flags);
+    v9x_write_u32(conn->response + 4, GetTickCount() - started);
+    if (!v9x_append_string(conn->response, sizeof(conn->response), &offset, name)) return 0;
+    return v9x_send_frame(conn, V9X_MSG_PROCESS_WAIT_RESPONSE, request_id, conn->response, offset);
+}
+
 static int v9x_handle_process_kill(V9xConnection *conn, DWORD request_id,
                                    const unsigned char *payload, unsigned long length)
 {
@@ -769,6 +806,142 @@ static int v9x_handle_window_list(V9xConnection *conn, DWORD request_id)
                           conn->file_response, walk.offset);
 }
 
+/* ---- WINDOW_TEXT ---------------------------------------------------- */
+
+/* WM_GETTEXT with a timeout, as in WINDOW_LIST, into a caller's buffer. */
+static void v9x_window_text(HWND window, char *text, unsigned long size)
+{
+    DWORD copied = 0ul;
+    text[0] = '\0';
+    if (SendMessageTimeoutA(window, WM_GETTEXT, (WPARAM)size, (LPARAM)text,
+                            SMTO_ABORTIFHUNG, 500u, &copied) == 0) {
+        text[0] = '\0';
+    }
+    text[size - 1ul] = '\0';
+}
+
+typedef struct V9xChildWalk {
+    unsigned char *out;
+    unsigned long capacity;
+    unsigned long offset;
+    unsigned long count;
+    int full;
+} V9xChildWalk;
+
+static BOOL CALLBACK v9x_child_entry(HWND child, LPARAM parameter)
+{
+    V9xChildWalk *walk = (V9xChildWalk *)parameter;
+    char text[V9X_WINDOW_TEXT_MAX + 1ul];
+    char class_name[64];
+    unsigned long start = walk->offset;
+    v9x_window_text(child, text, sizeof(text));
+    class_name[0] = '\0';
+    (void)GetClassNameA(child, class_name, sizeof(class_name));
+    if (walk->offset + 12ul > walk->capacity) {
+        walk->full = 1;
+        return FALSE;
+    }
+    v9x_write_u32(walk->out + walk->offset, (unsigned long)child);
+    v9x_write_u32(walk->out + walk->offset + 4, (unsigned long)GetDlgCtrlID(child));
+    v9x_write_u32(walk->out + walk->offset + 8,
+                  IsWindowVisible(child) ? V9X_WINDOW_CHILD_VISIBLE : 0ul);
+    walk->offset += 12ul;
+    if (!v9x_append_string(walk->out, walk->capacity, &walk->offset, class_name) ||
+        !v9x_append_string(walk->out, walk->capacity, &walk->offset, text)) {
+        walk->offset = start;
+        walk->full = 1;
+        return FALSE;
+    }
+    ++walk->count;
+    return TRUE;
+}
+
+/* u32 handle in; out: u32 handle, u32 pid, u32 child count, u32 truncated,
+   class, title, then per child (all descendants, in Z order): u32 handle,
+   u32 control id, u32 flags (visible), class, text. A fault dialog's
+   message and its Details text come back without a screenshot. */
+static int v9x_handle_window_text(V9xConnection *conn, DWORD request_id,
+                                  const unsigned char *payload, unsigned long length)
+{
+    char title[V9X_WINDOW_TEXT_MAX + 1ul];
+    char class_name[64];
+    V9xChildWalk walk;
+    DWORD pid = 0ul;
+    HWND window;
+    if (length != 4ul) {
+        return v9x_tools_error(conn, request_id, V9X_STATUS_INVALID_PAYLOAD,
+                               ERROR_INVALID_PARAMETER, "invalid window text request");
+    }
+    window = (HWND)v9x_read_u32(payload);
+    if (window == NULL || !IsWindow(window)) {
+        return v9x_tools_error(conn, request_id, V9X_STATUS_NOT_FOUND,
+                               ERROR_INVALID_WINDOW_HANDLE, "no such window");
+    }
+    v9x_window_text(window, title, sizeof(title));
+    class_name[0] = '\0';
+    (void)GetClassNameA(window, class_name, sizeof(class_name));
+    (void)GetWindowThreadProcessId(window, &pid);
+    walk.out = conn->file_response;
+    walk.capacity = sizeof(conn->file_response);
+    walk.offset = 16ul;
+    walk.count = 0ul;
+    walk.full = 0;
+    if (!v9x_append_string(walk.out, walk.capacity, &walk.offset, class_name) ||
+        !v9x_append_string(walk.out, walk.capacity, &walk.offset, title)) {
+        return v9x_tools_error(conn, request_id, V9X_STATUS_INTERNAL_ERROR,
+                               ERROR_INSUFFICIENT_BUFFER, "window text overflow");
+    }
+    (void)EnumChildWindows(window, v9x_child_entry, (LPARAM)&walk);
+    v9x_write_u32(walk.out, (unsigned long)window);
+    v9x_write_u32(walk.out + 4, pid);
+    v9x_write_u32(walk.out + 8, walk.count);
+    v9x_write_u32(walk.out + 12, walk.full ? 1ul : 0ul);
+    return v9x_send_frame(conn, V9X_MSG_WINDOW_TEXT_RESPONSE, request_id,
+                          walk.out, walk.offset);
+}
+
+/* ---- WINDOW_CLOSE --------------------------------------------------- */
+
+/* u32 handle in, the same u32 handle out. WM_CLOSE is posted, not sent: the
+   answer says the request was delivered, and the host checks WINDOW_LIST
+   for the result (a dialog can refuse). Closing Progman would raise the
+   Shut Down dialog, so the desktop, the taskbar and the agent's own windows
+   are refused. */
+static int v9x_handle_window_close(V9xConnection *conn, DWORD request_id,
+                                   const unsigned char *payload, unsigned long length)
+{
+    char class_name[64];
+    DWORD pid = 0ul;
+    HWND window;
+    if (length != 4ul) {
+        return v9x_tools_error(conn, request_id, V9X_STATUS_INVALID_PAYLOAD,
+                               ERROR_INVALID_PARAMETER, "invalid window close request");
+    }
+    window = (HWND)v9x_read_u32(payload);
+    if (window == NULL || !IsWindow(window) ||
+        (GetWindowLongA(window, GWL_STYLE) & WS_CHILD) != 0) {
+        return v9x_tools_error(conn, request_id, V9X_STATUS_NOT_FOUND,
+                               ERROR_INVALID_WINDOW_HANDLE, "no such top-level window");
+    }
+    class_name[0] = '\0';
+    (void)GetClassNameA(window, class_name, sizeof(class_name));
+    (void)GetWindowThreadProcessId(window, &pid);
+    if (lstrcmpiA(class_name, "Progman") == 0 || lstrcmpiA(class_name, "Shell_TrayWnd") == 0 ||
+        window == GetDesktopWindow() || pid == GetCurrentProcessId()) {
+        return v9x_tools_error(conn, request_id, V9X_STATUS_ACCESS_DENIED,
+                               ERROR_ACCESS_DENIED,
+                               "refused: the desktop, the taskbar or the agent itself");
+    }
+    if (!PostMessageA(window, WM_CLOSE, 0, 0)) {
+        DWORD error = GetLastError();
+        return v9x_tools_error(conn, request_id, V9X_STATUS_IO_FAILED, error,
+                               "WM_CLOSE could not be posted");
+    }
+    v9x_write_u32(conn->response, (unsigned long)window);
+    return v9x_send_frame(conn, V9X_MSG_WINDOW_CLOSE_RESPONSE, request_id,
+                          conn->response, 4ul);
+}
+
 /* ---- EVENT_NOTE ----------------------------------------------------- */
 
 /* The developer says what they are about to do, for the person at the
@@ -797,8 +970,10 @@ int v9x_is_tools_message(unsigned short type)
     return type == V9X_MSG_FILE_DELETE_REQUEST || type == V9X_MSG_FILE_HASH_REQUEST ||
            type == V9X_MSG_FILE_READ_TEXT_REQUEST ||
            type == V9X_MSG_PROCESS_LIST_REQUEST || type == V9X_MSG_PROCESS_KILL_REQUEST ||
+           type == V9X_MSG_PROCESS_WAIT_REQUEST ||
            type == V9X_MSG_REG_QUERY_REQUEST || type == V9X_MSG_WINDOW_LIST_REQUEST ||
-           type == V9X_MSG_EVENT_NOTE_REQUEST;
+           type == V9X_MSG_EVENT_NOTE_REQUEST || type == V9X_MSG_WINDOW_TEXT_REQUEST ||
+           type == V9X_MSG_WINDOW_CLOSE_REQUEST;
 }
 
 int v9x_handle_tools_message(V9xConnection *conn, unsigned short type,
@@ -815,10 +990,16 @@ int v9x_handle_tools_message(V9xConnection *conn, unsigned short type,
         return v9x_handle_process_list(conn, request_id);
     if (type == V9X_MSG_PROCESS_KILL_REQUEST)
         return v9x_handle_process_kill(conn, request_id, payload, length);
+    if (type == V9X_MSG_PROCESS_WAIT_REQUEST)
+        return v9x_handle_process_wait(conn, request_id, payload, length);
     if (type == V9X_MSG_REG_QUERY_REQUEST)
         return v9x_handle_reg_query(conn, request_id, payload, length);
     if (type == V9X_MSG_WINDOW_LIST_REQUEST && length == 0ul)
         return v9x_handle_window_list(conn, request_id);
+    if (type == V9X_MSG_WINDOW_TEXT_REQUEST)
+        return v9x_handle_window_text(conn, request_id, payload, length);
+    if (type == V9X_MSG_WINDOW_CLOSE_REQUEST)
+        return v9x_handle_window_close(conn, request_id, payload, length);
     if (type == V9X_MSG_EVENT_NOTE_REQUEST)
         return v9x_handle_event_note(conn, request_id, payload, length);
     return v9x_tools_error(conn, request_id, V9X_STATUS_INVALID_PAYLOAD,

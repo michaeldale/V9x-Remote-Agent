@@ -63,11 +63,11 @@ public sealed class V9xRelayStream : Stream
         string query = "machine=" + Uri.EscapeDataString(this.machine) + "&owner=" + Owner;
         if (!string.IsNullOrEmpty(label)) query += "&label=" + Uri.EscapeDataString(label);
         if (takeOver) query += "&replace=1";
-        Dictionary<string, object> opened = Json("open", query, new byte[0], 40);
+        DateTime deadline = DateTime.UtcNow.AddSeconds(openWaitSeconds);
+        Dictionary<string, object> opened = Json("open", query, new byte[0], Math.Max(1, Math.Min(40, openWaitSeconds)));
         session = (string)opened["session"];
         installId = (string)opened["install_id"];
         string state = (string)opened["state"];
-        DateTime deadline = DateTime.UtcNow.AddSeconds(openWaitSeconds);
         Dictionary<string, object> status = opened;
         DateTime started = DateTime.UtcNow;
         DateTime nextReport = started.AddSeconds(60);

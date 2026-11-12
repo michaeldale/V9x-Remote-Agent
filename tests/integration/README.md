@@ -50,6 +50,18 @@ and PointerPos pseudo-encodings. `vnc_stall.py <agent port> <vnc port>`
 drives the watchdog with the `TEMP\VNCSTALL.DAT` hook. It needs VNC enabled
 and running, plus `shell`, and it leaves the server stopped.
 
+`crashprb.c` (`CRASHPRB.EXE`) ends the way it is told: a NULL write (no
+arguments), `div` (divide by zero), `exit N`, `box` (an ordinary message box,
+not a fault) or `hang`, optionally after `wait N` seconds. It drives
+`wait-fault`, `exec -WaitForExit` and `close-window` (build command in its
+header). On 2026-11-06, Windows 98 SE and Windows 2000 SP4 in 86Box both
+gave the expected exit codes for NULL write, divide by zero, delayed crash,
+clean exit, message box, a quiet watch, and `-Dismiss`. Windows 98 shows the
+fault box from KERNEL32's process, titled with the module name, with the
+register dump in its Details edit control even while collapsed. Windows 2000
+(AeDebug Auto=1) shows Dr. Watson's `NotifyDialog` "Program Error", and
+closing it before its Cancel button turns into OK cancels the log.
+
 To re-run the negative file-integrity check against an existing uploaded file:
 
 ```powershell

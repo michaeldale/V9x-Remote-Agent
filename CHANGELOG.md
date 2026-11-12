@@ -2,6 +2,132 @@
 
 All notable changes to the V9x Remote Agent. Dates are in YYYY-MM-DD.
 
+## 0.17.0 (2026-11-12)
+
+Remote-help operator-friction improvements (2026-11-12).
+
+### Added
+- `wait-desktop -DismissLogon`: wait inside the guest, optionally cancel an
+  English Windows 9x startup logon dialog, and report `LogonDismissed`.
+  No credentials, provider changes or password-list changes. Unknown dialogs
+  and NT logons are left alone. Cancellation is recorded in the activity log.
+- `reboot` / `reset -DismissLogon`: after reconnect proof, cancel the logon
+  and wait for Explorer on the same connection. `-WaitSeconds` bounds each
+  phase separately. Unsupported agents are refused before power control.
+  MCP: `dismiss_logon` on the desktop wait and reboot/reset tools.
+- Protocol: `DESKTOP_WAIT_REQUEST` / response `0x0065` / `0x8065`,
+  capability `V9X_CAP_LOGON_DISMISS` `0x02000000` (Win9x only). One request
+  waits at most 60 s, like `PROCESS_WAIT`, so a caller that drops mid-wait
+  cannot hold a connection or relay session; CLI and MCP repeat it up to
+  `-WaitSeconds`.
+- Positional guest paths for `list`, `cat`, `stat`, `get` and `hash`, including
+  their aliases. Named paths remain supported; duplicate paths are rejected.
+- `reg -Set -Key <key> -Name <value> -String <text> | -Dword <n>` and
+  `reg -DeleteValue`: one value per operation, with the old value returned
+  and recorded in the activity log. Hive roots, HKLM system/security/hardware
+  branches, HKCC/HKDD and the agent's startup entries are protected. No key
+  tree deletion. New/current values are limited to 1024 bytes. MCP:
+  `v9x_reg_write` (`set_string`, `set_dword`, `delete_value`).
+- `display [-Restore]`: current versus registry mode; restore calls
+  `ChangeDisplaySettings(NULL, 0)`. `kill -RestoreDisplay` waits for the
+  process to exit before restoring. MCP: `v9x_display`, `restore_display`
+  on `v9x_kill`. If the exit wait or restore fails, the completed kill is
+  still reported (CLI: kill result plus `Display.Error`, exit 51).
+- `input -Window <title>`: select one window by literal, case-insensitive
+  title substring, foreground it and verify focus before sending input.
+  When the foreground lock refuses the switch, the agent retries once with
+  its thread attached to the current foreground input queue.
+  Missing/ambiguous/unfocusable targets are refused; losing focus stops
+  remaining actions and releases keys/buttons pressed by that batch.
+  New input replies include `ForegroundBefore`, `KeyboardWindow` (last
+  key press/typed character) and `ForegroundAfter`, with HWND, PID and title. MCP
+  input tools use `window`, also used for an optional screenshot crop.
+- Guest-side `PROCESS_WAIT` uses a real process handle in bounded chunks
+  of at most 60 seconds, reducing repeated relay process-list requests.
+  CLI/MCP use it for a PID or one exact-name match; wildcard/multiple-name
+  waits and older agents retain the existing process-list path.
+
+### Changed
+- `set-autologon.ps1` forwards `-Relay` / `-RelayServer` to every operation.
+  Its `-Dismiss` now uses cancellation through `wait-desktop -DismissLogon`
+  (requires 0.17.0+), without registry export or a foreground Enter key.
+  `-Enable` retains its explicit blank-password logon behavior.
+- Relay reconnects now use the wait's remaining budget instead of opening
+  every session with a minimum 150-second allowance. The relay's open
+  deadline includes the initial HTTP request. Guest-side waits allow
+  transport overhead separately, including the measured slow relay path.
+- Discovery's host fixture waits for an actual ready responder instead of
+  a fixed startup sleep; network waits are bounded so failure cannot hang
+  cleanup.
+
+Live-tested in 86Box. Windows 98 SE: `reset -DismissLogon` cancelled the
+startup logon dialog and reached Explorer; targeted input behind
+another window and into a minimized one; `display` and `kill -RestoreDisplay`.
+Windows 2000 SP4: targeted input past the foreground lock (including a
+minimized target after another window had keyboard input), `display`,
+`kill -RestoreDisplay`, registry set/change/delete with protected-key refusal,
+and the native process wait. The physical machine's network-password variant
+and the relay path are not yet live-tested. The original 0.15.0 process-wait
+hang has not been reproduced: the reconnect-budget defect is fixed and the
+new process wait avoids the repeated relay polling path, without claiming
+that the original incident's root cause is proven.
+
+## 0.16.0 (2026-11-06)
+
+Crash detection in one call: wait until a program exits or a fault dialog
+about it appears, and get the dialog's text back, instead of polling
+windows and processes or taking screenshots.
+
+### Added
+- **`wait-fault [-Pid <id> | -Name <image>] [-Dismiss]`**: exit 0 with
+  `Outcome = Exited` when the process ends, exit 50 with `Outcome = Fault`
+  when a fault dialog about it appears. `Fault` holds the dialog's `Title`,
+  `Message`, `Details` and `Buttons`. On Windows 9x, `Details` is the
+  register dump ("CRASHPRB caused an invalid page fault in module
+  CRASHPRB.EXE at 016f:004010e8. Registers: ..."), read without pressing
+  Details. On Windows 2000 it waits for Dr. Watson to finish its log
+  (closing the box earlier cancels the log) and gives the exception line
+  ("c0000094 (divide by zero)"). The dialog is matched by the image name in
+  its title or text as well as by owner, because Windows 9x shows it from
+  the KERNEL32 system process and Windows 2000 from Dr. Watson or CSRSS.
+  Faults are checked before exit, because the dialog outlives the process.
+  Without `-Pid`/`-Name` it watches every program until `-WaitSeconds`
+  (exit 0, `Outcome = NoFault`). `-Dismiss` closes the dialog. Alias
+  `wait-crash`. MCP: `v9x_wait_fault`.
+- **`close-window -Title <text>`**: WM_CLOSE to the one matching top-level
+  window, then wait until it is gone. It refuses the desktop, the taskbar
+  and the agent. MCP: `v9x_close_window`.
+- **`windows -Controls`**: each window's buttons, labels and edit text.
+  MCP: `v9x_windows` `controls`.
+- Protocol: `WINDOW_TEXT_REQUEST` `0x0063` / `0x8063` and
+  `WINDOW_CLOSE_REQUEST` `0x0064` / `0x8064`, capability
+  `V9X_CAP_WINDOW_TOOLS` `0x01000000`.
+- `tests\integration\crashprb.c`: a program that crashes (NULL write,
+  divide by zero), exits, shows a message box or hangs on request.
+
+### Changed
+- **`exec -WaitForExit` returns on a crash.** A crashed program stays alive
+  while its fault dialog is up, so the wait used to sit out `-WaitSeconds`
+  (an hour by default). On a 0.16.0+ agent it uses the `wait-fault` probe:
+  exit 50 with `Outcome` and `Fault`, and it takes `-Dismiss` (MCP
+  `wait_for_exit` sets `result: "fault"` and takes `dismiss`). Older agents
+  wait as before.
+
+Tested on Windows 98 SE and Windows 2000 SP4 in 86Box: NULL write, divide
+by zero, a delayed crash, clean exit, an ordinary message box (not a
+fault), a quiet watch, and `-Dismiss` leaving no dialog behind.
+
+## 0.15.1 (2026-11-06)
+
+### Fixed
+- **`update -Relay` replaced only the agent.** Its version check and the
+  replacement of `V9XVNC.EXE` and `SETUP.EXE` ran as inner v9xctl calls
+  that dropped `-Relay` and went to the local default port, so on
+  remote-help machines VNC and the tray's Settings page stayed on the old
+  version ("WARNING: V9XVNC.EXE was not updated: Agent at
+  127.0.0.1:9869 is unreachable"). The inner calls now use the same
+  relay machine and server. Host-side only; the guest agent is unchanged.
+
 ## 0.15.0 (2026-11-06)
 
 What a tester at the machine can see: a chat that survives a reboot, and a

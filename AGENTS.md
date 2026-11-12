@@ -38,21 +38,24 @@ Nothing requires clicking inside the emulator.
 | `hash` | `-Path`, optional `-Source` | Size, CRC32, SHA-256 in the guest; with `-Source`, `Matches` against a local file (0.13.0+) |
 | `delete` | `-Path`, `-Recurse`, `-Force` | Delete a file or directory; refuses roots, WINDOWS, SYSTEM, `C:\V9XREMOTE` (0.13.0+) |
 | `ps` | optional `-Name` | Processes; marks the agent and its exec jobs with their request id (0.13.0+) |
-| `kill` | `-Pid` or `-Name` | Terminate a process (e.g. a stuck exec job); refuses the agent and Windows core processes (0.13.0+) |
-| `reg` | `-Key HKLM\...` | Subkeys and values of one registry key, read-only (0.13.0+) |
+| `kill` | `-Pid` or `-Name`, `-RestoreDisplay` | Terminate a process; refuses the agent and Windows core processes (0.13.0+); optionally wait for exit and restore the saved display mode (0.17.0+) |
+| `reg` | `-Key`, optional `-Set -Name -String\|-Dword` or `-DeleteValue -Name` | Read a key (0.13.0+); change one value with its old value returned/logged and protected-key checks (0.17.0+) |
+| `display` | optional `-Restore` | Current versus saved registry mode; optionally restore the saved desktop mode (0.17.0+) |
 | `wait-file` | `-Path`, `-WaitSeconds`, `-Gone`, `-StableMs`, `-Match` | Wait until a guest file exists (or is gone, or stops growing; any agent), or has a line containing `-Match` text (0.13.0+) |
 | `wait-process` | `-Pid` or `-Name`, `-WaitSeconds` (default 3600) | Wait until a guest process has exited: a detached benchmark or installer is done (0.13.0+) |
+| `wait-fault` | optional `-Pid` or `-Name`, `-WaitSeconds` (default 3600), `-Dismiss` | Wait until a process exits (exit 0) **or crashes**: a fault dialog about it appears (exit 50, with the dialog's `Message` and `Details`, e.g. the 9x register dump). No `-Pid`/`-Name`: watch for any program's fault until the deadline (exit 0, `Outcome = NoFault`). `-Dismiss` closes the dialog (0.16.0+) |
 | `note` | `-Text` | Add `Developer: <text>` to the tester's activity log (`C:\V9XREMOTE\EVENTS.LOG`, tray > Activity log) before a step they should know about (0.15.0+) |
-| `windows` | optional `-Title` | Visible top-level windows: title, class, position, size, pid (0.13.0+) |
+| `windows` | optional `-Title`, `-Controls` | Visible top-level windows: title, class, position, size, pid (0.13.0+); `-Controls` adds each window's buttons, labels and edit text, so you can read a dialog without a screenshot (0.16.0+) |
 | `wait-window` | `-Title`, `-WaitSeconds`, `-Gone` | Wait until a window whose title contains the text is shown (or closed) (0.13.0+) |
+| `close-window` | `-Title`, `-WaitSeconds` (default 10) | Close the one window whose title contains the text (WM_CLOSE) and wait until it is gone; refuses the desktop, the taskbar and the agent (0.16.0+) |
 | `download` | `-Url`, `-Destination` | Guest fetches an `http://` URL to a guest path (http only, CRC32-verified) |
 | `update` | `-Source`, `-WaitSeconds` | Upgrade the agent from an install-package folder: hot, no reboot; agents before 0.6.0 get the staged route with one reboot (`Mode = Staged`, v9xctl 0.9.1+) |
-| `reboot` | `-JobId`, `-WaitSeconds` | Reboot with proof (see below) |
-| `reset` | `-JobId`, `-WaitSeconds` | Win9x guest whose restart hangs: flush, hardware reset (CF9h), same proof as `reboot` (agent 0.10.0+) |
+| `reboot` | `-JobId`, `-WaitSeconds`, `-DismissLogon` | Reboot with proof (see below); optional logon cancellation and desktop wait (0.17.0+ Win9x) |
+| `reset` | `-JobId`, `-WaitSeconds`, `-DismissLogon` | Win9x guest whose restart hangs: flush, hardware reset (CF9h), same proof as `reboot` (agent 0.10.0+); optional logon cancellation and desktop wait (0.17.0+) |
 | `shutdown` | `-JobId` | Controlled shutdown |
-| `wait-desktop` | `-WaitSeconds` | Block until Explorer's desktop is ready |
+| `wait-desktop` | `-WaitSeconds`, `-DismissLogon` | Block until Explorer is ready; optionally cancel a recognized Win9x startup logon (0.17.0+) without changing logon settings |
 | `screenshot` | `-OutFile` (alias of `-Destination`), `-Path`, `-Window <title>` or `-Region x,y,w,h`, `-Scale`, `-Gray` | Guest screen capture; saved as PNG/JPEG/GIF/TIFF/BMP by the output file extension; window/region/scale/gray keep it small |
-| `input` | `-Sequence`, optional `-OutFile`/`-SettleMs` (+ `-Region`/`-Scale`/`-Gray`) | Inject mouse/keyboard: move, click, drag, wheel, key/hotkey, type, delay; with `-OutFile`, settle and screenshot in the same call |
+| `input` | `-Sequence`, optional `-Window`, `-OutFile`/`-SettleMs` (+ `-Region`/`-Scale`/`-Gray`) | Inject mouse/keyboard; with `-OutFile`, settle and screenshot; 0.17.0+ supports verified window focus and foreground reporting |
 | `vnc` | `status`, `start` or `stop` | The guest's VNC server for a person (only where SETUP.EXE enabled it; agent package 0.11.0+) |
 
 Any verb but `discover` and `vnc` also takes `-Relay M-XXXXXX` to drive a
@@ -67,6 +70,14 @@ once, so a `screenshot`, `windows` or `cat` works while a long wait runs
 exit 43, "execution active"). Older agents take one: a second `-Relay`
 call exits 21 ("busy") instead of ending the first. Recover a stuck call
 with `-RelayTakeOver` (MCP `relay_take_over`). See [docs/remote-help.md](docs/remote-help.md).
+
+`list`, `cat`, `stat`, `get` and `hash` also accept a positional guest path,
+including aliases (`ls C:\V9XDIAG`, `cat C:\V9XREMOTE\EVENTS.LOG`). For
+`get` the positional path is `-Source`; its local `-Destination` stays explicit.
+With `-DismissLogon`, reboot/reset wait for Explorer after reconnect proof;
+`-WaitSeconds` bounds each phase separately. Cancellation only recognizes
+English Win9x startup password dialogs; unknown dialogs and NT are refused
+or time out. MCP uses `dismiss_logon` on the corresponding tools.
 
 **Tell the person at the machine what you are doing (agent 0.15.0+).** The
 agent keeps a plain-English activity log the owner opens from the tray
@@ -119,7 +130,9 @@ agent, keep using `screenshot` and `input`.
 | 46 | `reg` failure (key not found) |
 | 47 | `wait-file` / `-WaitForFile` deadline passed |
 | 48 | `wait-window` / `-WaitForWindow` / `screenshot -Window`: no such window, or the deadline passed |
-| 49 | `wait-process` / `exec -WaitForExit`: the process still runs at the deadline |
+| 49 | `wait-process` / `wait-fault` / `exec -WaitForExit`: the process still runs at the deadline |
+| 50 | `wait-fault` / `exec -WaitForExit` (agent 0.16.0+): the program crashed; the result's `Fault` holds the dialog text |
+| 51 | Display report/restore failed (0.17.0+) |
 
 Treat 20 as "the VM is off, still booting, or the forward is missing". Do not
 retry it in a loop of your own: add `-WaitForAgent <seconds>` and v9xctl
@@ -142,6 +155,8 @@ or too long (slow), and each extra call costs a connection.
 | a program to write its result file | `exec ... -WaitForFile <path>` or `wait-file -Path <path> [-StableMs 1000]` |
 | a report file to say it is finished (the file exists from the start) | `wait-file -Path <path> -Match "Complete=yes"` |
 | a program (benchmark, installer) to exit | `exec -Application <exe> -WaitForExit`, or `wait-process -Pid <exec's Pid>` / `-Name <image>` |
+| a test program to finish **or crash** | `exec -Application <exe> -WaitForExit -Dismiss` (0.16.0+: exit 50 with the fault text), or `wait-fault -Pid <exec's Pid> -Dismiss` |
+| to know nothing crashed during a run | `wait-fault -WaitSeconds N` (no `-Pid`/`-Name`: any program's fault dialog) |
 | each progress line of a log as it is written | `cat -Path <log> -Follow [-Match <text>] [-Until <text>]` |
 | a GUI step to repaint | `input -Sequence ... -OutFile shot.png` (`-SettleMs`, default 500) |
 
@@ -178,6 +193,15 @@ From the Bash tool, run it through `powershell.exe -NoProfile
 -ExecutionPolicy Bypass -File scripts/v9xctl.ps1 ...` with the same
 arguments. Exit 0 means the condition holds; 47/49 mean the deadline
 passed (the job is still running: wait again, do not assume it failed).
+Exit 50 (agent 0.16.0+) means it crashed: `Fault.Message` is what the
+dialog said and `Fault.Details` the Windows 9x register dump ("caused an
+invalid page fault in module X at 016f:004010e8"). On Windows 2000,
+Dr. Watson's box only says the program "has generated errors"; v9xctl
+waits for it to finish its log (closing it earlier cancels the log) and
+puts the exception line in `Details` ("c0000005 (access violation)"). The
+full dump is in that log (`C:\Documents and Settings\All Users\Documents\DrWatson\drwtsn32.log`).
+A crashed program stays in `ps` until its dialog is closed, and killing it
+leaves the dialog up: pass `-Dismiss`, or `close-window -Title <title>`.
 
 To watch progress rather than only the end, stream the log: `cat -Path
 <log> -Follow -Until "<final line text>"` prints each new line as it is

@@ -12,6 +12,92 @@ import zlib
 import v9x_mcp
 
 
+class DesktopWaitTests(unittest.TestCase):
+    def test_guest_wait_protocol(self):
+        client = v9x_mcp.V9xClient.__new__(v9x_mcp.V9xClient)
+        client.hello = {"capabilities": v9x_mcp.CAP_LOGON_DISMISS, "build_id": "fixture"}
+        client.timeout = 2
+        sent, timeouts = [], []
+        class Socket:
+            def settimeout(self, value):
+                timeouts.append(value)
+        client.sock = Socket()
+        def request(cap, name, msg, payload, response):
+            client.require(cap, name)
+            sent.append((msg, payload, response))
+            return struct.pack("<6I", 3, 7, 1024, 768, 0, 100)
+        client.tool_request = request
+        result = client.wait_desktop(5, True)
+        self.assertEqual(sent, [(0x65, struct.pack("<II", 1, 5000), 0x8065)])
+        self.assertTrue(result["desktop_ready"] and result["logon_dismissed"])
+        self.assertEqual(result["boot_counter"], 7)
+        self.assertEqual(timeouts, [35, 2])
+
+    def test_long_wait_is_chunked_to_guest_limit(self):
+        # The guest caps one DESKTOP_WAIT at 60 s; the host loops to its own
+        # deadline and keeps a dismissal reported by an earlier chunk.
+        client = v9x_mcp.V9xClient.__new__(v9x_mcp.V9xClient)
+        client.hello = {"capabilities": v9x_mcp.CAP_LOGON_DISMISS, "build_id": "fixture"}
+        client.timeout = 2
+        class Socket:
+            def settimeout(self, value):
+                pass
+        client.sock = Socket()
+        clock, sent = [0.0], []
+        def request(cap, name, msg, payload, response):
+            ms = struct.unpack("<II", payload)[1]
+            sent.append(ms)
+            clock[0] += ms / 1000.0
+            flags = 2 if len(sent) == 1 else (1 if len(sent) == 3 else 0)
+            return struct.pack("<6I", flags, 7, 1024, 768, 0, ms)
+        client.tool_request = request
+        old = v9x_mcp.time.monotonic
+        v9x_mcp.time.monotonic = lambda: clock[0]
+        try:
+            result = client.wait_desktop(150, True)
+        finally:
+            v9x_mcp.time.monotonic = old
+        self.assertEqual(sent, [60000, 60000, 30000])
+        self.assertTrue(result["desktop_ready"] and result["logon_dismissed"])
+        self.assertEqual(result["waited_ms"], 150000)
+
+    def test_kill_reports_kill_when_restore_fails(self):
+        class Client:
+            hello = {"capabilities": 0xFFFFFFFF}
+            def __enter__(self): return self
+            def __exit__(self, *exc): return False
+            def require(self, cap, name): pass
+            def kill(self, pid): return {"pid": pid, "name": "GAME.EXE"}
+            def wait_process(self, seconds, pid):
+                raise v9x_mcp.V9xError("pid %d still running after 10 s" % pid)
+        handler = v9x_mcp.ToolHandler.__new__(v9x_mcp.ToolHandler)
+        handler.connect = lambda *a, **k: Client()
+        with self.assertRaises(v9x_mcp.V9xError) as caught:
+            handler.v9x_kill({"pid": 123, "restore_display": True})
+        self.assertIn("pid 123 was killed", str(caught.exception))
+        self.assertIn("GAME.EXE", str(caught.exception))
+
+    def test_reboot_cancels_only_after_matching_proof(self):
+        calls = []
+        class Candidate:
+            def __init__(self, boot, token):
+                self.hello = {"boot_counter": boot, "pending_job": token}
+            def wait_desktop(self, timeout, dismiss_logon):
+                calls.append((self.hello["pending_job"], timeout, dismiss_logon))
+                return {"desktop_ready": True, "logon_dismissed": True}
+            def close(self):
+                calls.append("close")
+        candidates = [Candidate(1, "job"), Candidate(2, "wrong"), Candidate(2, "job")]
+        old_sleep = v9x_mcp.time.sleep
+        v9x_mcp.time.sleep = lambda _s: None
+        try:
+            result = v9x_mcp.wait_for_reboot(None, None, 1, "job", 5,
+                connect=lambda _left: candidates.pop(0), dismiss_logon=True)
+        finally:
+            v9x_mcp.time.sleep = old_sleep
+        self.assertTrue(result["logon_dismissed"])
+        self.assertEqual(calls, ["close", "close", ("job", 5, True), "close"])
+
 class StringCodecTests(unittest.TestCase):
     def test_round_trip(self):
         encoded = v9x_mcp.encode_string("C:\\V9XREMOTE")
@@ -305,6 +391,62 @@ class ToolCodecTests(unittest.TestCase):
                          ("Setup", "#32770", -4, 10))
         self.assertEqual((window["width"], window["height"], window["foreground"]), (504, 340, True))
 
+    def window_text_payload(self, handle, pid, title, controls):
+        payload = struct.pack("<4I", handle, pid, len(controls), 0)
+        payload += self.string("#32770") + self.string(title)
+        for child, control_id, visible, cls, text in controls:
+            payload += struct.pack("<III", child, control_id, 1 if visible else 0)
+            payload += self.string(cls) + self.string(text)
+        return payload
+
+    WIN98_FAULT = [
+        (0x10, 1, True, "Button", "&Close"),
+        (0x11, 5, False, "Button", "De&bug"),
+        (0x12, 8, True, "Edit", "CRASHPRB caused an invalid page fault in\r\nmodule CRASHPRB.EXE at 016f:004010e8."),
+        (0x13, 3, True, "Static", "This program has performed an illegal operation and will be shut down."),
+    ]
+
+    def test_window_text_and_fault_classification(self):
+        parsed = v9x_mcp.parse_window_text(self.window_text_payload(0x1B8, 9, "Crashprb", self.WIN98_FAULT))
+        self.assertEqual((parsed["handle"], parsed["pid"], parsed["title"], len(parsed["controls"])),
+                         (0x1B8, 9, "Crashprb", 4))
+        fault = v9x_mcp.classify_fault_dialog(parsed)
+        self.assertTrue(fault["is_fault"])
+        self.assertEqual(fault["buttons"], ["Close"])
+        self.assertTrue(fault["details"].startswith("CRASHPRB caused an invalid page fault in\nmodule"))
+        self.assertTrue(v9x_mcp.fault_names_target(fault["all_text"], {"CRASHPRB"}))
+        self.assertFalse(v9x_mcp.fault_names_target(fault["all_text"], {"CRASH"}))
+        box = v9x_mcp.classify_fault_dialog(v9x_mcp.parse_window_text(self.window_text_payload(
+            1, 9, "CRASHPRB", [(2, 2, True, "Static", "An ordinary message, not a fault.")])))
+        self.assertFalse(box["is_fault"])
+        with self.assertRaises(v9x_mcp.V9xError):
+            v9x_mcp.parse_window_text(self.window_text_payload(1, 2, "x", [])[:-1])
+
+    def test_wait_fault_reports_a_dialog_owned_by_another_process(self):
+        # 9x: the dialog belongs to KERNEL32 (pid 1), not the crashed pid 42.
+        closed = []
+        windows = [[{"handle": 0x1B8, "pid": 1, "class": "#32770", "title": "Crashprb"}], []]
+        client = self.fake_client(
+            processes=lambda: [{"pid": 42, "name": "CRASHPRB.EXE"}],
+            windows=lambda: windows.pop(0) if len(windows) > 1 else windows[0],
+            window_text=lambda h: v9x_mcp.parse_window_text(
+                self.window_text_payload(h, 1, "Crashprb", self.WIN98_FAULT)),
+            close_window=lambda h: closed.append(h))
+        result = client.wait_fault(5, pid=42, dismiss=True)
+        self.assertEqual((result["outcome"], result["dismissed"], closed), ("fault", True, [0x1B8]))
+        self.assertIn("illegal operation", result["fault"]["message"])
+        self.assertNotIn("all_text", result["fault"])
+
+    def test_wait_fault_exits_and_any_mode_times_out_quietly(self):
+        client = self.fake_client(processes=lambda: [], windows=lambda: [])
+        self.assertEqual(client.wait_fault(5, name="GONE.EXE")["outcome"], "exited")
+        original = v9x_mcp.poll_pause
+        v9x_mcp.poll_pause = lambda _started: None
+        try:
+            self.assertEqual(client.wait_fault(0)["outcome"], "no_fault")
+        finally:
+            v9x_mcp.poll_pause = original
+
     def test_connect_retries_a_connection_dropped_before_hello(self):
         attempts = []
 
@@ -343,13 +485,14 @@ class ToolCodecTests(unittest.TestCase):
     def test_tools_are_listed(self):
         names = {tool["name"] for tool in v9x_mcp.TOOLS}
         for name in ("v9x_read_text", "v9x_hash", "v9x_delete", "v9x_ps", "v9x_kill", "v9x_reg_query",
-                     "v9x_windows", "v9x_wait_file", "v9x_wait_process", "v9x_note"):
+                     "v9x_windows", "v9x_wait_file", "v9x_wait_process", "v9x_note",
+                     "v9x_wait_fault", "v9x_close_window"):
             self.assertIn(name, names)
             self.assertTrue(callable(getattr(v9x_mcp.ToolHandler, name)))
 
     def fake_client(self, **methods):
         client = v9x_mcp.V9xClient.__new__(v9x_mcp.V9xClient)
-        client.hello = {"capabilities": 0xFFFFFFFF, "build_id": "test"}
+        client.hello = {"capabilities": 0x01FFFFFF, "build_id": "test"}  # fixture models 0.16 operations
         for name, method in methods.items():
             setattr(client, name, method)
         return client
@@ -443,7 +586,7 @@ class JsonRpcTests(unittest.TestCase):
         self.assertIn("v9x_vnc", names)
         self.assertIn("v9x_relay_machines", names)
         self.assertIn("v9x_chat", names)
-        self.assertEqual(len(tools), 38)
+        self.assertEqual(len(tools), 42)
         # Every tool that talks to an agent can go through the relay.
         for tool in tools:
             if tool["name"] in ("v9x_discover", "v9x_relay_machines", "v9x_chat"):

@@ -84,8 +84,8 @@ unsigned long v9x_capabilities(const V9xAgentState *machine)
 {
     unsigned long caps = V9X_CAPABILITIES;
     if (!machine->allow_dos_vm && !v9x_platform_is_nt()) caps &= ~V9X_CAP_EXEC_SHELL;
-    if (v9x_platform_is_nt()) caps &= ~V9X_CAP_HARD_RESET;
-    if (!v9x_process_supported()) caps &= ~V9X_CAP_PROCESS;
+    if (v9x_platform_is_nt()) caps &= ~(V9X_CAP_HARD_RESET | V9X_CAP_LOGON_DISMISS);
+    if (!v9x_process_supported()) caps &= ~(V9X_CAP_PROCESS | V9X_CAP_PROCESS_WAIT);
     return caps;
 }
 
