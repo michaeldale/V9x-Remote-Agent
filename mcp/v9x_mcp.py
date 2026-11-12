@@ -1239,8 +1239,12 @@ class V9xClient:
             # must not hold its connection); loop until our own deadline.
             started = time.monotonic()
             dismissed = False
+            first = True
             while True:
-                elapsed_ms = int((time.monotonic() - started) * 1000)
+                # The first request carries the whole budget (capped); only
+                # later chunks subtract time already spent.
+                elapsed_ms = 0 if first else int((time.monotonic() - started) * 1000)
+                first = False
                 ms = max(0, min(60000, int(wait_seconds * 1000) - elapsed_ms))
                 try:
                     margin = 120.0 if isinstance(self.sock, RelaySession) else 30.0

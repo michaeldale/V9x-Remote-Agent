@@ -574,8 +574,13 @@ function Wait-V9xGuestDesktop {
     # its connection), so loop until this caller's own deadline.
     $clock = [Diagnostics.Stopwatch]::StartNew()
     $dismissed = $false
+    $first = $true
     for (;;) {
-        $ms = [uint32][Math]::Max(0, [Math]::Min(60000, ($WaitSeconds * 1000) - $clock.ElapsedMilliseconds))
+        # The first request carries the whole budget (capped); only later
+        # chunks subtract time already spent.
+        $spent = if ($first) { 0 } else { $clock.ElapsedMilliseconds }
+        $first = $false
+        $ms = [uint32][Math]::Max(0, [Math]::Min(60000, ($WaitSeconds * 1000) - $spent))
         $payload = [byte[]]([BitConverter]::GetBytes([uint32][bool]$DismissLogon) + [BitConverter]::GetBytes($ms))
         $savedTimeout = $Stream.ReadTimeout
         try {
