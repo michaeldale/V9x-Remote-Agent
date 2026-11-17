@@ -743,12 +743,15 @@ static DWORD WINAPI v9x_tray_worker(LPVOID parameter)
     int want_busy;
     HICON shown_icon;
     HICON want_icon;
+    int flash;
 
     /* The owner window is created here, not by v9x_tray_start: this is the
        only thread in the agent that pumps messages, and a window belongs to
        the thread that created it. The main thread spends its life blocked in
        accept(). */
     if (!v9x_tray_create_window(state)) return 0ul;
+
+    flash = state->tray_flash;
 
     for (;;) {
         while (FindWindowA("Shell_TrayWnd", 0) == 0) v9x_tray_wait(1000ul);
@@ -807,7 +810,7 @@ static DWORD WINAPI v9x_tray_worker(LPVOID parameter)
                     }
                 }
                 was_busy = 1;
-                want_busy = phase;
+                want_busy = flash ? phase : 0;
             } else {
                 was_busy = 0;
                 phase = 0;
@@ -822,8 +825,15 @@ static DWORD WINAPI v9x_tray_worker(LPVOID parameter)
                 continue;
             }
             if (since_refresh >= V9X_TRAY_REFRESH_MS) {
+                char fresh[sizeof(address)];
+
                 since_refresh = 0ul;
-                v9x_tray_address(state, address);
+                v9x_tray_address(state, fresh);
+                if (!flash && want_icon == shown_icon &&
+                    lstrcmpA(fresh, address) == 0) {
+                    continue;
+                }
+                lstrcpyA(address, fresh);
             }
             if (FindWindowA("Shell_TrayWnd", 0) == 0 ||
                 !v9x_tray_notify(state, NIM_MODIFY, address, want_icon)) {

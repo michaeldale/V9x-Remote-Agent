@@ -38,6 +38,8 @@ static void v9x_load_network_config(V9xAgentState *state)
         GetPrivateProfileIntA("agent", "allow_dos_vm", 1, v9x_config_path) != 0;
     state->discovery =
         GetPrivateProfileIntA("agent", "discovery", 0, v9x_config_path) != 0;
+    state->tray_flash =
+        GetPrivateProfileIntA("agent", "tray_flash", 1, v9x_config_path) != 0;
     {
         UINT seconds = GetPrivateProfileIntA("agent", "idle_timeout", 300,
                                              v9x_config_path);

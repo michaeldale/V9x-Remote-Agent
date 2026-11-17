@@ -110,6 +110,11 @@ typedef struct V9xAgentState {
        client that vanished without a FIN or RST pinned a connection slot
        and kept the tray icon busy forever. */
     DWORD idle_timeout_ms;
+    /* AGENT.INI [agent] tray_flash (default 1). When 0 the tray icon does
+       not show activity, and the periodic refresh is sent only when the
+       address changed. Each icon change is a taskbar repaint, which on a
+       slow-bus display costs more than the command being shown. */
+    int tray_flash;
     /* Activity picture for the tray icon. `active_connections` counts claimed
        connection slots; `activity` is bumped for every frame received or sent,
        and only ever compared for change, so wrap-around is harmless. */
