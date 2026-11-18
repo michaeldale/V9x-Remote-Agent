@@ -75,6 +75,7 @@ $sources = @(
     "src\guest-dos\net.c",
     "src\guest-dos\serve.c",
     "src\guest-dos\exec_dos.c",
+    "src\guest-dos\hw_dos.c",
     "src\guest-dos\files_dos.c",
     "src\guest-dos\main.c"
 )

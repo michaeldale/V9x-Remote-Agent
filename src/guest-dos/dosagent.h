@@ -22,11 +22,13 @@
    on its capability bit, so a client that asks for a dropped feature (cancel,
    screenshot, input, power, update, HTTP download) is refused cleanly. Here:
    the info/ping handshake, both exec modes, detach (as a handoff to
-   V9XLOOP.BAT, see V9X_DOS_RUNJOB), and file read/write. */
+   V9XLOOP.BAT, see V9X_DOS_RUNJOB), file read/write, and the DOS-only probes
+   (hw_dos.c). */
 #define V9X_DOS_CAPABILITIES (V9X_CAP_INFO | V9X_CAP_PING | \
                               V9X_CAP_EXEC_DIRECT | V9X_CAP_EXEC_SHELL | \
                               V9X_CAP_FILE_READ | V9X_CAP_FILE_WRITE | \
-                              V9X_CAP_INSTALL_ID | V9X_CAP_EXEC_DETACH)
+                              V9X_CAP_INSTALL_ID | V9X_CAP_EXEC_DETACH | \
+                              V9X_CAP_DOS_HW_ACCESS | V9X_CAP_DOS_CONSOLE)
 
 /* Pseudo winsock-version reported in HELLO/INFO so a host can tell a DOS agent
    apart from a Win9x one (0x20 = "Watt-32", not a real Winsock number). */
@@ -46,6 +48,26 @@
    runs the job with the agent's memory freed, then starts the agent again. */
 #define V9X_DOS_RUNJOB    "C:\\V9XREMOT\\RUNJOB.BAT"
 #define V9X_DOS_EXIT_HANDOFF 3
+#define V9X_DOS_REBOOT_COM "C:\\V9XREMOT\\TEMP\\REBOOT.COM"
+
+/* Probe messages (hw_dos.c), DOS agent only; 0x00B0-0x00B6 are unused by the
+   shared protocol. Requests are 0x00Bx, responses 0x80Bx. */
+#define V9X_CAP_DOS_HW_ACCESS  0x40000000ul  /* memory and port read/write */
+#define V9X_CAP_DOS_CONSOLE    0x80000000ul  /* screen, keys, reboot */
+#define V9X_MSG_MEM_READ_REQUEST    0x00B0u
+#define V9X_MSG_MEM_READ_RESPONSE   0x80B0u
+#define V9X_MSG_MEM_WRITE_REQUEST   0x00B1u
+#define V9X_MSG_MEM_WRITE_RESPONSE  0x80B1u
+#define V9X_MSG_IO_IN_REQUEST       0x00B2u
+#define V9X_MSG_IO_IN_RESPONSE      0x80B2u
+#define V9X_MSG_IO_OUT_REQUEST      0x00B3u
+#define V9X_MSG_IO_OUT_RESPONSE     0x80B3u
+#define V9X_MSG_SCREEN_REQUEST      0x00B4u
+#define V9X_MSG_SCREEN_RESPONSE     0x80B4u
+#define V9X_MSG_KEYS_REQUEST        0x00B5u
+#define V9X_MSG_KEYS_RESPONSE       0x80B5u
+#define V9X_MSG_REBOOT_DOS_REQUEST  0x00B6u
+#define V9X_MSG_REBOOT_DOS_RESPONSE 0x80B6u
 
 /* 8.3-safe staging names, created adjacent to the upload destination so the
    final rename stays on one volume. Single upload at a time, so fixed names are
@@ -79,6 +101,7 @@ typedef struct V9xDos {
     unsigned short listen_port;
     char allowed_client[16];    /* dotted-quad, empty = allow any */
     int handoff;                /* a detached job is in RUNJOB.BAT: exit */
+    int reboot;                 /* after the reply: 1 cold, 2 warm restart */
     char install_id[V9X_INSTALL_ID_SIZE]; /* AGENT.INI install_id */
     V9xDosWriteState write_state;
     unsigned char payload[V9X_MAX_PAYLOAD];
@@ -106,6 +129,13 @@ int v9x_send_frame(V9xDos *dos, unsigned short type, unsigned long request_id,
 int v9x_send_error(V9xDos *dos, unsigned long request_id,
                    unsigned long status, const char *detail);
 void v9x_serve_client(V9xDos *dos);
+
+/* hw_dos.c - memory, port, screen, key and reboot probes */
+int v9x_is_hw_message(unsigned short type);
+int v9x_handle_hw_message(V9xDos *dos, unsigned short type,
+                          unsigned long request_id,
+                          const unsigned char *payload, unsigned long length);
+void v9x_dos_reboot(int warm);
 
 /* exec_dos.c - synchronous command execution */
 int v9x_dos_execute(V9xDos *dos, unsigned long request_id,

@@ -72,6 +72,12 @@ int main(void)
             v9x_net_close(client);
             g_dos.socket = -1;
             v9x_log_line("client-disconnected");
+            if (g_dos.reboot) {
+                v9x_net_close(listener);
+                v9x_net_drain(1000ul);
+                v9x_log_line("reboot");
+                v9x_dos_reboot(g_dos.reboot == 2);
+            }
             if (g_dos.handoff) {
                 v9x_net_close(listener);
                 v9x_net_drain(1000ul);

@@ -264,6 +264,11 @@ void v9x_serve_client(V9xDos *dos)
             v9x_write_u32(dos->response + 4, 0ul);
             if (!v9x_send_frame(dos, V9X_MSG_CANCEL_RESPONSE,
                                 header.request_id, dos->response, 8ul)) return;
+        } else if (v9x_is_hw_message(header.type)) {
+            if (!v9x_handle_hw_message(dos, header.type, header.request_id,
+                                       dos->payload,
+                                       header.payload_length)) return;
+            if (dos->reboot) return;
         } else if (v9x_is_file_message(header.type)) {
             if (!v9x_handle_file_message(dos, header.type, header.request_id,
                                          dos->payload,
