@@ -1,6 +1,10 @@
 /* Hardware probes for the DOS agent: memory, I/O ports, the text screen, the
-   BIOS keyboard buffer and reboot - COMrade's command set over the V9x
-   connection. They run between programs, while the agent is in the foreground.
+   BIOS keyboard buffer and reboot. They run between programs, while the agent
+   is in the foreground.
+
+   The command set, and the reboot sequence in v9x_dos_reboot(), follow Kevin
+   Moonlight's COMrade (https://github.com/yyzkevin/COMrade, MIT licence), which
+   does the same over a serial line; no code is copied from it.
 
    DOS/4GW maps the first megabyte one to one into the flat data segment, so a
    linear address below 1 MB (plus the HMA) is used directly as a pointer. */
@@ -167,9 +171,10 @@ static int v9x_keys(V9xDos *dos, unsigned long request_id,
 }
 
 /* The reset vector is real-mode code, so the restart runs as a small real-mode
-   .COM child: COMrade's OP_REBOOT steps. 1234h at 40:72h makes it a warm
-   start; FEh to port 64h pulses an AT keyboard controller's reset line (an XT
-   has none); the far jump to FFFF:0000 restarts the BIOS either way. */
+   .COM child, with the steps of COMrade's do_reboot(). 1234h at 40:72h makes
+   it a warm start; FEh to port 64h pulses an AT keyboard controller's reset
+   line (an XT has none); the far jump to FFFF:0000 restarts the BIOS either
+   way. */
 void v9x_dos_reboot(int warm)
 {
     static unsigned char code[] = {
