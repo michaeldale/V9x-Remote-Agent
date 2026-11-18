@@ -20,12 +20,13 @@
 
 /* Capabilities this DOS build advertises in HELLO/INFO. The host gates every op
    on its capability bit, so a client that asks for a dropped feature (cancel,
-   detach, screenshot, input, power, update, HTTP download) is refused cleanly.
-   Only the info/ping handshake, both exec modes, and file read/write are here. */
+   screenshot, input, power, update, HTTP download) is refused cleanly. Here:
+   the info/ping handshake, both exec modes, detach (as a handoff to
+   V9XLOOP.BAT, see V9X_DOS_RUNJOB), and file read/write. */
 #define V9X_DOS_CAPABILITIES (V9X_CAP_INFO | V9X_CAP_PING | \
                               V9X_CAP_EXEC_DIRECT | V9X_CAP_EXEC_SHELL | \
                               V9X_CAP_FILE_READ | V9X_CAP_FILE_WRITE | \
-                              V9X_CAP_INSTALL_ID)
+                              V9X_CAP_INSTALL_ID | V9X_CAP_EXEC_DETACH)
 
 /* Pseudo winsock-version reported in HELLO/INFO so a host can tell a DOS agent
    apart from a Win9x one (0x20 = "Watt-32", not a real Winsock number). */
@@ -39,6 +40,12 @@
 #define V9X_DOS_BOOT      "C:\\V9XREMOT\\BOOT.DAT"
 #define V9X_DOS_LOG       "C:\\V9XREMOT\\AGENT.LOG"
 #define V9X_DOS_EXEC_OUT  "C:\\V9XREMOT\\TEMP\\OUT.TMP"
+
+/* A detached exec cannot run beside the agent: DOS has one foreground program.
+   The agent writes the job here and exits with V9X_DOS_EXIT_HANDOFF; V9XLOOP.BAT
+   runs the job with the agent's memory freed, then starts the agent again. */
+#define V9X_DOS_RUNJOB    "C:\\V9XREMOT\\RUNJOB.BAT"
+#define V9X_DOS_EXIT_HANDOFF 3
 
 /* 8.3-safe staging names, created adjacent to the upload destination so the
    final rename stays on one volume. Single upload at a time, so fixed names are
@@ -71,6 +78,7 @@ typedef struct V9xDos {
     unsigned long start_ms;     /* v9x_dos_now_ms() at agent start */
     unsigned short listen_port;
     char allowed_client[16];    /* dotted-quad, empty = allow any */
+    int handoff;                /* a detached job is in RUNJOB.BAT: exit */
     char install_id[V9X_INSTALL_ID_SIZE]; /* AGENT.INI install_id */
     V9xDosWriteState write_state;
     unsigned char payload[V9X_MAX_PAYLOAD];
@@ -88,6 +96,7 @@ int v9x_net_recv_exact(int sock, unsigned char *target, unsigned long length);
 int v9x_net_send_exact(int sock, const unsigned char *source,
                        unsigned long length);
 void v9x_net_close(int sock);
+void v9x_net_drain(unsigned long ms);   /* run the stack for ms after a close */
 unsigned long v9x_net_local_ip(void); /* configured IP, host byte order */
 unsigned long v9x_net_inet_addr(const char *text); /* network order, or -1 */
 

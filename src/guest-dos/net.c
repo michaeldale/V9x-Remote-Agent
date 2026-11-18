@@ -97,6 +97,14 @@ void v9x_net_close(int sock)
     if (sock >= 0) close_s(sock);
 }
 
+/* Keep the stack running after a close so the last reply and the FIN leave
+   before the program exits; sock_exit() at exit aborts open connections. */
+void v9x_net_drain(unsigned long ms)
+{
+    unsigned long start = v9x_dos_now_ms();
+    while (v9x_dos_now_ms() - start < ms) tcp_tick(NULL);
+}
+
 unsigned long v9x_net_local_ip(void)
 {
     /* gethostid() returns the configured local IP in host byte order. */

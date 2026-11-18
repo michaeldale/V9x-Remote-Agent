@@ -254,6 +254,7 @@ void v9x_serve_client(V9xDos *dos)
         } else if (header.type == V9X_MSG_EXEC_REQUEST) {
             if (!v9x_dos_execute(dos, header.request_id, dos->payload,
                                  header.payload_length)) return;
+            if (dos->handoff) return;
         } else if (header.type == V9X_MSG_CANCEL_REQUEST &&
                    header.payload_length == 4ul) {
             /* No concurrent or backgrounded execution exists on DOS, so there is
