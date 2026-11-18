@@ -52,6 +52,20 @@ int v9x_net_listen(unsigned short port)
     return listener;
 }
 
+/* 1 if a connection is waiting on the listener, 0 after ms with none, -1 on
+   error. Lets the accept loop look at the console between waits. */
+int v9x_net_wait(int listener, unsigned long ms)
+{
+    fd_set readable;
+    struct timeval timeout;
+
+    FD_ZERO(&readable);
+    FD_SET(listener, &readable);
+    timeout.tv_sec = (long)(ms / 1000ul);
+    timeout.tv_usec = (long)((ms % 1000ul) * 1000ul);
+    return select_s(listener + 1, &readable, 0, 0, &timeout);
+}
+
 int v9x_net_accept(int listener, unsigned long *peer_ip)
 {
     struct sockaddr_in client_address;
@@ -107,8 +121,9 @@ void v9x_net_drain(unsigned long ms)
 
 unsigned long v9x_net_local_ip(void)
 {
-    /* gethostid() returns the configured local IP in host byte order. */
-    return (unsigned long)gethostid();
+    /* gethostid() gives the address in network byte order here: 10.0.2.15
+       came back as 0F02000Ah. Callers want host order. */
+    return (unsigned long)ntohl((unsigned long)gethostid());
 }
 
 unsigned long v9x_net_inet_addr(const char *text)

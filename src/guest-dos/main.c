@@ -7,6 +7,8 @@
    state carried across restarts. The agent is launched from AUTOEXEC.BAT after
    the packet driver; see docs\dos-agent.md and packaging\dos\. */
 
+#include <conio.h>
+#include <stdio.h>
 #include <string.h>
 
 #include "dosagent.h"
@@ -20,7 +22,9 @@ int main(void)
 {
     int listener;
     int client;
+    int waiting;
     unsigned long peer_ip;
+    unsigned long ip;
     unsigned long allowed_ip = 0ul;
     int restrict_client;
 
@@ -56,7 +60,23 @@ int main(void)
             return 1;
         }
         v9x_log_line("listening");
+        ip = v9x_net_local_ip();
+        printf("V9x DOS agent on %lu.%lu.%lu.%lu:%u - Esc for a DOS prompt\n",
+               (ip >> 24) & 0xfful, (ip >> 16) & 0xfful, (ip >> 8) & 0xfful,
+               ip & 0xfful, (unsigned)g_dos.listen_port);
         for (;;) {
+            /* Wait in slices so a person at the machine can take it back:
+               Esc ends the agent and V9XLOOP.BAT drops to a prompt. */
+            waiting = v9x_net_wait(listener, 250ul);
+            if (waiting < 0) break;
+            if (waiting == 0) {
+                if (kbhit() && getch() == 27) {
+                    v9x_net_close(listener);
+                    v9x_log_line("console-quit");
+                    return V9X_DOS_EXIT_CONSOLE;
+                }
+                continue;
+            }
             peer_ip = 0ul;
             client = v9x_net_accept(listener, &peer_ip);
             if (client < 0) break;

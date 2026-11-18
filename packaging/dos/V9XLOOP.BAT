@@ -4,7 +4,9 @@ REM   C:\V9XREMOT\OFF present  -> the agent is not started (manual use).
 REM   N at the prompt          -> skip the agent for this boot only.
 REM   errorlevel 3             -> the host sent a detached job: run RUNJOB.BAT
 REM                               with the agent unloaded, then start it again.
-REM Any other exit ends the loop at the DOS prompt.
+REM   Esc at the console      -> the agent exits with errorlevel 4; the loop ends.
+REM Any other exit ends the loop too; errorlevel stays the agent's, so the
+REM caller can tell Esc (4) from a failed start (1).
 CHOICE /C:YN /T:Y,3 Start the V9x agent
 IF ERRORLEVEL 2 GOTO END
 :LOOP

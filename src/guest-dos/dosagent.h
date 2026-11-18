@@ -48,6 +48,7 @@
    runs the job with the agent's memory freed, then starts the agent again. */
 #define V9X_DOS_RUNJOB    "C:\\V9XREMOT\\RUNJOB.BAT"
 #define V9X_DOS_EXIT_HANDOFF 3
+#define V9X_DOS_EXIT_CONSOLE 4    /* Esc at the console: V9XLOOP.BAT stops */
 #define V9X_DOS_REBOOT_COM "C:\\V9XREMOT\\TEMP\\REBOOT.COM"
 
 /* Probe messages (hw_dos.c), DOS agent only; 0x00B0-0x00B6 are unused by the
@@ -115,6 +116,7 @@ typedef struct V9xDos {
 int v9x_net_init(void);                 /* sock_init(); 1 = ok */
 int v9x_net_listen(unsigned short port);/* returns listening socket or -1 */
 int v9x_net_accept(int listener, unsigned long *peer_ip); /* client sock or -1 */
+int v9x_net_wait(int listener, unsigned long ms); /* 1 pending, 0 none, -1 error */
 int v9x_net_recv_exact(int sock, unsigned char *target, unsigned long length);
 int v9x_net_send_exact(int sock, const unsigned char *source,
                        unsigned long length);
