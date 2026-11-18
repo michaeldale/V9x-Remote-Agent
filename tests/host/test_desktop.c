@@ -137,6 +137,21 @@ void v9x_log_line(const char *text) { (void)text; }
 #define mouse_event mouse_input
 #include "../../src/guest/input.c"
 
+/* Reuse the USER32 fixture to check that password text is never requested. */
+static LONG text_style;
+static int text_reads;
+static LONG text_get_style(HWND w, int which) { (void)w; (void)which; return text_style; }
+static LRESULT text_get(HWND w, UINT msg, WPARAM size, LPARAM text,
+                          UINT flags, UINT timeout, LPDWORD copied)
+{
+    (void)w; (void)msg; (void)flags; (void)timeout;
+    ++text_reads; lstrcpynA((char *)text, dialog_title, (int)size); *copied = strlen((char *)text);
+    return 1;
+}
+#define GetWindowLongA text_get_style
+#define SendMessageTimeoutA text_get
+#include "../../src/guest/windowtext.c"
+
 static void check_input(void)
 {
     unsigned char p[64];
@@ -215,6 +230,7 @@ static DWORD run(DWORD flags, DWORD timeout)
 int main(void)
 {
     unsigned char request[8];
+    char text[64];
     reset(); ready = 1; assert(run(1, 500) == 1 && posts == 0);
     reset(); assert(run(1, 500) == 3 && posts == 1 && events == 1);
     reset(); dialog_title = "Enter Windows Password"; assert(run(1, 500) == 3);
@@ -238,6 +254,12 @@ int main(void)
     assert(v9x_read_u32(connection.response) == V9X_STATUS_INVALID_PAYLOAD);
     check_operator();
     check_input();
-    puts("PASS: guest operator lifecycle (logon, registry, display, targeted input)");
+    dialog_class = "Edit"; dialog_title = "private text"; text_style = ES_PASSWORD;
+    v9x_window_text((HWND)1, text, sizeof(text));
+    assert(text_reads == 0 && strcmp(text, "[password redacted]") == 0);
+    text_style = 0;
+    v9x_window_text((HWND)1, text, sizeof(text));
+    assert(text_reads == 1 && strcmp(text, dialog_title) == 0);
+    puts("PASS: guest operator lifecycle (logon, registry, display, targeted input, password redaction)");
     return 0;
 }

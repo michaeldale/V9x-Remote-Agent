@@ -34,6 +34,7 @@ Nothing requires clicking inside the emulator.
 | `put` | `-Source`, `-Destination` | Upload one file, CRC32-verified, transactional |
 | `get` | `-Source`, `-Destination` | Download one file, CRC32-verified |
 | `push-tree` | `-Source`, `-Destination` | Recursive directory upload |
+| `pull-tree` | `-Source`, `-Destination`, `[-Filter]` | Recursive directory download over one connection (several `get`s in a row: use this) |
 | `cat` | `-Path`, `-Tail`, `-Match`, `-MaxBytes`, `-Follow`, `-Until` | A guest text file printed inline: last N lines, lines containing text, bounded; `-Follow` streams new lines as they land, `-Until <text>` stops (agent 0.13.0+) |
 | `hash` | `-Path`, optional `-Source` | Size, CRC32, SHA-256 in the guest; with `-Source`, `Matches` against a local file (0.13.0+) |
 | `delete` | `-Path`, `-Recurse`, `-Force` | Delete a file or directory; refuses roots, WINDOWS, SYSTEM, `C:\V9XREMOTE` (0.13.0+) |
@@ -43,7 +44,7 @@ Nothing requires clicking inside the emulator.
 | `display` | optional `-Restore` | Current versus saved registry mode; optionally restore the saved desktop mode (0.17.0+) |
 | `wait-file` | `-Path`, `-WaitSeconds`, `-Gone`, `-StableMs`, `-Match` | Wait until a guest file exists (or is gone, or stops growing; any agent), or has a line containing `-Match` text (0.13.0+) |
 | `wait-process` | `-Pid` or `-Name`, `-WaitSeconds` (default 3600) | Wait until a guest process has exited: a detached benchmark or installer is done (0.13.0+) |
-| `wait-fault` | optional `-Pid` or `-Name`, `-WaitSeconds` (default 3600), `-Dismiss` | Wait until a process exits (exit 0) **or crashes**: a fault dialog about it appears (exit 50, with the dialog's `Message` and `Details`, e.g. the 9x register dump). No `-Pid`/`-Name`: watch for any program's fault until the deadline (exit 0, `Outcome = NoFault`). `-Dismiss` closes the dialog (0.16.0+) |
+| `wait-fault` | optional `-Pid` or `-Name`, `-WaitSeconds` (default 3600), `-Dismiss`, `-DialogTitle <text[]>` | Wait until a process exits (exit 0) **or crashes**: a fault dialog about it appears (exit 50, with the dialog's `Message` and `Details`, e.g. the 9x register dump). No `-Pid`/`-Name`: watch for any program's fault until the deadline (exit 0, `Outcome = NoFault`). `-Dismiss` closes the dialog (0.16.0+). Host 0.18.0: `-DialogTitle` also returns on matching target-owned dialogs (`Outcome = Dialog`, exit 50); also on `exec -WaitForExit`. |
 | `note` | `-Text` | Add `Developer: <text>` to the tester's activity log (`C:\V9XREMOTE\EVENTS.LOG`, tray > Activity log) before a step they should know about (0.15.0+) |
 | `windows` | optional `-Title`, `-Controls` | Visible top-level windows: title, class, position, size, pid (0.13.0+); `-Controls` adds each window's buttons, labels and edit text, so you can read a dialog without a screenshot (0.16.0+) |
 | `wait-window` | `-Title`, `-WaitSeconds`, `-Gone` | Wait until a window whose title contains the text is shown (or closed) (0.13.0+) |
@@ -131,7 +132,7 @@ agent, keep using `screenshot` and `input`.
 | 47 | `wait-file` / `-WaitForFile` deadline passed |
 | 48 | `wait-window` / `-WaitForWindow` / `screenshot -Window`: no such window, or the deadline passed |
 | 49 | `wait-process` / `wait-fault` / `exec -WaitForExit`: the process still runs at the deadline |
-| 50 | `wait-fault` / `exec -WaitForExit` (agent 0.16.0+): the program crashed; the result's `Fault` holds the dialog text |
+| 50 | `wait-fault` / `exec -WaitForExit` (agent 0.16.0+): a crash or opt-in `-DialogTitle` match; `Outcome` is `Fault` or `Dialog`, and `Fault` holds the dialog text |
 | 51 | Display report/restore failed (0.17.0+) |
 
 Treat 20 as "the VM is off, still booting, or the forward is missing". Do not

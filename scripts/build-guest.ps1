@@ -91,6 +91,7 @@ $sources = @(
     "src\guest\tools.c",
     "src\guest\tray.c",
     "src\guest\update.c"
+    "src\guest\windowtext.c"
 )
 $objects = @()
 foreach ($relativeSource in $sources) {

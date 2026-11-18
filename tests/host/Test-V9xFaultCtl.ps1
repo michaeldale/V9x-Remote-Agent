@@ -1,6 +1,6 @@
 $ErrorActionPreference = 'Stop'
-# v9xctl fault handling (0.16.0): wait-fault (an ordinary message box is
-# read once and ignored; the fault dialog is owned by another process, as on
+# v9xctl fault handling: wait-fault (an ordinary message box is
+# ignored; the fault dialog is owned by another process, as on
 # Windows 9x, and found by the image name in its title; -Dismiss closes it),
 # close-window, windows -Controls, and exit 23 from an agent without
 # V9X_CAP_WINDOW_TOOLS, against a fixture agent that checks each request.
@@ -106,11 +106,14 @@ $server = Start-Job -ArgumentList $port, $protocolScript -ScriptBlock {
         Reply $session.Stream $r 0x8062 (Windows @(, $box))
         $r = Expect-Request $session.Stream 0x0063 (Hex (U32 0x50))
         Reply $session.Stream $r 0x8063 (WindowText 0x50 0x3000 'BENCH' @(, @('Static', 'Ready.', $true)))
-        # Second probe: the box is not read again; the fault dialog is.
+        # Second probe: controls can change without a title change, so the
+        # ordinary box is re-read before the new fault dialog.
         $r = Expect-Request $session.Stream 0x0080 ''
         Reply $session.Stream $r 0x8080 (Processes @($agent, $bench))
         $r = Expect-Request $session.Stream 0x0062 ''
         Reply $session.Stream $r 0x8062 (Windows @($box, $fault))
+        $r = Expect-Request $session.Stream 0x0063 (Hex (U32 0x50))
+        Reply $session.Stream $r 0x8063 (WindowText 0x50 0x3000 'BENCH' @(, @('Static', 'Ready.', $true)))
         $r = Expect-Request $session.Stream 0x0063 (Hex (U32 0x60))
         Reply $session.Stream $r 0x8063 (WindowText 0x60 0x1 'Bench' $faultChildren)
         $r = Expect-Request $session.Stream 0x0064 (Hex (U32 0x60))
@@ -118,6 +121,30 @@ $server = Start-Job -ArgumentList $port, $protocolScript -ScriptBlock {
         $r = Expect-Request $session.Stream 0x0062 ''
         Reply $session.Stream $r 0x8062 (Windows @(, $box))
         Start-Sleep -Milliseconds 300
+        $session.Client.Dispose()
+
+        # One selected-dialog run covers exec forwarding, PID scoping,
+        # dismissal, and returning before the subsequent file wait.
+        $session = Accept-Session $listener $allCaps
+        $r = Read-V9xFrame -Stream $session.Stream
+        if ($r.Type -ne 0x0010 -or [BitConverter]::ToUInt16($r.Payload, 2) -ne 3) {
+            throw 'exec -WaitForExit did not launch detached with a PID request.'
+        }
+        $execComplete = (U32 0) + (U32 0) + (U32 0) + (U32 1) + (U32 0) + (U32 0) + (U32 0x60) + (U32 0x3000)
+        Reply $session.Stream $r 0x8010 (U32 0)
+        Reply $session.Stream $r 0x8011 $execComplete
+        $r = Expect-Request $session.Stream 0x0080 ''
+        Reply $session.Stream $r 0x8080 (Processes @($agent, $bench))
+        $r = Expect-Request $session.Stream 0x0062 ''
+        Reply $session.Stream $r 0x8062 (Windows @(@(0x80, 99, '#32770', 'Critical Error'), @(0x81, 0x3000, '#32770', 'Critical Error')))
+        foreach ($entry in @(@(0x80, 99), @(0x81, 0x3000))) {
+            $r = Expect-Request $session.Stream 0x0063 (Hex (U32 $entry[0]))
+            Reply $session.Stream $r 0x8063 (WindowText $entry[0] $entry[1] 'Critical Error' @(, @('Edit', 'Engine failed.', $true)))
+        }
+        $r = Expect-Request $session.Stream 0x0064 (Hex (U32 0x81))
+        Reply $session.Stream $r 0x8064 (U32 0x81)
+        $r = Expect-Request $session.Stream 0x0062 ''
+        Reply $session.Stream $r 0x8062 (Windows @())
         $session.Client.Dispose()
 
         # close-window -Title rep: one match, closed, gone on the next look.
@@ -131,14 +158,15 @@ $server = Start-Job -ArgumentList $port, $protocolScript -ScriptBlock {
         Start-Sleep -Milliseconds 300
         $session.Client.Dispose()
 
-        # windows -Title bench -Controls.
-        $session = Accept-Session $listener $allCaps
-        $r = Expect-Request $session.Stream 0x0062 ''
-        Reply $session.Stream $r 0x8062 (Windows @($box, @(0x70, 0x3000, 'Notepad', 'Report - Notepad')))
-        $r = Expect-Request $session.Stream 0x0063 (Hex (U32 0x50))
-        Reply $session.Stream $r 0x8063 (WindowText 0x50 0x3000 'BENCH' @(, @('Static', 'Ready.', $true)))
-        Start-Sleep -Milliseconds 300
-        $session.Client.Dispose()
+        # Reuse the window response for both pipeline capture and JSON.
+        foreach ($format in @('text', 'json')) {
+            $session = Accept-Session $listener $allCaps
+            $r = Expect-Request $session.Stream 0x0062 ''
+            Reply $session.Stream $r 0x8062 (Windows @($box, @(0x70, 0x3000, 'Notepad', 'Report - Notepad')))
+            $r = Expect-Request $session.Stream 0x0063 (Hex (U32 0x50))
+            Reply $session.Stream $r 0x8063 (WindowText 0x50 0x3000 'BENCH' @(, @('Static', 'Ready.', $true)))
+            $session.Client.Dispose()
+        }
 
         # wait-fault on a 0.15 agent: refused before any request (exit 23).
         $session = Accept-Session $listener ([uint32]($allCaps -band (-bnot 0x01000000)))
@@ -176,14 +204,24 @@ try {
         $fault.Fault.Details -ne "BENCH caused an invalid page fault in`nmodule BENCH.EXE at 016f:004010e8.") {
         throw "wait-fault result mismatch: $($fault | ConvertTo-Json -Compress -Depth 4)"
     }
+    $executed = Invoke-FixtureClient @('exec', '-Application', 'C:\BENCH\BENCH.EXE', '-WaitForExit',
+        '-DialogTitle', 'critical error', '-Dismiss', '-WaitForFile', 'C:\NEVER.INI', '-WaitSeconds', '10') 50
+    if ($executed.Success -or $executed.Outcome -ne 'Dialog' -or $executed.Fault.Details -ne 'Engine failed.' -or
+        $executed.Fault.DialogPid -ne 12288 -or -not $executed.Dismissed) {
+        throw 'exec selected-dialog wait did not preserve PID scoping, text, dismissal or early return.'
+    }
     $closed = Invoke-FixtureClient @('close-window', '-Title', 'rep')
     if (-not $closed.Closed -or $closed.Window.Handle -ne 0x70) { throw "close-window result mismatch: $($closed | ConvertTo-Json -Compress)" }
+    $text = & $clientScript windows -Title bench -Controls -Host 127.0.0.1 -Port $port | Out-String
+    if ($LASTEXITCODE -ne 0 -or $text -notmatch 'Ready\.') { throw 'windows -Controls text was not on the success pipeline.' }
     $listed = Invoke-FixtureClient @('windows', '-Title', 'bench', '-Controls')
     if ($listed.Count -ne 1 -or $listed.Windows[0].Controls[0].Text -ne 'Ready.') {
         throw "windows -Controls result mismatch: $($listed | ConvertTo-Json -Compress -Depth 4)"
     }
     Invoke-FixtureClient @('wait-fault', '-Name', 'BENCH.EXE', '-WaitSeconds', '10') 23 | Out-Null
     Invoke-FixtureClient @('windows', '-Dismiss') 10 | Out-Null
+    Invoke-FixtureClient @('wait-fault', '-DialogTitle', 'Critical Error') 10 | Out-Null
+    Invoke-FixtureClient @('exec', '-Application', 'C:\BENCH.EXE', '-DialogTitle', 'Critical Error') 10 | Out-Null
     if (-not (Wait-Job -Job $server -Timeout 10)) { throw 'Fault fixture did not finish.' }
     $serverOutput = @(Receive-Job -Job $server -ErrorAction Stop)
     if ($serverOutput -notcontains 'SERVER_PASS') { throw 'Fault fixture did not report success.' }

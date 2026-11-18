@@ -101,6 +101,17 @@ connection that is dropped before HELLO is retried twice.
 Every tool opens a fresh connection, so a crashed VM never wedges the server;
 errors come back as tool results with `isError` set.
 
+Host 0.18.0 adds `dialog_titles: ["Critical Error"]` on `v9x_wait_fault`
+(requires `pid` or `name`) and `v9x_exec` (requires `wait_for_exit: true`).
+These are literal, case-insensitive title substrings for dialogs owned by
+the watched process. Matching returns outcome/result `dialog` with text in
+`fault` / `waited_for_exit.fault`; `dismiss: true` closes it. Crash detection
+continues alongside the filter. Uses the existing 0.16.0+ window tools.
+Guest 0.18.0 redacts password Edit/RichEdit controls before reading them.
+Its hot-swap watchdog retains the previous binary until the new listener is
+ready and rolls back failed startups. `v9x_update` checks SHA-256 after
+reconnect when `hash` is available, rejecting a possible rollback.
+
 Agent 0.17.0 development adds `dismiss_logon: true` on `v9x_wait_desktop`,
 `v9x_reboot_with_proof` and `v9x_reset_with_proof`. It cancels a recognized
 English Windows 9x startup password dialog and waits for Explorer in the

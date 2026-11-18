@@ -1,5 +1,9 @@
 # Remote help and self-update
 
+Planned owner recognition: [contribution credits proposal](remote-help-contribution-credits.md)
+for the BluetraitBlog plugin (hardware coverage, testing outcomes, availability
+and command activity; not implemented).
+
 Agent 0.12.0 can talk to the update server, `michaeldale.com.au` (the
 `v9x_update_checker` plugin of its Bluetrait site), for two things:
 

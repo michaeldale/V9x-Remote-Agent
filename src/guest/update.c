@@ -35,6 +35,20 @@ static const char v9x_update_run_value[] = "V9xRemoteAgent";
    The agent exits about a second after accepting the update. */
 #define V9X_HOTSWAP_WAIT_MS 120000ul
 #define V9X_HOTSWAP_POLL_MS 250ul
+#define V9X_HOTSWAP_READY_MS 60000ul
+static const char v9x_update_ready[] = "V9xRemoteAgentUpdateReady";
+
+/* A fresh event belongs to the swapper. Only signal after bind/listen has
+   succeeded; a created process or incremented boot counter is not health.
+   No loopback connection is needed, so allowed_client remains enforced. */
+void v9x_hotswap_ready(void)
+{
+    HANDLE ready = OpenEventA(EVENT_MODIFY_STATE, FALSE, v9x_update_ready);
+    if (ready != 0) {
+        (void)SetEvent(ready);
+        CloseHandle(ready);
+    }
+}
 
 static int v9x_update_error(V9xConnection *conn, DWORD request_id, DWORD status,
                             DWORD native_error, const char *detail)
@@ -241,6 +255,21 @@ static void v9x_hotswap_log(const char *line)
     CloseHandle(file);
 }
 
+/* Keep the Win32 error or child exit code in the recovery log: the process
+   can be gone by the time a tester reconnects or restarts the machine. */
+static void v9x_hotswap_code(const char *label, DWORD code)
+{
+    char line[128];
+    static const char hex[] = "0123456789ABCDEF";
+    unsigned int at = 0u;
+    int shift;
+    while (*label != '\0' && at < 110u) line[at++] = *label++;
+    line[at++] = ' '; line[at++] = '0'; line[at++] = 'x';
+    for (shift = 28; shift >= 0; shift -= 4) line[at++] = hex[(code >> shift) & 15ul];
+    line[at] = '\0';
+    v9x_hotswap_log(line);
+}
+
 /* Re-assert the RunServices entry natively, which is what the batch did
    with REGEDIT /S INSTALL.REG. Failure is logged, not fatal: the entry
    is already there on any guest that was installed with INSTALL.BAT. On
@@ -269,10 +298,35 @@ static void v9x_hotswap_register(void)
     }
 }
 
+static int v9x_hotswap_rollback(void)
+{
+    DWORD native_error = 0ul;
+    if (GetFileAttributesA(v9x_update_agent_old) == 0xfffffffful) {
+        v9x_hotswap_log("rollback-unavailable");
+        return 4;
+    }
+    (void)DeleteFileA(v9x_update_agent);
+    if (!MoveFileA(v9x_update_agent_old, v9x_update_agent)) {
+        v9x_hotswap_code("rollback-restore-failed", GetLastError());
+        return 4;
+    }
+    v9x_hotswap_register();
+    if (!v9x_spawn(v9x_update_relaunch, 0, &native_error)) {
+        v9x_hotswap_code("rollback-relaunch-failed", native_error);
+        return 4;
+    }
+    v9x_hotswap_log("rollback-relaunched");
+    return 3;
+}
+
 int v9x_hotswap_run(void)
 {
     unsigned long waited = 0ul;
     DWORD native_error = 0ul;
+    HANDLE ready;
+    HANDLE process = 0;
+    HANDLE handles[2];
+    DWORD outcome;
     v9x_hotswap_log("hotswap-start");
 
     /* Wait for the old agent to exit. A rename of a mapped executable fails
@@ -317,30 +371,65 @@ int v9x_hotswap_run(void)
        which Win9x allows; deleting it is not, so the relaunched agent does
        that (v9x_hotswap_cleanup). */
     if (!CopyFileA(v9x_update_agent_new, v9x_update_agent, FALSE)) {
-        v9x_hotswap_log("agent-copy-failed");
-        /* Put the old binary back so RunServices still finds an agent. */
-        (void)MoveFileA(v9x_update_agent_old, v9x_update_agent);
-        return 2;
+        v9x_hotswap_code("agent-copy-failed", GetLastError());
+        return v9x_hotswap_rollback();
     }
-    (void)DeleteFileA(v9x_update_agent_old);
+    v9x_hotswap_register();
+    ready = CreateEventA(0, TRUE, FALSE, v9x_update_ready);
+    if (ready == 0) {
+        v9x_hotswap_code("ready-event-failed", GetLastError());
+        return v9x_hotswap_rollback();
+    }
+    (void)ResetEvent(ready);
+    v9x_hotswap_log("agent-relaunch");
+    if (!v9x_spawn(v9x_update_relaunch, &process, &native_error)) {
+        v9x_hotswap_code("agent-relaunch-failed", native_error);
+        CloseHandle(ready);
+        return v9x_hotswap_rollback();
+    }
+    /* Watch the actual child as well as its readiness signal. Keep the
+       previous binary until the replacement has opened its listener. */
+    handles[0] = process;
+    handles[1] = ready;
+    outcome = WaitForMultipleObjects(2, handles, FALSE, V9X_HOTSWAP_READY_MS);
+    CloseHandle(ready);
+    if (outcome != WAIT_OBJECT_0 + 1) {
+        if (outcome == WAIT_OBJECT_0 && GetExitCodeProcess(process, &native_error)) {
+            v9x_hotswap_code("agent-exit-code", native_error);
+        } else if (outcome == WAIT_FAILED) {
+            v9x_hotswap_code("agent-ready-wait-failed", GetLastError());
+        }
+        v9x_hotswap_log(outcome == WAIT_OBJECT_0 ? "agent-exited-before-ready" :
+                                                   "agent-ready-timeout");
+        /* Never replace an image beneath a live process (NT permits the
+           rename). If termination fails, retain both files for recovery. */
+        if (WaitForSingleObject(process, 0ul) != WAIT_OBJECT_0) {
+            if (!TerminateProcess(process, 1ul) ||
+                WaitForSingleObject(process, 10000ul) != WAIT_OBJECT_0) {
+                CloseHandle(process);
+                v9x_hotswap_code("agent-stop-failed-rollback-retained", GetLastError());
+                return 4;
+            }
+        }
+        CloseHandle(process);
+        return v9x_hotswap_rollback();
+    }
+    CloseHandle(process);
+    v9x_hotswap_log("agent-ready");
+    /* Promote the helper only after health succeeds so rollback retains
+       the previous agent/helper pair. */
     if (CopyFileA(v9x_update_helper_new, v9x_update_helper, FALSE)) {
         (void)DeleteFileA(v9x_update_helper_new);
     } else {
         v9x_hotswap_log("helper-copy-failed");
     }
-    v9x_hotswap_register();
-    v9x_hotswap_log("agent-relaunch");
-    if (!v9x_spawn(v9x_update_relaunch, 0, &native_error)) {
-        v9x_hotswap_log("agent-relaunch-failed");
-        return 3;
-    }
+    (void)DeleteFileA(v9x_update_agent_old);
     return 0;
 }
 
-/* Called by the agent at start: remove the staged binary the swapper could
-   not delete because it was running from it. The swapper exits right after
-   spawning us, so a few short retries cover the race; a leftover is
-   harmless and is overwritten by the next update anyway. */
+/* Best-effort startup cleanup. A 0.18.0+ swapper stays mapped until listener
+   readiness, so its staged binary can remain until the next agent start.
+   Older swappers exit immediately and these short retries cover that race. */
 void v9x_hotswap_cleanup(void)
 {
     int attempt;

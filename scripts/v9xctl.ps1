@@ -15,7 +15,7 @@ deterministic and listed in AGENTS.md (20 means the agent was unreachable).
 
 .PARAMETER Action
 The verb: discover, ping, info, inventory, exec, shell, stat, list, mkdir, put, get, push-tree,
-download, update, reboot, reset, shutdown, wait-desktop, screenshot, input, vnc, help.
+pull-tree, download, update, reboot, reset, shutdown, wait-desktop, screenshot, input, vnc, help.
 
 .PARAMETER VncCommand
 For the vnc verb, the second word: status, start or stop.
@@ -89,7 +89,7 @@ param(
     [ArgumentCompleter({
         param($commandName, $parameterName, $wordToComplete)
         @('discover', 'ping', 'info', 'inventory', 'exec', 'shell', 'stat', 'list', 'mkdir',
-          'put', 'get', 'push-tree', 'wait-file', 'delete', 'hash', 'cat', 'ps', 'kill', 'reg',
+          'put', 'get', 'push-tree', 'pull-tree', 'wait-file', 'delete', 'hash', 'cat', 'ps', 'kill', 'reg',
           'windows', 'wait-window', 'close-window', 'wait-process', 'wait-fault', 'note',
           'download', 'update', 'reboot', 'reset', 'shutdown',
           'wait-desktop', 'screenshot', 'input', 'display', 'vnc', 'help') |
@@ -127,6 +127,10 @@ param(
     [switch]$Controls,
     # wait-fault / exec -WaitForExit: close the fault dialog once read.
     [switch]$Dismiss,
+    # Also stop on an application-owned dialog with any of these literal
+    # title substrings (case-insensitive); ordinary dialogs stay ignored.
+    [ValidateNotNullOrEmpty()]
+    [string[]]$DialogTitle = @(),
     # Win9x only (0.17.0+): cancel a recognized startup logon dialog while
     # waiting for Explorer, without changing the owner's logon settings.
     [switch]$DismissLogon,
@@ -200,6 +204,8 @@ param(
     # cat: only lines containing this text (case-insensitive); wait-file:
     # wait until the file has such a line.
     [string]$Match = '',
+    # pull-tree: only files whose name matches this wildcard (V9XGRAB*.BMP).
+    [string]$Filter = '',
     # cat: most bytes of text to return (the agent caps it near 64 KiB).
     [ValidateRange(1, 65512)]
     [int]$MaxBytes = 16384,
@@ -390,7 +396,7 @@ function Connect-V9xSessionWithRetry {
             $transport = $dropped -or $failure -is [Net.Sockets.SocketException] -or
                 $failure -is [TimeoutException]
             ++$attempt
-            $delay = [Math]::Min(5, [Math]::Pow(2, $attempt - 1))
+            $delay = if ($attempt -ge 4) { 5 } else { [Math]::Pow(2, $attempt - 1) }
             $retry = ($WaitSeconds -gt 0 -and $transport -and
                       [DateTime]::UtcNow.AddSeconds($delay) -lt $deadline) -or
                      ($WaitSeconds -le 0 -and $dropped -and $attempt -le 2)
@@ -697,11 +703,12 @@ function Get-V9xFaultDialog {
 # exit, so a dialog left behind by a process that has already gone is still
 # reported. -Dismiss closes the dialog (WM_CLOSE) and waits for it to go.
 function Wait-V9xGuestFault {
-    param($Stream, [ref]$RequestId, [uint32]$ProcessId, [string]$Name, [int]$WaitSeconds, [switch]$Dismiss)
+    param($Stream, [ref]$RequestId, [uint32]$ProcessId, [string]$Name, [int]$WaitSeconds, [switch]$Dismiss,
+          [string[]]$DialogTitle = @())
     Assert-V9xCapability 0x01000000 'read fault dialogs (wait-fault)' '0.16.0'
     $anyFault = -not $ProcessId -and -not $Name
     $what = if ($ProcessId) { 'pid {0} ({0:X8})' -f $ProcessId } elseif ($Name) { "'$Name'" } else { 'any program' }
-    $probeState = @{ First = $true; WasRunning = $false; Initial = @(); Running = @(); Seen = @{}; Names = @() }
+    $probeState = @{ First = $true; WasRunning = $false; Initial = @(); Running = @(); Names = @() }
     if ($Name -and -not [Management.Automation.WildcardPattern]::ContainsWildcardCharacters($Name)) {
         $probeState.Names = @([IO.Path]::GetFileNameWithoutExtension($Name))
     }
@@ -726,19 +733,20 @@ function Wait-V9xGuestFault {
         $pids = @($probeState.Initial | ForEach-Object { $_.Pid }) + @($running | ForEach-Object { $_.Pid })
         if ($ProcessId) { $pids += $ProcessId }
         $dialogs = @(Get-V9xGuestWindows -Stream $s -RequestId $r | Where-Object { $script:V9xFaultDialogClasses -contains $_.Class })
+        # HWNDs can be reused and controls can change without a new title,
+        # including a reused system fault dialog: always read current text.
         foreach ($dialog in $dialogs) {
-            $key = "$($dialog.Handle)|$($dialog.Title)"
-            if (-not $probeState.Seen.ContainsKey($key)) {
-                try {
-                    $probeState.Seen[$key] = Get-V9xFaultDialog -Stream $s -RequestId $r -Window $dialog
-                } catch {
-                    # Gone between the list and the read: look again next probe.
-                    if ($_.Exception.Data['V9xExitCode'] -eq 48) { continue }
-                    throw
-                }
+            try {
+                $fault = Get-V9xFaultDialog -Stream $s -RequestId $r -Window $dialog
+            } catch {
+                # Gone between the list and the read: look again next probe.
+                if ($_.Exception.Data['V9xExitCode'] -eq 48) { continue }
+                throw
             }
-            $fault = $probeState.Seen[$key]
-            if (-not $fault.IsFault) { continue }
+            $selectedDialog = ($pids -contains $fault.DialogPid) -and @($DialogTitle | Where-Object {
+                $fault.Title.IndexOf($_, [StringComparison]::OrdinalIgnoreCase) -ge 0
+            }).Count -gt 0
+            if (-not $fault.IsFault -and -not $selectedDialog) { continue }
             $mine = $anyFault -or ($pids -contains $fault.DialogPid)
             if (-not $mine) {
                 foreach ($base in $probeState.Names) {
@@ -746,7 +754,7 @@ function Wait-V9xGuestFault {
                 }
             }
             if ($mine) {
-                return [pscustomobject]@{ Outcome = 'Fault'; Fault = $fault
+                return [pscustomobject]@{ Outcome = $(if ($fault.IsFault) { 'Fault' } else { 'Dialog' }); Fault = $fault
                                           WasRunning = $probeState.WasRunning; Processes = $probeState.Initial }
             }
         }
@@ -764,7 +772,7 @@ function Wait-V9xGuestFault {
         $outcome.Fault = Complete-V9xDrWatsonFault -Stream $Stream -RequestId $RequestId -Fault $outcome.Fault
     }
     $dismissed = $false
-    if ($Dismiss -and $outcome.Outcome -eq 'Fault') {
+    if ($Dismiss -and $outcome.Outcome -in 'Fault', 'Dialog') {
         Close-V9xGuestWindow -Stream $Stream -RequestId $RequestId -Handle $outcome.Fault.Handle
         $clock = [Diagnostics.Stopwatch]::StartNew()
         while ($clock.ElapsedMilliseconds -lt 5000) {
@@ -1354,7 +1362,7 @@ $script:V9xVerbs = [ordered]@{
     }
     'exec' = @{
         Purpose = 'Run a Win32 EXE directly and capture stdout/stderr'
-        Usage = 'exec -Application <guest EXE> [-Arguments <text>] [-WorkingDirectory <guest dir>] [-TimeoutSeconds <n>] [-ExpectedExitCode <n>] [-ShowWindow] [-Detach] [-WaitForExit | -WaitForFile <guest path> [-Match <text>] | -WaitForWindow <title part>] [-WaitSeconds <n>]'
+        Usage = 'exec -Application <guest EXE> [-Arguments <text>] [-WorkingDirectory <guest dir>] [-TimeoutSeconds <n>] [-ExpectedExitCode <n>] [-ShowWindow] [-Detach] [-WaitForExit [-DialogTitle <text[]>] [-Dismiss] | -WaitForFile <guest path> [-Match <text>] | -WaitForWindow <title part>] [-WaitSeconds <n>]'
         Example = 'exec -Application C:\WINDOWS\NOTEPAD.EXE -Arguments C:\README.TXT -TimeoutSeconds 30 -Json'
         Required = @{ Application = '-Application' }
     }
@@ -1400,6 +1408,12 @@ $script:V9xVerbs = [ordered]@{
         Example = 'push-tree -Source .\build\install -Destination C:\V9XREMOTE\JOBS\install'
         Required = @{ Source = '-Source'; Destination = '-Destination' }
     }
+    'pull-tree' = @{
+        Purpose = 'Download a guest directory tree over one connection, each file CRC32-verified; -Filter keeps matching file names'
+        Usage = 'pull-tree -Source <guest dir> -Destination <local dir> [-Filter <wildcard>]'
+        Example = 'pull-tree -Source C:\V9XDIAG -Destination .\grab -Filter V9XGRAB*.BMP -Json'
+        Required = @{ Source = '-Source'; Destination = '-Destination' }
+    }
     'delete' = @{
         Purpose = 'Delete a guest file, or a directory with -Recurse (agent 0.13.0+; refuses roots, WINDOWS, SYSTEM, the agent folder)'
         Usage = 'delete -Path <guest path> [-Recurse] [-Force]'
@@ -1425,7 +1439,7 @@ $script:V9xVerbs = [ordered]@{
     }
     'wait-fault' = @{
         Purpose = 'Wait until a process exits (exit 0) or a fault dialog about it appears (exit 50, with the dialog text); no -Pid/-Name: watch for any fault until -WaitSeconds (agent 0.16.0+)'
-        Usage = 'wait-fault [-Pid <id> | -Name <image name>] [-WaitSeconds <n>] [-Dismiss]   (default 3600)'
+        Usage = 'wait-fault [-Pid <id> | -Name <image name>] [-DialogTitle <text[]>] [-WaitSeconds <n>] [-Dismiss]   (default 3600; selected dialog: exit 50, Outcome Dialog)'
         Example = 'wait-fault -Name MYTEST.EXE -WaitSeconds 600 -Dismiss -Json'
     }
     'windows' = @{
@@ -1689,6 +1703,10 @@ if ($Action -eq 'push-tree' -and -not (Test-Path -LiteralPath $Source -PathType 
     [Console]::Error.WriteLine("Local source directory not found: $Source")
     exit 11
 }
+if ($Filter -and $Action -ne 'pull-tree') {
+    Write-V9xVerbUsage -Writer ([Console]::Error) -Verb $Action -Problem '-Filter applies only to pull-tree.'
+    exit 10
+}
 if ($Action -eq 'hash' -and $Source -and -not (Test-Path -LiteralPath $Source -PathType Leaf)) {
     [Console]::Error.WriteLine("Local file to compare not found: $Source")
     exit 11
@@ -1707,6 +1725,12 @@ if ($Dismiss -and -not ($Action -eq 'wait-fault' -or ($Action -eq 'exec' -and $W
 }
 if ($Controls -and $Action -ne 'windows') {
     Write-V9xVerbUsage -Writer ([Console]::Error) -Verb 'windows' -Problem '-Controls is a windows option.'
+    exit 10
+}
+if ($DialogTitle.Count -and ($Action -ne 'wait-fault' -and -not ($Action -eq 'exec' -and $WaitForExit) -or
+        ($Action -eq 'wait-fault' -and -not $ProcessId -and -not $Name) -or
+        @($DialogTitle | Where-Object { [string]::IsNullOrWhiteSpace($_) }).Count)) {
+    Write-V9xVerbUsage -Writer ([Console]::Error) -Verb 'wait-fault' -Problem '-DialogTitle requires a target (-Pid/-Name), or exec -WaitForExit.'
     exit 10
 }
 if ($DismissLogon -and $Action -notin @('wait-desktop', 'reboot', 'reset')) {
@@ -1996,6 +2020,7 @@ try {
     $captureAfterInput = $false
     $killDisplayFailed = $false
     $hello = $session.Hello
+    if ($DialogTitle.Count) { Assert-V9xCapability 0x01000000 'wait for selected dialogs' '0.16.0' }
 
     # Refuse before reboot/reset does anything on unsupported agents.
     if ($DismissLogon) {
@@ -2618,6 +2643,19 @@ try {
             throw $exception
         }
         $client = $resumed.Client
+        # A rollback also increments BootCounter. Verify the installed image
+        # before reporting an update as successful (hash: agent 0.13.0+).
+        if (($resumed.Hello.Capabilities -band [uint32]0x00040000) -ne 0) {
+            $verifyRequest = [uint32]$resumed.RequestId
+            $installed = ConvertFrom-V9xHashPayload -Payload (Invoke-V9xRequest -Stream $resumed.Stream `
+                -RequestId ([ref]$verifyRequest) -Type 0x0029 `
+                -Payload (New-V9xPathPayload -Path 'C:\V9XREMOTE\V9XAGNT.EXE') -Expected 0x8029 -GuestErrorExitCode 42)
+            if ($installed.Sha256 -ne (Get-FileHash -LiteralPath $agentSource -Algorithm SHA256).Hash) {
+                $exception = [InvalidOperationException]::new('Agent reconnected but the installed binary differs from the package (possible rollback). Read C:\V9XREMOTE\HOTSWAP.LOG before retrying.')
+                $exception.Data['V9xExitCode'] = 42
+                throw $exception
+            }
+        }
         $result = [pscustomobject]@{
             Success = $true; RequestId = $requestId
             PreviousBuild = $oldBuild; PreviousBootCounter = $oldBootCounter
@@ -2645,9 +2683,9 @@ try {
                 })
                 if (-not $Json) {
                     foreach ($w in $windows) {
-                        [Console]::Out.WriteLine("[$($w.Class)] $($w.Title)  (handle $($w.Handle), pid $($w.Pid))")
+                        Write-Output "[$($w.Class)] $($w.Title)  (handle $($w.Handle), pid $($w.Pid))"
                         foreach ($c in $w.Controls) {
-                            if ($c.Text) { [Console]::Out.WriteLine("  $($c.Class) #$($c.ControlId)$(if (-not $c.Visible) { ' (hidden)' }): $($c.Text -replace "`r?`n", "`n    ")") }
+                            if ($c.Text) { Write-Output "  $($c.Class) #$($c.ControlId)$(if (-not $c.Visible) { ' (hidden)' }): $($c.Text -replace "`r?`n", "`n    ")" }
                         }
                     }
                     exit 0
@@ -2685,12 +2723,12 @@ try {
 
     if ($Action -eq 'wait-fault') {
         $waited = Wait-V9xGuestFault -Stream $stream -RequestId ([ref]$requestId) `
-            -ProcessId $ProcessId -Name $Name -WaitSeconds $WaitSeconds -Dismiss:$Dismiss
+            -ProcessId $ProcessId -Name $Name -WaitSeconds $WaitSeconds -Dismiss:$Dismiss -DialogTitle $DialogTitle
         if (($ProcessId -or $Name) -and -not $waited.WasRunning -and $waited.Outcome -eq 'Exited') {
             [Console]::Error.WriteLine("Note: no process matched $(if ($ProcessId) { "pid $ProcessId" } else { "'$Name'" }) on the first look: it had already exited, or the name is wrong (see ps).")
         }
         $result = [pscustomobject]@{
-            Success = $waited.Outcome -ne 'Fault'; AgentBuild = $hello.BuildId
+            Success = $waited.Outcome -notin 'Fault', 'Dialog'; AgentBuild = $hello.BuildId
             Outcome = $waited.Outcome
             Pid = $(if ($ProcessId) { $ProcessId } else { $null }); Name = $Name
             WasRunning = $waited.WasRunning; Processes = @($waited.Processes | ForEach-Object { $_.Name })
@@ -2701,12 +2739,12 @@ try {
         else {
             $result | Select-Object Outcome, Pid, Name, WasRunning, Processes, Dismissed, WaitedMilliseconds | Format-List
             if ($result.Fault) {
-                [Console]::Out.WriteLine("Fault dialog: $($result.Fault.Title)")
-                [Console]::Out.WriteLine($result.Fault.Message)
-                if ($result.Fault.Details) { [Console]::Out.WriteLine(''); [Console]::Out.WriteLine($result.Fault.Details) }
+                Write-Output "$($result.Outcome) dialog: $($result.Fault.Title)"
+                Write-Output $result.Fault.Message
+                if ($result.Fault.Details) { Write-Output ''; Write-Output $result.Fault.Details }
             }
         }
-        exit $(if ($waited.Outcome -eq 'Fault') { 50 } else { 0 })
+        exit $(if ($waited.Outcome -in 'Fault', 'Dialog') { 50 } else { 0 })
     }
 
     if ($Action -eq 'close-window') {
@@ -2899,8 +2937,8 @@ try {
         exit 0
     }
 
-    if ($Action -in @('stat', 'list', 'mkdir', 'put', 'get', 'push-tree')) {
-        $requiredCapability = if ($Action -in @('stat', 'list', 'get')) {
+    if ($Action -in @('stat', 'list', 'mkdir', 'put', 'get', 'push-tree', 'pull-tree')) {
+        $requiredCapability = if ($Action -in @('stat', 'list', 'get', 'pull-tree')) {
             [uint32]0x00000020
         } else {
             [uint32]0x00000040
@@ -2965,6 +3003,52 @@ try {
                 Success = $true; RequestId = [uint32]($requestId - 1); AgentBuild = $hello.BuildId
                 Source = $transfer.Source; Destination = $transfer.Destination
                 Bytes = $transfer.Size; Crc32 = ('{0:X8}' -f $transfer.Crc32)
+            }
+        } elseif ($Action -eq 'pull-tree') {
+            # One session for the whole tree: through the relay each get
+            # opens its own session, which costs more than the bytes (ten
+            # 3DMark grab BMPs took four minutes as separate gets).
+            $guestRoot = $Source.Replace('/', '\')
+            if ($guestRoot -notmatch '^[A-Za-z]:\\$') { $guestRoot = $guestRoot.TrimEnd('\') }
+            $localRoot = [IO.Path]::GetFullPath($Destination)
+            New-Item -ItemType Directory -Force -Path $localRoot | Out-Null
+            $pending = [Collections.Generic.Queue[string]]::new()
+            $pending.Enqueue('')
+            $pulled = [Collections.Generic.List[object]]::new()
+            [uint64]$totalBytes = 0
+            $directoryCount = 0
+            while ($pending.Count -gt 0) {
+                $relativeDirectory = $pending.Dequeue()
+                $guestDirectory = Join-V9xGuestPath -Parent $guestRoot -Child $relativeDirectory
+                ++$directoryCount
+                $payload = New-V9xPathPayload -Path $guestDirectory
+                $bytes = New-V9xFrameBytes -Type 0x0021 -RequestId $requestId -Payload $payload
+                $stream.Write($bytes, 0, $bytes.Length)
+                $frame = Read-V9xOperationFrame -Stream $stream -RequestId $requestId `
+                    -ExpectedTypes 0x8021 -GuestErrorExitCode 40
+                $requestId = [uint32]($requestId + 1)
+                $entries = @(ConvertFrom-V9xListPayload -Payload $frame.Payload | Sort-Object Name)
+                foreach ($entry in $entries) {
+                    $relative = if ($relativeDirectory) { "$relativeDirectory\$($entry.Name)" } else { $entry.Name }
+                    if ($entry.IsDirectory) {
+                        $pending.Enqueue($relative)
+                        continue
+                    }
+                    if ($Filter -and $entry.Name -notlike $Filter) {
+                        continue
+                    }
+                    $transfer = Invoke-V9xGetInternal -Stream $stream -RequestId ([ref]$requestId) `
+                        -GuestPath (Join-V9xGuestPath -Parent $guestRoot -Child $relative) `
+                        -LocalPath (Join-Path $localRoot $relative)
+                    $totalBytes += $transfer.Size
+                    $pulled.Add([pscustomobject]@{ Name = $relative; Bytes = $transfer.Size; Crc32 = ('{0:X8}' -f $transfer.Crc32) })
+                }
+            }
+            $result = [pscustomobject]@{
+                Success = $true; RequestId = [uint32]($requestId - 1)
+                AgentBuild = $hello.BuildId; Source = $guestRoot
+                Destination = $localRoot; Directories = $directoryCount
+                Files = $pulled.Count; Bytes = $totalBytes; Entries = $pulled.ToArray()
             }
         } else {
             $sourceRoot = (Get-Item -LiteralPath $Source).FullName.TrimEnd('\')
@@ -3100,13 +3184,13 @@ try {
             # because a faulted process lingers while its dialog is up.
             $waited = Wait-V9xGuestFault -Stream $stream -RequestId ([ref]$exitRequest) `
                 -ProcessId $exitPid -Name $(if ($exitPid) { '' } else { $exitName }) `
-                -WaitSeconds $WaitSeconds -Dismiss:$Dismiss
+                -WaitSeconds $WaitSeconds -Dismiss:$Dismiss -DialogTitle $DialogTitle
             $result | Add-Member -NotePropertyMembers ([ordered]@{
                 WaitedForExit = $true; ExitWaitedMilliseconds = $waited.WaitedMilliseconds
                 WasRunning = $waited.WasRunning; Outcome = $waited.Outcome
                 Fault = ConvertTo-V9xFaultResult $waited.Fault; Dismissed = $waited.Dismissed
             })
-            if ($waited.Outcome -eq 'Fault') {
+            if ($waited.Outcome -in 'Fault', 'Dialog') {
                 $outcomeExit = 50
                 $result.Success = $false
             }

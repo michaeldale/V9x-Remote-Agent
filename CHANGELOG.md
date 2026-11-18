@@ -2,6 +2,58 @@
 
 All notable changes to the V9x Remote Agent. Dates are in YYYY-MM-DD.
 
+## 0.19.0 (2026-11-18)
+
+### Added
+- `pull-tree -Source <guest dir> -Destination <local dir> [-Filter <wildcard>]`:
+  download a guest tree over one connection, each file CRC32-checked like
+  `get`. Through the relay every separate `get` opens its own session;
+  Velocity9x's ten 3DMark grab BMPs took about four minutes that way.
+  Host-side only (FILE_LIST + FILE_OPEN_READ), so it works with every agent
+  that has `get`. No MCP tool yet. Host test `Test-V9xPullTreeCtl.ps1`.
+- AGENT.INI `[agent] tray_flash=0` stops the tray icon flashing while busy,
+  and the periodic refresh then sends only a changed tooltip, without
+  repainting the icon. For slow-bus displays, where each repaint costs more
+  than the command: measured on an IBM 5160 with an 8-bit ISA Mach8 card.
+  Default `1`, unchanged behavior. Contributed by Mike1978uk (GitHub PR 1).
+
+### Fixed
+- The tray icon comes back after Explorer restarts even if nothing about it
+  changes: the tray thread compares the taskbar window handle on every update
+  rather than waiting for a NIM_MODIFY to fail. Windows 95 without IE4 sends
+  no `TaskbarCreated`.
+
+## 0.18.0 (2026-11-13)
+
+### Fixed
+- Hot updates retain the previous agent until the replacement opens its
+  listener. The swapper watches the child for exit or a 60-second readiness
+  deadline and restores/relaunches the previous binary on copy, launch or
+  startup failure. The screenshot helper is promoted after readiness, keeping
+  the old pair intact for rollback. If the failed child cannot be stopped,
+  the backup is retained and `HOTSWAP.LOG` records the recovery failure.
+  CLI/MCP verify the installed agent's SHA-256 after reconnect when the guest
+  supports `hash`, so a rollback is not reported as a successful update.
+  This hardens the reported physical-machine failure; its original cause
+  remains unproven without the incident logs.
+- `-WaitForAgent` caps its backoff before computing an exponential, avoiding
+  the Int32 overflow after 32 immediate connection refusals.
+- Guest window-text reads redact password Edit/RichEdit controls before
+  requesting their text, protecting `windows -Controls` and fault reports.
+- `windows -Controls` text output now flows through PowerShell's success
+  pipeline and can be captured by `Out-String`.
+- Fault waits re-read dialog controls, so reused windows or changing text
+  cannot leave a stale classification.
+
+### Added
+- `wait-fault -DialogTitle <text[]>`, also on `exec -WaitForExit`: opt into
+  application-owned error dialogs such as UT2004's `Critical Error`. Literal,
+  case-insensitive title substrings; requires a target PID/name. Matching
+  dialogs return `Outcome = Dialog`, text in `Fault`, exit 50, and honor
+  `-Dismiss`. Ordinary dialogs remain ignored by default. Existing 0.16.0+
+  guest window tools suffice; no wire-protocol change. MCP: `dialog_titles`
+  on `v9x_wait_fault` / `v9x_exec`, outcome/result `dialog`.
+
 ## 0.17.0 (2026-11-12)
 
 Remote-help operator-friction improvements (2026-11-12).

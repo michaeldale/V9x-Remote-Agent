@@ -344,6 +344,14 @@ VM). Under SLiRP NAT the host never sees guest multicast. Start-up logs
 `mdns-unavailable` and is retried every 30 s, and INVENTORY `meta discovery`
 reports the state.
 
+`tray_flash=0` (default `1`) keeps the tray icon on its resting picture
+(white, or yellow during a VNC session) while a command runs, instead of
+flashing lime. The icon still changes for VNC and remote help, and the
+5-second refresh sends only the tooltip, and only when its text changed. Each
+icon change repaints the taskbar, which on a slow-bus display (an 8-bit ISA
+card) costs more than the command being shown. The key is read at start-up,
+so restart the agent after changing it; it is not on the Options page.
+
 Addresses must be dotted-decimal IPv4. `0.0.0.0` listens on every IPv4
 adapter. A blank `allowed_client` preserves the original accept-any behavior;
 a specific address rejects every other source before HELLO. Invalid configured

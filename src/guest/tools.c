@@ -749,17 +749,9 @@ static BOOL CALLBACK v9x_window_entry(HWND window, LPARAM parameter)
     RECT rect;
     DWORD pid = 0ul;
     DWORD flags = 0ul;
-    DWORD copied = 0ul;
     unsigned long start = walk->offset;
     if (!IsWindowVisible(window)) return TRUE;
-    /* WM_GETTEXT with a timeout: GetWindowText on another process's window
-       would wait for ever on a hung program. */
-    title[0] = '\0';
-    if (SendMessageTimeoutA(window, WM_GETTEXT, sizeof(title), (LPARAM)title,
-                            SMTO_ABORTIFHUNG, 500u, &copied) == 0) {
-        title[0] = '\0';
-    }
-    title[sizeof(title) - 1u] = '\0';
+    v9x_window_text(window, title, sizeof(title));
     class_name[0] = '\0';
     (void)GetClassNameA(window, class_name, sizeof(class_name));
     if (!GetWindowRect(window, &rect)) {
@@ -807,18 +799,6 @@ static int v9x_handle_window_list(V9xConnection *conn, DWORD request_id)
 }
 
 /* ---- WINDOW_TEXT ---------------------------------------------------- */
-
-/* WM_GETTEXT with a timeout, as in WINDOW_LIST, into a caller's buffer. */
-static void v9x_window_text(HWND window, char *text, unsigned long size)
-{
-    DWORD copied = 0ul;
-    text[0] = '\0';
-    if (SendMessageTimeoutA(window, WM_GETTEXT, (WPARAM)size, (LPARAM)text,
-                            SMTO_ABORTIFHUNG, 500u, &copied) == 0) {
-        text[0] = '\0';
-    }
-    text[size - 1ul] = '\0';
-}
 
 typedef struct V9xChildWalk {
     unsigned char *out;

@@ -340,6 +340,13 @@ isolated development network. Details in [SECURITY.md](SECURITY.md).
 
 Working notes, newest first:
 
+- [docs/issues/2026-11-13-ut2004-session-update-and-wait-problems.md](docs/issues/2026-11-13-ut2004-session-update-and-wait-problems.md):
+  a hot update to 0.17.0 that left a physical Win98 SE machine with no
+  agent until a restart; `-WaitForAgent` overflowing at attempt 32;
+  `wait-fault` blind to a program's own error dialog; `windows -Controls`
+  printing a password field. Addressed in 0.18.0 with rollback on failed
+  startup, capped retries, opt-in dialog waits and password redaction;
+  the original physical-machine update failure remains unreproduced.
 - [docs/issues/2026-11-05-relay-silent-guest-during-3d.md](docs/issues/2026-11-05-relay-silent-guest-during-3d.md):
   a remote-help guest running full-screen 3D stops checking in; 0.15.0 logs
   the silence (`remote-poll-gap`) and reports it once a minute while a

@@ -307,17 +307,21 @@ static HICON v9x_icon_create(unsigned int body, int cloud)
     return CreateIconFromResource(resource, (DWORD)length, TRUE, 0x00030000ul);
 }
 
-static int v9x_tray_notify(V9xAgentState *state, DWORD message,
-                           const char *address, HICON icon)
+/* `flags` is NIF_ICON | NIF_TIP | NIF_MESSAGE for an add or a full refresh,
+   or NIF_TIP alone to change the tooltip without touching the icon: with
+   tray_flash=0 that is the only update sent while the picture is unchanged,
+   because NIF_ICON repaints the taskbar. */
+static int v9x_tray_notify(V9xAgentState *state, DWORD message, UINT flags,
+                           const char *tooltip, HICON icon)
 {
     NOTIFYICONDATAA data;
     data.cbSize = NOTIFYICONDATAA_V1_SIZE;
     data.hWnd = state->tray_window;
     data.uID = V9X_TRAY_ICON_ID;
-    data.uFlags = NIF_ICON | NIF_TIP | NIF_MESSAGE;
+    data.uFlags = flags;
     data.uCallbackMessage = V9X_TRAY_CALLBACK;
     data.hIcon = icon;
-    v9x_tray_tooltip(state, address, data.szTip);
+    lstrcpynA(data.szTip, tooltip, sizeof(data.szTip));
     return Shell_NotifyIconA(message, &data) != FALSE;
 }
 
@@ -743,6 +747,11 @@ static DWORD WINAPI v9x_tray_worker(LPVOID parameter)
     int want_busy;
     HICON shown_icon;
     HICON want_icon;
+    HWND taskbar;
+    char tooltip[64];
+    char shown_tip[64];
+    UINT flags;
+    int flash;
 
     /* The owner window is created here, not by v9x_tray_start: this is the
        only thread in the agent that pumps messages, and a window belongs to
@@ -750,14 +759,20 @@ static DWORD WINAPI v9x_tray_worker(LPVOID parameter)
        accept(). */
     if (!v9x_tray_create_window(state)) return 0ul;
 
+    flash = state->tray_flash;
+
     for (;;) {
-        while (FindWindowA("Shell_TrayWnd", 0) == 0) v9x_tray_wait(1000ul);
+        while ((taskbar = FindWindowA("Shell_TrayWnd", 0)) == 0) {
+            v9x_tray_wait(1000ul);
+        }
         v9x_tray_address(state, address);
         v9x_tray_vnc_active = v9x_tray_sample_vnc();
         shown_icon = state->tray_icons[v9x_tray_sample_cloud(state)]
                                       [v9x_tray_vnc_active ? V9X_TRAY_BODY_VNC :
                                                              V9X_TRAY_BODY_IDLE];
-        if (!v9x_tray_notify(state, NIM_ADD, address, shown_icon)) {
+        v9x_tray_tooltip(state, address, shown_tip);
+        if (!v9x_tray_notify(state, NIM_ADD, NIF_ICON | NIF_TIP | NIF_MESSAGE,
+                             shown_tip, shown_icon)) {
             if (!reported) {
                 v9x_tray_log_error("tray-notify-failed");
                 reported = 1;
@@ -773,7 +788,9 @@ static DWORD WINAPI v9x_tray_worker(LPVOID parameter)
            at V9X_TRAY_FLASH_MS while busy, every one of them with the
            cloud badge while remote help is connected, and
            re-assert the icon with a fresh address every V9X_TRAY_REFRESH_MS
-           when idle. Any failed NIM_MODIFY or a vanished taskbar (Explorer
+           when idle. With tray_flash=0 the icon stays on its resting body
+           while busy and the refresh sends only a changed tooltip. Any
+           failed NIM_MODIFY or a changed taskbar window (Explorer
            restarted) drops back to NIM_ADD. */
         last_activity = v9x_flag_read(&state->activity);
         hold_ms = 0ul;
@@ -807,7 +824,7 @@ static DWORD WINAPI v9x_tray_worker(LPVOID parameter)
                     }
                 }
                 was_busy = 1;
-                want_busy = phase;
+                want_busy = flash ? phase : 0;
             } else {
                 was_busy = 0;
                 phase = 0;
@@ -825,11 +842,26 @@ static DWORD WINAPI v9x_tray_worker(LPVOID parameter)
                 since_refresh = 0ul;
                 v9x_tray_address(state, address);
             }
-            if (FindWindowA("Shell_TrayWnd", 0) == 0 ||
-                !v9x_tray_notify(state, NIM_MODIFY, address, want_icon)) {
+            /* A restarted Explorer owns a new taskbar window that has never
+               heard of this icon. Windows 95 without IE4 sends no
+               TaskbarCreated, and with tray_flash=0 an idle icon may go
+               without a NIM_MODIFY for hours, so a failed modify cannot be
+               relied on to notice: compare the window handle instead. */
+            if (FindWindowA("Shell_TrayWnd", 0) != taskbar) break;
+            v9x_tray_tooltip(state, address, tooltip);
+            if (!flash && want_icon == shown_icon) {
+                /* tray_flash=0 refresh with an unchanged picture: send the
+                   tooltip alone, and only when its text changed. */
+                if (lstrcmpA(tooltip, shown_tip) == 0) continue;
+                flags = NIF_TIP;
+            } else {
+                flags = NIF_ICON | NIF_TIP | NIF_MESSAGE;
+            }
+            if (!v9x_tray_notify(state, NIM_MODIFY, flags, tooltip, want_icon)) {
                 break;
             }
             shown_icon = want_icon;
+            lstrcpyA(shown_tip, tooltip);
         }
     }
 }

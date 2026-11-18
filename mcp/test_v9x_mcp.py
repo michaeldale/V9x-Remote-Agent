@@ -7,6 +7,7 @@ import socket
 import struct
 import threading
 import unittest
+import unittest.mock
 import zlib
 
 import v9x_mcp
@@ -446,6 +447,29 @@ class ToolCodecTests(unittest.TestCase):
             self.assertEqual(client.wait_fault(0)["outcome"], "no_fault")
         finally:
             v9x_mcp.poll_pause = original
+
+    def test_wait_fault_selected_dialog_is_scoped_to_target(self):
+        windows = [{"handle": h, "pid": p, "class": "#32770", "title": "Critical Error"}
+                   for h, p in [(1, 99), (2, 42)]]
+        client = self.fake_client(
+            processes=lambda: [{"pid": 42, "name": "UT2004.EXE"}], windows=lambda: windows,
+            window_text=lambda h: v9x_mcp.parse_window_text(self.window_text_payload(
+                h, 99 if h == 1 else 42, "Critical Error", [(3, 3, True, "Edit", "Engine failed.")])) )
+        result = client.wait_fault(5, name="UT2004.EXE", dialog_titles=["not this", "critical error"])
+        self.assertEqual((result["outcome"], result["fault"]["dialog_pid"]), ("dialog", 42))
+        self.assertEqual(result["fault"]["details"], "Engine failed.")
+        with self.assertRaises(v9x_mcp.V9xError):
+            client.wait_fault(0, dialog_titles=["Critical Error"])
+
+    def test_update_reconnect_rejects_rollback_and_closes_connection(self):
+        client = self.fake_client(hash_file=lambda _path: {"sha256": "OLD"})
+        client.hello = {"boot_counter": 11, "capabilities": v9x_mcp.CAP_FILE_TOOLS}
+        client.close = unittest.mock.Mock()
+        with unittest.mock.patch.object(v9x_mcp.time, "sleep"):
+            with self.assertRaisesRegex(v9x_mcp.V9xError, "possible rollback"):
+                v9x_mcp.wait_for_update("localhost", 1, 10, 1, connect=lambda _budget: client,
+                                        expected_sha256="NEW")
+        client.close.assert_called_once()
 
     def test_connect_retries_a_connection_dropped_before_hello(self):
         attempts = []

@@ -47,6 +47,15 @@ try {
         if ($LASTEXITCODE -ne 0) { throw 'Open Watcom failed to build desktop wait tests.' }
         & (Join-Path $outputDir 'test_desktop.exe')
         if ($LASTEXITCODE -ne 0) { throw 'Guest desktop wait tests failed.' }
+        & $compilerDriver '-bt=nt' '-zq' '-wx' '-s' '-fe=test_swap.exe' `
+            (Join-Path $repoRoot 'tests\host\test_hotswap.c') `
+            (Join-Path $repoRoot 'src\common\frame.c') `
+            (Join-Path $repoRoot 'src\common\bounds.c') `
+            (Join-Path $repoRoot 'src\common\crc32.c') `
+            (Join-Path $watcomRoot 'lib386\nt\advapi32.lib')
+        if ($LASTEXITCODE -ne 0) { throw 'Open Watcom failed to build hot-swap recovery tests.' }
+        & (Join-Path $outputDir 'test_swap.exe')
+        if ($LASTEXITCODE -ne 0) { throw 'Hot-swap recovery tests failed.' }
         # READ_TEXT line filtering (tail, match, bounded output).
         & $compilerDriver '-bt=nt' '-zq' '-wx' '-s' '-fe=test_textscan.exe' `
             (Join-Path $repoRoot 'tests\host\test_textscan.c') `
@@ -128,6 +137,7 @@ try {
 Write-Output 'PASS: native C frame, bounds, and encoding tests'
 & (Join-Path $repoRoot 'tests\host\Test-V9xCtl.ps1')
 & (Join-Path $repoRoot 'tests\host\Test-V9xFileCtl.ps1')
+& (Join-Path $repoRoot 'tests\host\Test-V9xPullTreeCtl.ps1')
 & (Join-Path $repoRoot 'tests\host\Test-V9xM4Ctl.ps1')
 & (Join-Path $repoRoot 'tests\host\Test-V9xToolsCtl.ps1')
 & (Join-Path $repoRoot 'tests\host\Test-V9xWaitCtl.ps1')

@@ -1511,7 +1511,7 @@ class V9xClient:
             pass
         return fault
 
-    def wait_fault(self, wait_seconds, pid=0, name="", dismiss=False):
+    def wait_fault(self, wait_seconds, pid=0, name="", dismiss=False, dialog_titles=None):
         """Poll until the process (pid or image name) exits -> outcome
         "exited", or a fault dialog about it appears -> outcome "fault" with
         the dialog's title, message and details. Neither pid nor name: watch
@@ -1521,9 +1521,15 @@ class V9xClient:
         target's image. Faults are checked before exit: a dialog outlives
         its process. dismiss: close it (WM_CLOSE) and wait for it to go."""
         self.require(CAP_WINDOW_TOOLS, "fault dialogs (agent 0.16.0+)")
+        dialog_titles = dialog_titles or []
+        if (not isinstance(dialog_titles, list) or
+                any(not isinstance(title, str) or not title.strip() for title in dialog_titles)):
+            raise V9xError("dialog_titles must be a list of nonempty title substrings")
+        if dialog_titles and not (pid or name):
+            raise V9xError("dialog_titles requires pid or name")
         any_fault = not pid and not name
         started = time.monotonic()
-        first, running, seen = None, [], {}
+        first, running = None, []
         names = set()
         if name and not any(ch in name for ch in "*?["):
             names.add(os.path.splitext(name)[0].upper())
@@ -1537,16 +1543,20 @@ class V9xClient:
                 names.update(os.path.splitext(p["name"])[0].upper() for p in running)
             pids = {p["pid"] for p in (first or []) + running} | ({pid} if pid else set())
             fault = None
-            for window in self.windows():
+            windows = self.windows()
+            outcome = "fault"
+            for window in windows:
                 if window["class"] not in FAULT_DIALOG_CLASSES:
                     continue
-                key = (window["handle"], window["title"])
-                if key not in seen:
-                    try:
-                        seen[key] = classify_fault_dialog(self.window_text(window["handle"]))
-                    except V9xError:
-                        continue  # closed between the list and the read
-                found = seen[key]
+                try:
+                    found = classify_fault_dialog(self.window_text(window["handle"]))
+                except V9xError:
+                    continue  # closed between the list and the read
+                selected_dialog = (found["dialog_pid"] in pids and
+                                   any(title.lower() in found["title"].lower() for title in dialog_titles))
+                if selected_dialog and not found["is_fault"]:
+                    fault, outcome = found, "dialog"
+                    break
                 if found["is_fault"] and (any_fault or found["dialog_pid"] in pids
                                           or fault_names_target(found["all_text"], names)):
                     fault = found
@@ -1555,7 +1565,8 @@ class V9xClient:
             base = {"pid": pid or None, "name": name, "was_running": bool(first),
                     "processes": [p["name"] for p in first or []], "waited_ms": waited}
             if fault is not None:
-                fault = self.complete_dr_watson_fault(fault)
+                if outcome == "fault":
+                    fault = self.complete_dr_watson_fault(fault)
                 dismissed = False
                 if dismiss:
                     self.close_window(fault["handle"])
@@ -1566,7 +1577,7 @@ class V9xClient:
                             break
                         time.sleep(0.25)
                 fault = {k: v for k, v in fault.items() if k not in ("is_fault", "all_text", "phrase")}
-                return dict(base, outcome="fault", fault=fault, dismissed=dismissed)
+                return dict(base, outcome=outcome, fault=fault, dismissed=dismissed)
             if not any_fault and not running:
                 return dict(base, outcome="exited", fault=None, dismissed=False)
             if time.monotonic() - started >= wait_seconds:
@@ -1951,7 +1962,7 @@ class V9xClient:
         return boot
 
 
-def wait_for_update(host, port, old_boot, wait_seconds, resolve=None, connect=None):
+def wait_for_update(host, port, old_boot, wait_seconds, resolve=None, connect=None, expected_sha256=None):
     deadline = time.monotonic() + wait_seconds
     last_error = "no connection attempt succeeded"
     while time.monotonic() < deadline:
@@ -1969,6 +1980,11 @@ def wait_for_update(host, port, old_boot, wait_seconds, resolve=None, connect=No
         try:
             hello = candidate.hello
             if hello["boot_counter"] != old_boot:
+                if expected_sha256 and hello["capabilities"] & CAP_FILE_TOOLS:
+                    installed = candidate.hash_file("C:\\V9XREMOTE\\V9XAGNT.EXE")
+                    if installed["sha256"].upper() != expected_sha256.upper():
+                        raise V9xError("agent reconnected with a different binary (possible rollback); "
+                                       "read C:\\V9XREMOTE\\HOTSWAP.LOG before retrying")
                 return hello
             last_error = "reconnected with unchanged boot counter %d" % hello[
                 "boot_counter"
@@ -2088,6 +2104,7 @@ TOOLS = [
                 "show_window": {"type": "boolean", "description": "Show the child's window (console children; GUI-subsystem EXEs manage their own window)"},
                 "detach": {"type": "boolean", "description": "Launch and return immediately without waiting or capturing output. Use for installers and programs that outlive the request. The result's pid (agent 0.14.0+) is what v9x_wait_process and v9x_kill take."},
                 "wait_for_exit": {"type": "boolean", "description": "Launch detached, then return when the process has exited (no 1-hour exec cap, no output captured, exit code unknown). Agent 0.16.0+: a crash ends the wait too, with result \"fault\" and the fault dialog's text in waited_for_exit.fault"},
+                "dialog_titles": {"type": "array", "items": {"type": "string", "minLength": 1}, "description": "With wait_for_exit: also stop on an application-owned dialog matching any literal title substring (case-insensitive), with result/outcome dialog and text in waited_for_exit.fault. Requires agent 0.16.0+."},
                 "dismiss": {"type": "boolean", "description": "With wait_for_exit: close the fault dialog once read, so the next test starts clean"},
                 "wait_for_file": guest_path_schema("After the run (usually with detach): wait until this guest file exists, then return"),
                 "match": {"type": "string", "description": "With wait_for_file: wait until the file has a line containing this text (e.g. Complete=yes)"},
@@ -2297,6 +2314,7 @@ TOOLS = [
                 "name": {"type": "string", "description": "Image name, e.g. MYTEST.EXE"},
                 "wait_seconds": {"type": "integer", "minimum": 1, "maximum": 3600, "description": "Limit (default 600)"},
                 "dismiss": {"type": "boolean", "description": "Close the fault dialog once read"},
+                "dialog_titles": {"type": "array", "items": {"type": "string", "minLength": 1}, "description": "Also stop on an application-owned dialog matching any literal title substring, e.g. Critical Error. Requires pid or name; outcome dialog, text in fault. Case-insensitive."},
             },
             "additionalProperties": False,
         },
@@ -2816,7 +2834,11 @@ class ToolHandler:
             return self.text(client.inventory())
 
     def v9x_exec(self, args):
+        if args.get("dialog_titles") and not args.get("wait_for_exit"):
+            raise V9xError("dialog_titles requires wait_for_exit")
         with self.connect() as client:
+            if args.get("dialog_titles"):
+                client.require(CAP_WINDOW_TOOLS, "dialog waits (agent 0.16.0+)")
             result = client.execute(
                 0,
                 application=args["application"],
@@ -2852,12 +2874,16 @@ class ToolHandler:
                 # 0.16.0+: a crash ends the wait, with the fault dialog's text,
                 # instead of sitting out wait_seconds behind the dialog.
                 waited = client.wait_fault(wait_seconds, result.get("pid") or 0, name,
-                                           bool(args.get("dismiss")))
-                if waited["outcome"] == "fault":
-                    result["result"] = "fault"
+                                           bool(args.get("dismiss")), args.get("dialog_titles"))
+                if waited["outcome"] in ("fault", "dialog"):
+                    result["result"] = waited["outcome"]
             else:
+                if args.get("dialog_titles"):
+                    client.require(CAP_WINDOW_TOOLS, "dialog waits (agent 0.16.0+)")
                 waited = client.wait_process(wait_seconds, result.get("pid") or 0, name)
             result["waited_for_exit"] = waited
+            if waited.get("outcome") in ("fault", "dialog"):
+                return result
         if args.get("wait_for_file"):
             result["waited_for_file"] = client.wait_file(args["wait_for_file"], wait_seconds,
                                                          match=args.get("match", ""))
@@ -3007,7 +3033,7 @@ class ToolHandler:
         with self.connect() as client:
             client.require(CAP_PROCESS, "process list (agent 0.13.0+, Windows 9x/2000)")
             return self.text(client.wait_fault(int(args.get("wait_seconds", 600)), pid, name,
-                                               bool(args.get("dismiss"))))
+                                               bool(args.get("dismiss")), args.get("dialog_titles")))
 
     def v9x_close_window(self, args):
         with self.connect() as client:
@@ -3223,6 +3249,7 @@ class ToolHandler:
         hello = wait_for_update(
             self.host, self.port, old_boot, wait_seconds,
             self.reresolve if self.install_id else None, connect=self.reconnector(),
+            expected_sha256=hashlib.sha256(agent_data).hexdigest(),
         )
         return self.text(
             {

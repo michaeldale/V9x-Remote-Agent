@@ -168,5 +168,27 @@ try {
     Remove-Job -Job $server -Force -ErrorAction SilentlyContinue
 }
 
-Write-Output 'PASS: v9xctl execution streaming and detached launch against protocol fixture'
+# Exercise the real retry function with virtual delays, keeping this fixture
+# fast even past the original 32-refusal overflow. Isolate the substitutions.
+& {
+    $tokens = $null; $parseErrors = $null
+    $ast = [Management.Automation.Language.Parser]::ParseFile($clientScript, [ref]$tokens, [ref]$parseErrors)
+    if ($parseErrors.Count) { throw $parseErrors[0] }
+    $retry = $ast.Find({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+        $node.Name -eq 'Connect-V9xSessionWithRetry' }, $true)
+    . ([scriptblock]::Create($retry.Extent.Text))
+    $Relay = ''; $Id = ''; $retryState = @{ Attempts = 0 }
+    function Start-Sleep([int]$Milliseconds) {
+        if ($Milliseconds -gt 5000) { throw 'Retry backoff exceeded 5 s.' }
+    }
+    function Connect-V9xSession {
+        param($HostName, $TcpPort, $TimeoutSeconds, $RelayOpenWaitSeconds)
+        ++$retryState.Attempts
+        if ($retryState.Attempts -le 40) { throw [Net.Sockets.SocketException]::new(10061) }
+        return 'connected'
+    }
+    if ((Connect-V9xSessionWithRetry -HostName localhost -TcpPort 1 -TimeoutSeconds 1 -WaitSeconds 3600) -ne 'connected' -or
+        $retryState.Attempts -ne 41) { throw 'Retry did not survive 40 immediate refusals.' }
+}
+Write-Output 'PASS: v9xctl execution, detached launch and connection retry through 40 refusals'
 

@@ -6,6 +6,14 @@
 Use `-Json` for compact machine-readable output. Use `-Host`, `-Port`, and
 `-ConnectTimeoutSeconds` to override connection settings.
 
+`-Json` writes one result object to the PowerShell success pipeline;
+diagnostics go to stderr. Most text results use PowerShell formatting
+objects (`Format-List`/`Format-Table`), so use `Out-String` to capture their
+display text, and prefer JSON for scripts. From 0.18.0, `windows -Controls`
+and fault/dialog text also use the success pipeline. `cat`/`cat -Follow`
+stream raw console text; do not expect structured objects from their text
+mode. Help/usage also writes directly to stdout/stderr.
+
 For a physical target, pass its LAN address directly:
 
 ```powershell
@@ -73,6 +81,28 @@ staged, then remove `C:\V9XPKG`. That takes about a minute and one reboot
 (waiting at least 300 s whatever `-WaitSeconds` says), creates DOS VMs, and
 reports `Mode = Staged`. It exits 41 when staging fails and 42 when the update
 did not apply (`C:\V9XREMOTE\UPDATE.LOG` on the guest says why).
+
+Packages from 0.18.0 retain `V9XAGNT.OLD` while the swapper waits up to 60 s
+for the new child to open its listener. Copy/start/early-exit/readiness
+failures restore and relaunch the previous agent. The helper is replaced
+after readiness, preserving the previous pair for rollback. This is a local
+listener readiness check, not proof of remote network reachability. Failed
+termination or file restoration can still require manual recovery; the old
+binary is retained where possible. Read `C:\V9XREMOTE\HOTSWAP.LOG` before
+rebooting after a failure, along with `AGENT.LOG` and `AGENT.OLD`.
+The host verifies the installed agent's SHA-256 after reconnect on agents
+with `hash` (0.13.0+); mismatch exits 42 and reports possible rollback.
+Allow at least 90 s for an update including rollback. The staged
+`V9XNEW.EXE` may remain until the next agent start because it is still
+mapped by the watchdog during startup cleanup.
+
+`info.PendingJob` is the persisted power-control resume token from
+`C:\V9XREMOTE\PENDING.DAT`, not a live execution or download job. It remains
+across agent starts and reboots until another power request replaces it.
+Use `ps` for running jobs. During a guest HTTP download, the transactional
+temporary file is `<destination>.<connection-slot>.DLPART` (slots 0-3);
+the destination appears only after successful completion. `list`/`stat`
+can inspect that temporary file on another connection. Do not modify it.
 - `-DiscoverSeconds` (default 3) is how long to listen. With `-Id`, listening
   stops as soon as the install answers.
 - `info` shows `InstallId` for 0.8.0+ agents (empty for older ones).
@@ -129,7 +159,14 @@ File examples:
     -Destination .\agent.log
 .\scripts\v9xctl.ps1 push-tree -Source .\package `
     -Destination C:\V9XREMOTE\JOBS\demo
+.\scripts\v9xctl.ps1 pull-tree -Source C:\V9XDIAG -Destination .\grab `
+    -Filter V9XGRAB*.BMP
 ```
+
+`pull-tree` lists the guest directory and its subdirectories and gets every
+file (or every file whose name matches `-Filter`) over one connection, each
+checked like `get`. Through the relay that saves a session open per file.
+Any agent with `get`; host-side only.
 
 Uploads and gets are limited to 2 GiB per file on agent 0.11.0+
 (256 MiB on older agents and 64 MiB before 0.6.4, which reject larger
@@ -270,11 +307,23 @@ Waiting without sleeping:
   first fault dialog from any program, or ends at `-WaitSeconds` with exit 0
   and `Outcome = NoFault`. Exit 49 at the deadline when a target still
   runs. Each probe is one `PROCESS_LIST` and one `WINDOW_LIST`; a dialog's
-  text is read once. `exec -WaitForExit` on a 0.16.0+ agent uses the same
+  text is re-read for non-fault dialogs because controls may change under
+  the same title. `exec -WaitForExit` on a 0.16.0+ agent uses the same
   wait (and takes `-Dismiss`), so a crash returns exit 50 at once instead
   of holding the wait until the deadline behind its dialog.
+  From host 0.18.0, add `-DialogTitle 'Critical Error'` to also stop on a
+  matching application-owned dialog. Accepts an array of literal,
+  case-insensitive title substrings; requires `-Pid`/`-Name` (or
+  `exec -WaitForExit`). Returns `Outcome = Dialog`, text in `Fault`, exit
+  50, and supports `-Dismiss`. A title match from another PID is ignored;
+  normal crash detection still works. Existing 0.16.0+ agents suffice.
 - `windows -Controls` adds each window's child controls (`Class`,
   `ControlId`, `Visible`, `Text`): read a dialog without a screenshot.
+  Guest 0.18.0+ replaces password Edit/RichEdit text with
+  `[password redacted]` before reading the control. Older guests still
+  expose those fields; update them before enumerating controls. Prefer
+  `-Title` to scope the result. Host 0.18.0 text can be captured with
+  `$text = & .\scripts\v9xctl.ps1 windows -Title 'Critical Error' -Controls | Out-String`.
   `close-window -Title <text>` posts WM_CLOSE to the one window whose title
   contains the text and waits (`-WaitSeconds`, default 10) until it is
   gone; it refuses the desktop, the taskbar and the agent's own windows,
