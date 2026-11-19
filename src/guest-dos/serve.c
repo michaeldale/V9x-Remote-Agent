@@ -206,7 +206,26 @@ void v9x_serve_client(V9xDos *dos)
     unsigned short maximum;
     unsigned long target_request;
 
+    int waiting;
+    unsigned long idle_since;
+
     for (;;) {
+        /* recv() would block with the keyboard unread, so wait in slices:
+           Esc still reaches the agent, and a silent client is dropped. */
+        idle_since = v9x_dos_now_ms();
+        for (;;) {
+            waiting = v9x_net_wait(dos->socket, 250ul);
+            if (waiting < 0) return;
+            if (waiting > 0) break;
+            if (v9x_console_esc()) {
+                dos->console_quit = 1;
+                return;
+            }
+            if (v9x_dos_now_ms() - idle_since >= V9X_DOS_IDLE_MS) {
+                v9x_log_line("client-idle");
+                return;
+            }
+        }
         if (!v9x_net_recv_exact(dos->socket, dos->header_bytes,
                                 V9X_HEADER_SIZE)) return;
         if (!v9x_decode_header(dos->header_bytes, &header)) return;
@@ -254,6 +273,7 @@ void v9x_serve_client(V9xDos *dos)
         } else if (header.type == V9X_MSG_EXEC_REQUEST) {
             if (!v9x_dos_execute(dos, header.request_id, dos->payload,
                                  header.payload_length)) return;
+            if (dos->handoff) return;
         } else if (header.type == V9X_MSG_CANCEL_REQUEST &&
                    header.payload_length == 4ul) {
             /* No concurrent or backgrounded execution exists on DOS, so there is
@@ -263,6 +283,11 @@ void v9x_serve_client(V9xDos *dos)
             v9x_write_u32(dos->response + 4, 0ul);
             if (!v9x_send_frame(dos, V9X_MSG_CANCEL_RESPONSE,
                                 header.request_id, dos->response, 8ul)) return;
+        } else if (v9x_is_hw_message(header.type)) {
+            if (!v9x_handle_hw_message(dos, header.type, header.request_id,
+                                       dos->payload,
+                                       header.payload_length)) return;
+            if (dos->reboot) return;
         } else if (v9x_is_file_message(header.type)) {
             if (!v9x_handle_file_message(dos, header.type, header.request_id,
                                          dos->payload,

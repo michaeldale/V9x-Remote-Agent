@@ -75,6 +75,7 @@ $sources = @(
     "src\guest-dos\net.c",
     "src\guest-dos\serve.c",
     "src\guest-dos\exec_dos.c",
+    "src\guest-dos\hw_dos.c",
     "src\guest-dos\files_dos.c",
     "src\guest-dos\main.c"
 )
@@ -124,7 +125,7 @@ if (Test-Path -LiteralPath $dos4gw) {
 } else {
     Write-Warning "dos4gw.exe not found at $dos4gw; add DOS4GW.EXE to the package manually."
 }
-foreach ($name in @('INSTALL.BAT', 'AGENT.INI', 'WATTCP.CFG', 'README.TXT')) {
+foreach ($name in @('INSTALL.BAT', 'AGENT.INI', 'WATTCP.CFG', 'README.TXT', 'V9XLOOP.BAT')) {
     $sourceLines = @(Get-Content -LiteralPath (Join-Path $repoRoot "packaging\dos\$name"))
     if ($name -eq 'README.TXT') {
         $sourceLines = $sourceLines -replace '@VERSION@', $agentVersion

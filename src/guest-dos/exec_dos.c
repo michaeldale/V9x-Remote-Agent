@@ -92,7 +92,7 @@ static int v9x_append_text(char *target, unsigned long capacity,
    append stdout redirection to the capture file. Mirrors v9x_build_command_line
    in src\guest\execute.c; the redirect is the DOS-specific addition. */
 static int v9x_build_command_line(const V9xDosJob *job, char *target,
-                                  unsigned long capacity)
+                                  unsigned long capacity, int redirect)
 {
     unsigned long offset = 0ul;
     target[0] = '\0';
@@ -110,8 +110,34 @@ static int v9x_build_command_line(const V9xDosJob *job, char *target,
             }
         }
     }
+    if (!redirect) return 1;
     return v9x_append_text(target, capacity, &offset, " > ") &&
            v9x_append_text(target, capacity, &offset, V9X_DOS_EXEC_OUT);
+}
+
+/* Write a detached job for V9XLOOP.BAT. No redirect: a game or benchmark keeps
+   the screen, and a caller wanting output adds its own "> file". */
+static int v9x_write_runjob(const V9xDosJob *job)
+{
+    char command_line[2400];
+    FILE *file;
+    int ok;
+    if (!v9x_build_command_line(job, command_line, sizeof(command_line), 0)) {
+        return 0;
+    }
+    file = fopen(V9X_DOS_RUNJOB, "w");
+    if (file == 0) return 0;
+    ok = fputs("@ECHO OFF\n", file) >= 0;
+    if (ok && job->directory[0] != '\0') {
+        if (job->directory[1] == ':') {
+            ok = fprintf(file, "%c:\n", job->directory[0]) > 0;
+        }
+        ok = ok && fprintf(file, "CD %s\n", job->directory) > 0;
+    }
+    ok = ok && fprintf(file, "%s\n", command_line) > 0;
+    if (fclose(file) != 0) ok = 0;
+    if (!ok) (void)remove(V9X_DOS_RUNJOB);
+    return ok;
 }
 
 /* Change to the job's working directory (drive-aware), remembering the previous
@@ -228,8 +254,20 @@ int v9x_dos_execute(V9xDos *dos, unsigned long request_id,
     if (!v9x_send_frame(dos, V9X_MSG_EXEC_ACCEPTED, request_id,
                         dos->response, 4ul)) return 0;
 
+    if ((job.options & V9X_EXEC_OPTION_DETACH) != 0u) {
+        if (v9x_write_runjob(&job)) {
+            exit_code = 0ul;
+            flags = V9X_EXEC_FLAG_DETACHED;
+            dos->handoff = 1;
+        } else {
+            result = V9X_EXEC_RESULT_CREATE_FAILED;
+            native_error = (unsigned long)errno;
+        }
+        goto complete_job;
+    }
+
     (void)remove(V9X_DOS_EXEC_OUT);
-    if (!v9x_build_command_line(&job, command_line, sizeof(command_line))) {
+    if (!v9x_build_command_line(&job, command_line, sizeof(command_line), 1)) {
         result = V9X_EXEC_RESULT_CREATE_FAILED;
         native_error = (unsigned long)EINVAL;
     } else if (!v9x_pushd(job.directory, saved_dir, sizeof(saved_dir))) {
@@ -253,6 +291,7 @@ int v9x_dos_execute(V9xDos *dos, unsigned long request_id,
     }
     (void)remove(V9X_DOS_EXEC_OUT);
 
+complete_job:
     elapsed = v9x_dos_now_ms() - started;
     v9x_write_u32(complete, result);
     v9x_write_u32(complete + 4, exit_code);
