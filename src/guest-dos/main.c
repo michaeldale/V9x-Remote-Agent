@@ -18,6 +18,11 @@
    real-mode one with 64 KiB segment limits. */
 static V9xDos g_dos;
 
+int v9x_console_esc(void)
+{
+    return kbhit() && getch() == 27;
+}
+
 int main(void)
 {
     int listener;
@@ -70,7 +75,7 @@ int main(void)
             waiting = v9x_net_wait(listener, 250ul);
             if (waiting < 0) break;
             if (waiting == 0) {
-                if (kbhit() && getch() == 27) {
+                if (v9x_console_esc()) {
                     v9x_net_close(listener);
                     v9x_log_line("console-quit");
                     return V9X_DOS_EXIT_CONSOLE;
@@ -92,6 +97,11 @@ int main(void)
             v9x_net_close(client);
             g_dos.socket = -1;
             v9x_log_line("client-disconnected");
+            if (g_dos.console_quit) {
+                v9x_net_close(listener);
+                v9x_log_line("console-quit");
+                return V9X_DOS_EXIT_CONSOLE;
+            }
             if (g_dos.reboot) {
                 v9x_net_close(listener);
                 v9x_net_drain(1000ul);

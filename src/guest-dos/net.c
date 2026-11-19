@@ -52,8 +52,9 @@ int v9x_net_listen(unsigned short port)
     return listener;
 }
 
-/* 1 if a connection is waiting on the listener, 0 after ms with none, -1 on
-   error. Lets the accept loop look at the console between waits. */
+/* 1 if the socket is readable (a connection waiting on a listener, data or a
+   close on a client), 0 after ms with none, -1 on error. Lets the caller look
+   at the console between waits. */
 int v9x_net_wait(int listener, unsigned long ms)
 {
     fd_set readable;

@@ -206,7 +206,26 @@ void v9x_serve_client(V9xDos *dos)
     unsigned short maximum;
     unsigned long target_request;
 
+    int waiting;
+    unsigned long idle_since;
+
     for (;;) {
+        /* recv() would block with the keyboard unread, so wait in slices:
+           Esc still reaches the agent, and a silent client is dropped. */
+        idle_since = v9x_dos_now_ms();
+        for (;;) {
+            waiting = v9x_net_wait(dos->socket, 250ul);
+            if (waiting < 0) return;
+            if (waiting > 0) break;
+            if (v9x_console_esc()) {
+                dos->console_quit = 1;
+                return;
+            }
+            if (v9x_dos_now_ms() - idle_since >= V9X_DOS_IDLE_MS) {
+                v9x_log_line("client-idle");
+                return;
+            }
+        }
         if (!v9x_net_recv_exact(dos->socket, dos->header_bytes,
                                 V9X_HEADER_SIZE)) return;
         if (!v9x_decode_header(dos->header_bytes, &header)) return;

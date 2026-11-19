@@ -49,6 +49,11 @@
 #define V9X_DOS_RUNJOB    "C:\\V9XREMOT\\RUNJOB.BAT"
 #define V9X_DOS_EXIT_HANDOFF 3
 #define V9X_DOS_EXIT_CONSOLE 4    /* Esc at the console: V9XLOOP.BAT stops */
+/* One client at a time: a host that vanishes without closing (sleep, killed
+   process) would hold the agent forever, so a silent client is dropped. Host
+   tools connect per call, so this never cuts a live session. */
+#define V9X_DOS_IDLE_MS 120000ul
+int v9x_console_esc(void); /* 1 if Esc is waiting at the keyboard */
 #define V9X_DOS_REBOOT_COM "C:\\V9XREMOT\\TEMP\\REBOOT.COM"
 
 /* Probe messages (hw_dos.c), DOS agent only; 0x00B0-0x00B6 are unused by the
@@ -103,6 +108,7 @@ typedef struct V9xDos {
     char allowed_client[16];    /* dotted-quad, empty = allow any */
     int handoff;                /* a detached job is in RUNJOB.BAT: exit */
     int reboot;                 /* after the reply: 1 cold, 2 warm restart */
+    int console_quit;           /* Esc pressed while a client was connected */
     char install_id[V9X_INSTALL_ID_SIZE]; /* AGENT.INI install_id */
     V9xDosWriteState write_state;
     unsigned char payload[V9X_MAX_PAYLOAD];
